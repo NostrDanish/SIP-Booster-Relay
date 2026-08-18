@@ -17,9 +17,12 @@ export interface NostrFilter {
   until?: number;
   limit?: number;
   cursor?: string;
+  search?: string; // NIP-50
   [key: string]: any;
 }
 
+/** NIP-11 relay information document (custom fields allowed — clients MUST
+ *  ignore fields they do not understand). */
 export interface RelayInfo {
   name: string;
   description: string;
@@ -29,17 +32,42 @@ export interface RelayInfo {
   software: string;
   version: string;
   icon: string;
+  banner?: string;
+  privacy_policy?: string;
+  terms_of_service?: string;
   limitation?: {
     payment_required?: boolean;
     restricted_writes?: boolean;
+    auth_required?: boolean;
     [key: string]: any;
   };
+  retention?: Array<{ kinds?: Array<number | [number, number]>; time?: number; count?: number }>;
+  relay_countries?: string[];
+  language_tags?: string[];
+  tags?: string[];
+  posting_policy?: string;
   payments_url?: string;
   fees?: {
     admission?: Array<{ amount: number; unit: string }>;
     subscription?: Array<{ amount: number; unit: string; period: number }>;
     publication?: Array<{ kinds: number[]; amount: number; unit: string }>;
   };
+  /** SIP-01 §15 capability block (custom field). */
+  uncaged_index?: {
+    sip01: boolean;
+    nip50: boolean;
+    nip77: boolean;
+    document_kinds: number[];
+    scope: string;
+    domains: string[];
+    languages: string[];
+    document_types: string[];
+    filters: string[];
+    relay_mode: 'general' | 'hybrid' | 'sip01';
+    validation: boolean;
+    schema_version: string;
+  };
+  [key: string]: any;
 }
 
 export interface Subscription {
@@ -56,6 +84,9 @@ export interface QueryResult {
 export interface Env {
   RELAY_DATABASE: D1Database;
   RELAY_WEBSOCKET: DurableObjectNamespace;
+  /** Static assets binding (wrangler [assets]); optional — a minimal inline
+   *  landing page is served when absent (single-script paste deploys). */
+  ASSETS?: { fetch(request: Request): Promise<Response> };
 }
 
 // Durable Object types
@@ -69,6 +100,8 @@ export interface WebSocketSession {
   webSocket: WebSocket;
   subscriptions: Map<string, NostrFilter[]>;
   pubkeyRateLimiter: RateLimiter;
+  /** Roomier token bucket for kind 39697 indexer bursts (SIP-01). */
+  sipRateLimiter: RateLimiter;
   reqRateLimiter: RateLimiter;
   bookmark: string;
   host: string;
@@ -77,6 +110,15 @@ export interface WebSocketSession {
   authenticatedPubkeys: Set<string>;
   // Pay-to-relay: cached per-session, checked at AUTH time
   hasPaid?: boolean;
+}
+
+/** NIP-77 negentropy session state (per NEG subscription id, in-memory). */
+export interface NegSession {
+  /** The negentropy server instance (holds the sealed storage vector). */
+  neg: import('../shared/negentropy.js').Negentropy;
+  filter: NostrFilter;
+  createdAt: number;
+  itemCount: number;
 }
 
 export class RateLimiter {
@@ -116,7 +158,8 @@ export interface Nip05Response {
   relays?: Record<string, string[]>;
 }
 
-// WebSocket message types for Nostr protocol
+// WebSocket message types for the Nostr protocol (client → relay and
+// relay → client variants share the array shape)
 export type NostrMessage =
   | ["EVENT", string, NostrEvent]
   | ["EOSE", string]
@@ -125,8 +168,13 @@ export type NostrMessage =
   | ["REQ", string, ...NostrFilter[]]
   | ["CLOSE", string]
   | ["CLOSED", string, string]
+  | ["COUNT", string, ...any[]]              // NIP-45
   | ["AUTH", string]           // Relay sends challenge string
-  | ["AUTH", NostrEvent];      // Client sends signed auth event (kind 22242)
+  | ["AUTH", NostrEvent]       // Client sends signed auth event (kind 22242)
+  | ["NEG-OPEN", string, NostrFilter, string] // NIP-77
+  | ["NEG-MSG", string, string]               // NIP-77
+  | ["NEG-ERR", string, string]               // NIP-77
+  | ["NEG-CLOSE", string];                    // NIP-77
 
 // WebSocket event types for Cloudflare Workers
 export interface WebSocketEventMap {
@@ -196,6 +244,7 @@ export interface DurableObjectStorage {
   put(entries: Record<string, any>): Promise<void>;
   delete(key: string): Promise<boolean>;
   delete(keys: string[]): Promise<number>;
+  list(options?: { prefix?: string }): Promise<Map<string, any>>;
   setAlarm(scheduledTime: number | Date): Promise<void>;
   getAlarm(): Promise<number | null>;
   deleteAlarm(): Promise<void>;

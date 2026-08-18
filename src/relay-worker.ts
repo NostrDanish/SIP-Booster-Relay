@@ -1,11 +1,45 @@
+/**
+ * UNCAGED SIP Relay — main Cloudflare Worker.
+ *
+ * A serverless SIP-01 search index relay: Nostr kind 39697 web-index
+ * observations (https://github.com/NostrDanish/SIP-01) on Cloudflare Workers
+ * + D1 + Durable Objects.
+ *
+ * Forked from Nosflare (https://github.com/Spl0itable/nosflare, MIT) — see
+ * UPSTREAM.md for the inherited/modified component list.
+ *
+ * Request routing:
+ *   GET /            + Upgrade: websocket            → Durable Object (Nostr protocol)
+ *   GET /            + Accept: application/nostr+json → NIP-11 relay information
+ *   GET /.well-known/nostr.json                      → NIP-05
+ *   GET /api/*                                       → operator/dashboard JSON API
+ *   POST /?notify-zap                                → zap receipt payment notification
+ *   GET <anything else>                              → static operator UI (assets binding)
+ *
+ * @module src/relay-worker
+ */
+
 import { schnorr } from "@noble/curves/secp256k1.js";
-import { Env, NostrEvent, NostrFilter, QueryResult, NostrMessage, Nip05Response } from './types';
+import { Env, NostrEvent, NostrFilter, QueryResult, Nip05Response } from './types';
 import * as config from './config';
 import { RelayWebSocket } from './durable-object';
+import { SIP01_KIND, validateSip01Event, extractSip01Fields } from '../shared/sip01.js';
+import { SUPPORTED_NIP50_OPERATORS } from '../shared/search-query.js';
+import { SIP01_SCHEMA_STATEMENTS, SCHEMA_VERSION, migrationV7Statements, CACHED_TAG_NAMES } from './sip01/schema';
+import { ingestSip01Observation, removeSip01Observations, bumpMetric } from './sip01/ingest';
+import * as sipApi from './sip01/api';
+import { executeSearch } from './sip01/search';
+import { verifyZapReceipt, hasPaidForRelay, savePaidPubkey } from './pay';
+import { serveMiniLanding } from './mini-landing';
 
 // Import config values
 const {
   relayInfo,
+  RELAY_MODE,
+  SIP01_ENABLED,
+  SIP01_VALIDATION,
+  SIP01_INDEXING,
+  PAYMENT_MODE,
   PAY_TO_RELAY_ENABLED,
   RELAY_ACCESS_PRICE_SATS,
   relayNpub,
@@ -16,11 +50,19 @@ const {
   checkValidNip05,
   blockedNip05Domains,
   allowedNip05Domains,
+  isIndexerAllowed,
+  SIP01_MAX_EVENT_BYTES,
+  NIP50_ENABLED,
+  NIP45_ENABLED,
+  NIP77_ENABLED,
+  NEG_MAX_ITEMS,
+  COUNT_MAX_ESTIMATE,
   DB_PRUNING_ENABLED,
   DB_SIZE_THRESHOLD_GB,
   DB_PRUNE_BATCH_SIZE,
   DB_PRUNE_TARGET_GB,
   pruneProtectedKinds,
+  SIP01_PRUNE_ALLOWED,
 } = config;
 
 // Query optimization constants
@@ -28,7 +70,30 @@ const GLOBAL_MAX_EVENTS = 500;
 const MAX_QUERY_COMPLEXITY = 1000;
 const CHUNK_SIZE = 500;
 
+// Re-export for the Durable Object
+export { NEG_MAX_ITEMS };
+
+/**
+ * Per-isolate, idempotent database initialization. The Durable Object's first
+ * EVENT/REQ/COUNT/NEG may arrive before any browser hit the landing page, so
+ * the storage path guarantees the schema exists on its own.
+ */
+let dbInitPromise: Promise<void> | null = null;
+
+export function ensureDatabase(db: D1Database): Promise<void> {
+  if (!dbInitPromise) {
+    dbInitPromise = initializeDatabase(db).catch((error) => {
+      console.error('DB init error:', error);
+      dbInitPromise = null; // allow retry on next request
+    });
+  }
+  return dbInitPromise;
+}
+
+// ---------------------------------------------------------------------------
 // Database initialization
+// ---------------------------------------------------------------------------
+
 async function initializeDatabase(db: D1Database): Promise<void> {
   const dropSession = db.withSession('first-primary');
 
@@ -91,30 +156,9 @@ async function initializeDatabase(db: D1Database): Promise<void> {
     ).run();
   }
 
-  try {
-    const initCheck = await dropSession.prepare(
-      "SELECT value FROM system_config WHERE key = 'db_initialized' LIMIT 1"
-    ).first().catch(() => null);
-
-    if (initCheck && initCheck.value === '1') {
-      console.log("Database already initialized");
-      return;
-    }
-  } catch (error) {
-    console.log("Database not initialized, creating schema...");
-  }
-
   const session = db.withSession('first-primary');
 
   try {
-    await session.prepare(`
-      CREATE TABLE IF NOT EXISTS system_config (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL,
-        created_at INTEGER DEFAULT (strftime('%s', 'now'))
-      )
-    `).run();
-
     const statements = [
       `CREATE TABLE IF NOT EXISTS events (
         id TEXT PRIMARY KEY,
@@ -134,6 +178,8 @@ async function initializeDatabase(db: D1Database): Promise<void> {
         tag_L TEXT,
         tag_s TEXT,
         tag_u TEXT,
+        tag_l TEXT,
+        tag_x TEXT,
         reply_to_event_id TEXT,
         root_event_id TEXT,
         content_preview TEXT
@@ -159,7 +205,7 @@ async function initializeDatabase(db: D1Database): Promise<void> {
         pubkey TEXT NOT NULL,
         kind INTEGER NOT NULL,
         created_at INTEGER NOT NULL,
-        tag_type TEXT NOT NULL CHECK(tag_type IN ('p', 'e', 'a', 't', 'd', 'r', 'L', 's', 'u')),
+        tag_type TEXT NOT NULL,
         tag_value TEXT NOT NULL,
         PRIMARY KEY (event_id, tag_type, tag_value)
       )`,
@@ -184,7 +230,10 @@ async function initializeDatabase(db: D1Database): Promise<void> {
       )`,
       `CREATE INDEX IF NOT EXISTS idx_content_hashes_pubkey ON content_hashes(pubkey)`,
       `CREATE INDEX IF NOT EXISTS idx_content_hashes_created_at ON content_hashes(created_at DESC)`,
-      `CREATE INDEX IF NOT EXISTS idx_content_hashes_pubkey_created ON content_hashes(pubkey, created_at DESC)`
+      `CREATE INDEX IF NOT EXISTS idx_content_hashes_pubkey_created ON content_hashes(pubkey, created_at DESC)`,
+
+      // SIP-01 tables (documents / observations / indexers / metrics)
+      ...SIP01_SCHEMA_STATEMENTS,
     ];
 
     for (const statement of statements) {
@@ -192,96 +241,35 @@ async function initializeDatabase(db: D1Database): Promise<void> {
     }
 
     await session.prepare("PRAGMA foreign_keys = ON").run();
-    await session.prepare(
-      "INSERT OR REPLACE INTO system_config (key, value) VALUES ('db_initialized', '1')"
-    ).run();
 
-    // Check current schema version
+    // Schema migrations (idempotent). Older databases created by upstream
+    // versions carry the restrictive tag CHECK constraint — rebuilt in v7.
     const versionResult = await session.prepare(
       "SELECT value FROM system_config WHERE key = 'schema_version'"
     ).first() as { value: string } | null;
     const currentVersion = versionResult ? parseInt(versionResult.value) : 0;
 
-    if (currentVersion < 5) {
-      console.log('Migrating to schema version 5: adding and populating tag columns in events table...');
-
-      // Add tag columns if they don't exist (for databases created before these columns were in CREATE TABLE)
-      const v5Columns = ['tag_p', 'tag_e', 'tag_a', 'tag_t', 'tag_d', 'tag_r'];
-      for (const col of v5Columns) {
+    if (currentVersion < SCHEMA_VERSION) {
+      console.log(`Migrating schema ${currentVersion} → ${SCHEMA_VERSION} (SIP-01 tag cache rebuild)...`);
+      for (const statement of migrationV7Statements()) {
         try {
-          await session.prepare(`ALTER TABLE events ADD COLUMN ${col} TEXT`).run();
-        } catch (e: any) {
-          // Column already exists — safe to ignore
-          if (!e.message?.includes('duplicate column')) throw e;
+          await session.prepare(statement).run();
+        } catch (error: any) {
+          // "duplicate column" on ALTER ADD COLUMN is fine on re-runs.
+          if (!error?.message?.includes('duplicate column')) throw error;
         }
       }
-
-      await session.prepare(`
-        UPDATE events
-        SET
-          tag_p = (SELECT tag_value FROM tags WHERE event_id = events.id AND tag_name = 'p' LIMIT 1),
-          tag_e = (SELECT tag_value FROM tags WHERE event_id = events.id AND tag_name = 'e' LIMIT 1),
-          tag_a = (SELECT tag_value FROM tags WHERE event_id = events.id AND tag_name = 'a' LIMIT 1),
-          tag_t = (SELECT tag_value FROM tags WHERE event_id = events.id AND tag_name = 't' LIMIT 1),
-          tag_d = (SELECT tag_value FROM tags WHERE event_id = events.id AND tag_name = 'd' LIMIT 1),
-          tag_r = (SELECT tag_value FROM tags WHERE event_id = events.id AND tag_name = 'r' LIMIT 1)
-        WHERE EXISTS (
-          SELECT 1 FROM tags t
-          WHERE t.event_id = events.id
-          AND t.tag_name IN ('p', 'e', 'a', 't', 'd', 'r')
-        )
-      `).run();
-
-      console.log('Schema v5 migration completed');
-    }
-
-    if (currentVersion < 6) {
-      console.log('Migrating to schema version 6: adding L/s/u tags and thread metadata...');
-
-      // Add columns if they don't exist (for databases created before these columns were in CREATE TABLE)
-      const v6Columns = ['tag_L', 'tag_s', 'tag_u', 'reply_to_event_id', 'root_event_id', 'content_preview'];
-      for (const col of v6Columns) {
-        try {
-          await session.prepare(`ALTER TABLE events ADD COLUMN ${col} TEXT`).run();
-        } catch (e: any) {
-          // Column already exists — safe to ignore
-          if (!e.message?.includes('duplicate column')) throw e;
-        }
-      }
-
-      await session.prepare(`
-        UPDATE events
-        SET
-          tag_L = (SELECT tag_value FROM tags WHERE event_id = events.id AND tag_name = 'L' LIMIT 1),
-          tag_s = (SELECT tag_value FROM tags WHERE event_id = events.id AND tag_name = 's' LIMIT 1),
-          tag_u = (SELECT tag_value FROM tags WHERE event_id = events.id AND tag_name = 'u' LIMIT 1),
-          reply_to_event_id = (SELECT tag_value FROM tags WHERE event_id = events.id AND tag_name = 'e' LIMIT 1),
-          root_event_id = (
-            SELECT tag_value FROM tags
-            WHERE event_id = events.id AND tag_name = 'e'
-            AND EXISTS (
-              SELECT 1 FROM tags t2
-              WHERE t2.event_id = events.id AND t2.tag_name = 'e'
-              HAVING COUNT(*) > 1
-            )
-            ORDER BY ROWID DESC LIMIT 1
-          ),
-          content_preview = SUBSTR(content, 1, 100)
-        WHERE EXISTS (
-          SELECT 1 FROM tags t
-          WHERE t.event_id = events.id
-          AND t.tag_name IN ('L', 's', 'u', 'e')
-        ) OR LENGTH(content) > 0
-      `).run();
-
-      console.log('Schema v6 migration completed');
+      await session.prepare(
+        "INSERT OR REPLACE INTO system_config (key, value) VALUES ('schema_version', ?)"
+      ).bind(String(SCHEMA_VERSION)).run();
+      console.log('Schema migration completed');
     }
 
     await session.prepare(
-      "INSERT OR REPLACE INTO system_config (key, value) VALUES ('schema_version', '6')"
+      "INSERT OR REPLACE INTO system_config (key, value) VALUES ('db_initialized', '1')"
     ).run();
 
-    // Populate multi-value cache from existing data
+    // Populate multi-value cache from any pre-existing events
     await session.prepare(`
       INSERT OR IGNORE INTO event_tags_cache_multi (event_id, pubkey, kind, created_at, tag_type, tag_value)
       SELECT
@@ -293,13 +281,8 @@ async function initializeDatabase(db: D1Database): Promise<void> {
         t.tag_value
       FROM events e
       INNER JOIN tags t ON e.id = t.event_id
-      WHERE t.tag_name IN ('p', 'e', 'a', 't', 'd', 'r', 'L', 's', 'u')
+      WHERE t.tag_name IN (${CACHED_TAG_NAMES.map((t) => `'${t}'`).join(', ')})
     `).run();
-
-    // Run ANALYZE to initialize statistics
-    await session.prepare("ANALYZE events").run();
-    await session.prepare("ANALYZE tags").run();
-    await session.prepare("ANALYZE event_tags_cache_multi").run();
 
     console.log("Database initialization completed!");
   } catch (error) {
@@ -308,7 +291,10 @@ async function initializeDatabase(db: D1Database): Promise<void> {
   }
 }
 
+// ---------------------------------------------------------------------------
 // Event verification
+// ---------------------------------------------------------------------------
+
 async function verifyEventSignature(event: NostrEvent): Promise<boolean> {
   try {
     const signatureBytes = hexToBytes(event.sig);
@@ -322,6 +308,20 @@ async function verifyEventSignature(event: NostrEvent): Promise<boolean> {
     return schnorr.verify(signatureBytes, messageHash, publicKeyBytes);
   } catch (error) {
     console.error("Error verifying event signature:", error);
+    return false;
+  }
+}
+
+/** Verify the event id matches its serialized hash (NIP-01). */
+async function verifyEventId(event: NostrEvent): Promise<boolean> {
+  try {
+    const serializedEventData = serializeEventForSigning(event);
+    const messageHashBuffer = await crypto.subtle.digest(
+      "SHA-256",
+      new TextEncoder().encode(serializedEventData)
+    );
+    return bytesToHex(new Uint8Array(messageHashBuffer)) === event.id;
+  } catch {
     return false;
   }
 }
@@ -365,146 +365,15 @@ function shouldCheckForDuplicates(kind: number): boolean {
   return enableAntiSpam && antiSpamKinds.has(kind);
 }
 
-// Payment handling
-async function hasPaidForRelay(pubkey: string, env: Env): Promise<boolean | null> {
-  if (!PAY_TO_RELAY_ENABLED) return true;
+// ---------------------------------------------------------------------------
+// NIP-05 validation (optional anti-spam, disabled by default)
+// ---------------------------------------------------------------------------
 
-  try {
-    const session = env.RELAY_DATABASE.withSession('first-unconstrained');
-    const result = await session.prepare(
-      "SELECT pubkey FROM paid_pubkeys WHERE pubkey = ? LIMIT 1"
-    ).bind(pubkey).first();
-    return result !== null;
-  } catch (error) {
-    console.error(`Error checking paid status for ${pubkey}:`, error);
-    return null; // null = unknown (DB error), don't cache this
-  }
-}
-
-async function savePaidPubkey(pubkey: string, env: Env): Promise<boolean> {
-  try {
-    const session = env.RELAY_DATABASE.withSession('first-primary');
-    await session.prepare(`
-      INSERT INTO paid_pubkeys (pubkey, paid_at, amount_sats)
-      VALUES (?, ?, ?)
-      ON CONFLICT(pubkey) DO UPDATE SET
-        paid_at = excluded.paid_at,
-        amount_sats = excluded.amount_sats
-    `).bind(pubkey, Math.floor(Date.now() / 1000), RELAY_ACCESS_PRICE_SATS).run();
-    return true;
-  } catch (error) {
-    console.error(`Error saving paid pubkey ${pubkey}:`, error);
-    return false;
-  }
-}
-
-// Fetches kind 0 event from fallback relay
-function fetchEventFromFallbackRelay(pubkey: string): Promise<NostrEvent | null> {
-  return new Promise((resolve, reject) => {
-    const fallbackRelayUrl = 'wss://relay.primal.net';
-    const ws = new WebSocket(fallbackRelayUrl);
-    let hasClosed = false;
-
-    const closeWebSocket = (subscriptionId: string | null) => {
-      if (!hasClosed && ws.readyState === WebSocket.OPEN) {
-        if (subscriptionId) {
-          ws.send(JSON.stringify(["CLOSE", subscriptionId]));
-        }
-        ws.close();
-        hasClosed = true;
-        console.log('WebSocket connection to fallback relay closed');
-      }
-    };
-
-    ws.addEventListener('open', () => {
-      console.log("WebSocket connection to fallback relay opened.");
-      const subscriptionId = Math.random().toString(36).substr(2, 9);
-      const filters = {
-        kinds: [0],
-        authors: [pubkey],
-        limit: 1
-      };
-      const reqMessage = JSON.stringify(["REQ", subscriptionId, filters]);
-      ws.send(reqMessage);
-    });
-
-    ws.addEventListener('message', event => {
-      try {
-        // @ts-ignore - Cloudflare Workers WebSocket event has data property
-        const message = JSON.parse(event.data) as NostrMessage;
-
-        // Handle EVENT message
-        if (message[0] === "EVENT" && message[1]) {
-          const eventData = message[2];
-          if (eventData.kind === 0 && eventData.pubkey === pubkey) {
-            console.log("Received kind 0 event from fallback relay.");
-            closeWebSocket(message[1]);
-            resolve(eventData);
-          }
-        }
-
-        // Handle EOSE message
-        else if (message[0] === "EOSE") {
-          console.log("EOSE received from fallback relay, no kind 0 event found.");
-          closeWebSocket(message[1]);
-          resolve(null);
-        }
-      } catch (error) {
-        console.error(`Error processing fallback relay event for pubkey ${pubkey}: ${error}`);
-        reject(error);
-      }
-    });
-
-    ws.addEventListener('error', (error: Event) => {
-      console.error(`WebSocket error with fallback relay:`, error);
-      ws.close();
-      hasClosed = true;
-      reject(error);
-    });
-
-    ws.addEventListener('close', () => {
-      hasClosed = true;
-      console.log('Fallback relay WebSocket connection closed.');
-    });
-
-    setTimeout(() => {
-      if (!hasClosed) {
-        console.log('Timeout reached. Closing WebSocket connection to fallback relay.');
-        closeWebSocket(null);
-        reject(new Error(`No response from fallback relay for pubkey ${pubkey}`));
-      }
-    }, 5000);
-  });
-}
-
-// Fetch kind 0 event for pubkey
-async function fetchKind0EventForPubkey(pubkey: string, env: Env): Promise<NostrEvent | null> {
+async function validateNIP05FromKind0(pubkey: string, env: Env): Promise<boolean> {
   try {
     const filters = [{ kinds: [0], authors: [pubkey], limit: 1 }];
     const result = await queryEvents(filters, 'first-unconstrained', env);
-
-    if (result.events && result.events.length > 0) {
-      return result.events[0];
-    }
-
-    // If no event found from local database, use fallback relay
-    console.log(`No kind 0 event found locally, trying fallback relay: wss://relay.primal.net`);
-    const fallbackEvent = await fetchEventFromFallbackRelay(pubkey);
-    if (fallbackEvent) {
-      return fallbackEvent;
-    }
-  } catch (error) {
-    console.error(`Error fetching kind 0 event for pubkey ${pubkey}: ${error}`);
-  }
-
-  return null;
-}
-
-// NIP-05 validation
-async function validateNIP05FromKind0(pubkey: string, env: Env): Promise<boolean> {
-  try {
-    // Fetch kind 0 event for the pubkey
-    const metadataEvent = await fetchKind0EventForPubkey(pubkey, env);
+    const metadataEvent = result.events?.[0] ?? null;
 
     if (!metadataEvent) {
       console.error(`No kind 0 metadata event found for pubkey: ${pubkey}`);
@@ -519,10 +388,7 @@ async function validateNIP05FromKind0(pubkey: string, env: Env): Promise<boolean
       return false;
     }
 
-    // Validate the NIP-05 address
-    const isValid = await validateNIP05(nip05Address, pubkey);
-    return isValid;
-
+    return await validateNIP05(nip05Address, pubkey);
   } catch (error) {
     console.error(`Error validating NIP-05 for pubkey ${pubkey}: ${error}`);
     return false;
@@ -549,7 +415,7 @@ async function validateNIP05(nip05Address: string, pubkey: string): Promise<bool
     }
 
     // Fetch the NIP-05 data
-    const url = `https://${domain}/.well-known/nostr.json?name=${name}`;
+    const url = `https://${domain}/.well-known/nostr.json?name=${encodeURIComponent(name)}`;
     const response = await fetch(url);
 
     if (!response.ok) {
@@ -573,11 +439,13 @@ async function validateNIP05(nip05Address: string, pubkey: string): Promise<bool
   }
 }
 
-// Query complexity calculation
+// ---------------------------------------------------------------------------
+// Query complexity
+// ---------------------------------------------------------------------------
+
 function calculateQueryComplexity(filter: NostrFilter): number {
   let complexity = 0;
 
-  // Base complexity
   complexity += (filter.ids?.length || 0) * 1;
   complexity += (filter.authors?.length || 0) * 2;
   complexity += (filter.kinds?.length || 0) * 5;
@@ -602,14 +470,36 @@ function calculateQueryComplexity(filter: NostrFilter): number {
   return complexity;
 }
 
+// ---------------------------------------------------------------------------
 // Event processing
+// ---------------------------------------------------------------------------
+
 async function processEvent(event: NostrEvent, sessionId: string, env: Env): Promise<{ success: boolean; message: string; bookmark?: string }> {
+  await ensureDatabase(env.RELAY_DATABASE);
+  const session = env.RELAY_DATABASE.withSession('first-primary');
   try {
+    // Event id must match the serialized hash (NIP-01)
+    if (!(await verifyEventId(event))) {
+      await bumpMetric(session, 'events_invalid');
+      return { success: false, message: "invalid: event id does not match content" };
+    }
+
+    // created_at sanity: reject far-future events (NIP-01 SHOULD)
+    const upperLimit = relayInfo.limitation?.created_at_upper_limit;
+    if (typeof upperLimit === 'number' && upperLimit > 0) {
+      const now = Math.floor(Date.now() / 1000);
+      if (event.created_at > now + upperLimit) {
+        await bumpMetric(session, 'events_invalid');
+        return { success: false, message: "invalid: created_at is too far in the future" };
+      }
+    }
+
     // NIP-05 validation if enabled (bypassed for kind 1059)
     if (event.kind !== 1059 && checkValidNip05 && event.kind !== 0) {
       const isValidNIP05 = await validateNIP05FromKind0(event.pubkey, env);
       if (!isValidNIP05) {
         console.error(`Event denied. NIP-05 validation failed for pubkey ${event.pubkey}.`);
+        await bumpMetric(session, 'events_invalid');
         return { success: false, message: "invalid: NIP-05 validation failed" };
       }
     }
@@ -624,6 +514,31 @@ async function processEvent(event: NostrEvent, sessionId: string, env: Env): Pro
       return { success: true, message: "Ephemeral event broadcast" };
     }
 
+    // SIP-01: validate web index observations at ingestion (§12.4) and apply
+    // the operator's indexer policy. An invalid observation never reaches the
+    // index — garbage in = garbage index.
+    if (event.kind === SIP01_KIND && SIP01_ENABLED) {
+      if (!isIndexerAllowed(event.pubkey)) {
+        await bumpMetric(session, 'sip01_indexer_blocked');
+        return { success: false, message: "blocked: indexer pubkey not allowed on this relay" };
+      }
+
+      const eventBytes = JSON.stringify(event).length;
+      if (eventBytes > SIP01_MAX_EVENT_BYTES) {
+        await bumpMetric(session, 'sip01_validation_failures');
+        return { success: false, message: `invalid: event exceeds ${SIP01_MAX_EVENT_BYTES} bytes` };
+      }
+
+      if (SIP01_VALIDATION) {
+        const validation = await validateSip01Event(event as any);
+        if (!validation.valid) {
+          await bumpMetric(session, 'sip01_validation_failures');
+          console.log(`sip01: rejected observation ${event.id}: ${validation.errors.join('; ')}`);
+          return { success: false, message: `invalid: ${validation.errors[0]}` };
+        }
+      }
+    }
+
     // Save event directly to database (duplicate check happens inside saveEventToDatabase)
     return await saveEventToDatabase(event, env);
 
@@ -633,7 +548,10 @@ async function processEvent(event: NostrEvent, sessionId: string, env: Env): Pro
   }
 }
 
-// Save event directly to D1 database
+// ---------------------------------------------------------------------------
+// Event storage
+// ---------------------------------------------------------------------------
+
 async function saveEventToDatabase(event: NostrEvent, env: Env): Promise<{ success: boolean; message: string; bookmark?: string }> {
   try {
     // Check worker cache for duplicate event ID
@@ -649,11 +567,11 @@ async function saveEventToDatabase(event: NostrEvent, env: Env): Promise<{ succe
     // Check D1 for duplicate event ID
     const existingEvent = await session.prepare("SELECT id FROM events WHERE id = ? LIMIT 1").bind(event.id).first();
     if (existingEvent) {
+      if (event.kind === SIP01_KIND) await bumpMetric(session, 'sip01_duplicates');
       return { success: false, message: "duplicate: event already exists", bookmark: session.getBookmark() ?? undefined };
     }
 
     // NIP-16: Replaceable events (kinds 0, 3, 10000-19999)
-    // Only the latest event (by created_at) for a given (kind, pubkey) should be stored
     const isReplaceable = event.kind === 0 || event.kind === 3 || (event.kind >= 10000 && event.kind < 20000);
     if (isReplaceable) {
       const existing = await session.prepare(
@@ -664,7 +582,6 @@ async function saveEventToDatabase(event: NostrEvent, env: Env): Promise<{ succe
         if (event.created_at <= (existing.created_at as number)) {
           return { success: false, message: "duplicate: a newer or equal replaceable event already exists", bookmark: session.getBookmark() ?? undefined };
         }
-        // Delete the older event and its associated data
         const oldId = existing.id as string;
         await session.batch([
           session.prepare("DELETE FROM tags WHERE event_id = ?").bind(oldId),
@@ -676,8 +593,9 @@ async function saveEventToDatabase(event: NostrEvent, env: Env): Promise<{ succe
       }
     }
 
-    // NIP-33: Parameterized replaceable events (kinds 30000-39999)
-    // Only the latest event for a given (kind, pubkey, d-tag) should be stored
+    // NIP-01 addressable events (kinds 30000-39999) — the SIP-01 kind 39697
+    // slot: one live observation per (pubkey, d). The superseded observation
+    // row is removed so document/indexer aggregates stay exact.
     const isParameterizedReplaceable = event.kind >= 30000 && event.kind < 40000;
     if (isParameterizedReplaceable) {
       const dTag = event.tags.find(t => t[0] === 'd')?.[1] || '';
@@ -689,7 +607,6 @@ async function saveEventToDatabase(event: NostrEvent, env: Env): Promise<{ succe
         if (event.created_at <= (existing.created_at as number)) {
           return { success: false, message: "duplicate: a newer or equal parameterized replaceable event already exists", bookmark: session.getBookmark() ?? undefined };
         }
-        // Delete the older event and its associated data
         const oldId = existing.id as string;
         await session.batch([
           session.prepare("DELETE FROM tags WHERE event_id = ?").bind(oldId),
@@ -697,6 +614,9 @@ async function saveEventToDatabase(event: NostrEvent, env: Env): Promise<{ succe
           session.prepare("DELETE FROM event_tags_cache_multi WHERE event_id = ?").bind(oldId),
           session.prepare("DELETE FROM events WHERE id = ?").bind(oldId),
         ]);
+        if (event.kind === SIP01_KIND && SIP01_INDEXING) {
+          await removeSip01Observations(session, [oldId]);
+        }
         console.log(`Replaced older parameterized event ${oldId} with newer event ${event.id} (kind ${event.kind}, d=${dTag})`);
       }
     }
@@ -706,7 +626,6 @@ async function saveEventToDatabase(event: NostrEvent, env: Env): Promise<{ succe
     if (shouldCheckForDuplicates(event.kind)) {
       contentHash = await hashContent(event);
 
-      // Check D1 for existing content hash
       const duplicateContent = enableGlobalDuplicateCheck
         ? await session.prepare("SELECT event_id FROM content_hashes WHERE hash = ? LIMIT 1").bind(contentHash).first()
         : await session.prepare("SELECT event_id FROM content_hashes WHERE hash = ? AND pubkey = ? LIMIT 1").bind(contentHash, event.pubkey).first();
@@ -718,33 +637,15 @@ async function saveEventToDatabase(event: NostrEvent, env: Env): Promise<{ succe
 
     // Process tags and extract common tag values
     const tagInserts: Array<{ name: string; value: string }> = [];
-    let tagP: string | null = null;
-    let tagE: string | null = null;
-    let tagA: string | null = null;
-    let tagT: string | null = null;
-    let tagD: string | null = null;
-    let tagR: string | null = null;
-    let tagL: string | null = null;
-    let tagS: string | null = null;
-    let tagU: string | null = null;
+    const firstValues: Record<string, string | null> = {};
+    for (const name of CACHED_TAG_NAMES) firstValues[name] = null;
 
     for (const tag of event.tags) {
       if (tag[0]) {
-        tagInserts.push({
-          name: tag[0],
-          value: tag[1] || ''
-        });
-
-        // Capture first occurrence of common tags
-        if (tag[0] === 'p' && !tagP) tagP = tag[1];
-        if (tag[0] === 'e' && !tagE) tagE = tag[1];
-        if (tag[0] === 'a' && !tagA) tagA = tag[1];
-        if (tag[0] === 't' && !tagT) tagT = tag[1];
-        if (tag[0] === 'd' && !tagD) tagD = tag[1];
-        if (tag[0] === 'r' && !tagR) tagR = tag[1];
-        if (tag[0] === 'L' && !tagL) tagL = tag[1];
-        if (tag[0] === 's' && !tagS) tagS = tag[1];
-        if (tag[0] === 'u' && !tagU) tagU = tag[1];
+        tagInserts.push({ name: tag[0], value: tag[1] || '' });
+        if (tag[0] in firstValues && firstValues[tag[0]] === null) {
+          firstValues[tag[0]] = tag[1] ?? '';
+        }
       }
     }
 
@@ -756,8 +657,8 @@ async function saveEventToDatabase(event: NostrEvent, env: Env): Promise<{ succe
 
     // Insert the main event
     const insertResult = await session.prepare(`
-      INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, tag_p, tag_e, tag_a, tag_t, tag_d, tag_r, tag_L, tag_s, tag_u, reply_to_event_id, root_event_id, content_preview)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, tag_p, tag_e, tag_a, tag_t, tag_d, tag_r, tag_L, tag_s, tag_u, tag_l, tag_x, reply_to_event_id, root_event_id, content_preview)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO NOTHING
     `).bind(
       event.id,
@@ -767,15 +668,17 @@ async function saveEventToDatabase(event: NostrEvent, env: Env): Promise<{ succe
       JSON.stringify(event.tags),
       event.content,
       event.sig,
-      tagP,
-      tagE,
-      tagA,
-      tagT,
-      tagD,
-      tagR,
-      tagL,
-      tagS,
-      tagU,
+      firstValues['p'],
+      firstValues['e'],
+      firstValues['a'],
+      firstValues['t'],
+      firstValues['d'],
+      firstValues['r'],
+      firstValues['L'],
+      firstValues['s'],
+      firstValues['u'],
+      firstValues['l'],
+      firstValues['x'],
       replyToEventId,
       rootEventId,
       contentPreview
@@ -787,19 +690,18 @@ async function saveEventToDatabase(event: NostrEvent, env: Env): Promise<{ succe
       return { success: false, message: "duplicate: event already exists", bookmark: session.getBookmark() ?? undefined };
     }
 
-    // Consolidate all post-insert writes (tags, caches, content hash) into a single batch
-    // to minimize D1 round-trips to the primary
-    const postInsertBatch: ReturnType<typeof session.prepare>[] = [];
+    // Consolidate all post-insert writes (tags, caches, content hash) into batches
+    const postInsertBatch: D1PreparedStatement[] = [];
 
-    // Tag inserts
     for (const t of tagInserts) {
       postInsertBatch.push(
         session.prepare('INSERT INTO tags (event_id, tag_name, tag_value) VALUES (?, ?, ?)').bind(event.id, t.name, t.value)
       );
     }
 
-    // Multi-value tag cache for p/e/a/t/d/r/L/s/u tags
-    const cacheableTags = tagInserts.filter(t => ['p', 'e', 'a', 't', 'd', 'r', 'L', 's', 'u'].includes(t.name));
+    // Multi-value tag cache for relay-filterable single-letter tags
+    const cachedSet = new Set<string>(CACHED_TAG_NAMES as readonly string[]);
+    const cacheableTags = tagInserts.filter(t => cachedSet.has(t.name));
     for (const t of cacheableTags) {
       postInsertBatch.push(
         session.prepare(`
@@ -820,16 +722,28 @@ async function saveEventToDatabase(event: NostrEvent, env: Env): Promise<{ succe
       );
     }
 
-    // Execute all post-insert writes in chunks of 100 (D1 batch limit)
-    for (let i = 0; i < postInsertBatch.length; i += 100) {
-      await session.batch(postInsertBatch.slice(i, i + 100));
+    // Execute all post-insert writes in chunks of 90 (D1 batch limit is 100)
+    for (let i = 0; i < postInsertBatch.length; i += 90) {
+      await session.batch(postInsertBatch.slice(i, i + 90));
     }
+
+    // SIP-01: maintain the document/observation/indexer index.
+    if (event.kind === SIP01_KIND && SIP01_INDEXING) {
+      try {
+        await ingestSip01Observation(session, event);
+        await bumpMetric(session, 'sip01_accepted');
+      } catch (error) {
+        // Indexing failure must not lose the event itself; the reindex script
+        // can repair derived tables from the canonical events table.
+        console.error(`sip01: indexing failed for ${event.id}:`, error);
+        await bumpMetric(session, 'sip01_index_errors');
+      }
+    }
+    await bumpMetric(session, 'events_accepted');
 
     // Cache the event ID in worker cache to prevent duplicates
     await cache.put(cacheKey, new Response('cached', {
-      headers: {
-        'Cache-Control': 'max-age=3600'
-      }
+      headers: { 'Cache-Control': 'max-age=3600' }
     }));
 
     console.log(`Event ${event.id} saved directly to database`);
@@ -849,7 +763,10 @@ async function processDeletionEvent(event: NostrEvent, env: Env): Promise<{ succ
 
   const session = env.RELAY_DATABASE.withSession('first-primary');
 
-  if (deletedEventIds.length === 0) {
+  // NIP-33-style address deletion (`a` tags) for addressable events
+  const addressTags = event.tags.filter(tag => tag[0] === "a").map(tag => tag[1]);
+
+  if (deletedEventIds.length === 0 && addressTags.length === 0) {
     return { success: true, message: "No events to delete", bookmark: session.getBookmark() ?? undefined };
   }
 
@@ -857,7 +774,6 @@ async function processDeletionEvent(event: NostrEvent, env: Env): Promise<{ succ
   const errors: string[] = [];
   const idsToDelete: string[] = [];
 
-  // Verify ownership for all events in a single query
   if (deletedEventIds.length > 0) {
     try {
       const ownerPlaceholders = deletedEventIds.map(() => '?').join(',');
@@ -873,7 +789,7 @@ async function processDeletionEvent(event: NostrEvent, env: Env): Promise<{ succ
       for (const eventId of deletedEventIds) {
         const ownerPubkey = eventOwners.get(eventId);
         if (!ownerPubkey) {
-          console.warn(`Event ${eventId} not found in D1. Nothing to delete (may be in queue).`);
+          console.warn(`Event ${eventId} not found in D1. Nothing to delete.`);
           continue;
         }
         if (ownerPubkey !== event.pubkey) {
@@ -889,10 +805,38 @@ async function processDeletionEvent(event: NostrEvent, env: Env): Promise<{ succ
     }
   }
 
-  // Second pass: batch delete all verified events in one D1 call
+  // Address deletion: `a` tag value is `<kind>:<pubkey>:<d>`. Only the
+  // address owner may delete, and only events at or older than the kind-5's
+  // created_at (NIP-09 addressable semantics).
+  if (addressTags.length > 0) {
+    for (const addr of addressTags) {
+      const [kindStr, author, d] = addr.split(':');
+      const kind = Number.parseInt(kindStr, 10);
+      if (!Number.isFinite(kind) || !author || author !== event.pubkey) continue;
+
+      try {
+        const existing = await session.prepare(
+          "SELECT id, created_at FROM events WHERE kind = ? AND pubkey = ? AND tag_d = ? LIMIT 1"
+        ).bind(kind, author, d ?? '').first();
+
+        if (existing && (existing.created_at as number) <= event.created_at) {
+          idsToDelete.push(existing.id as string);
+        }
+      } catch (error) {
+        console.error(`Error resolving address ${addr}:`, error);
+      }
+    }
+  }
+
   if (idsToDelete.length > 0) {
     try {
-      const deleteStatements: ReturnType<typeof session.prepare>[] = [];
+      // SIP-01: drop derived observation rows first (documents/indexers
+      // aggregates are repaired inside removeSip01Observations).
+      if (SIP01_INDEXING) {
+        await removeSip01Observations(session, idsToDelete);
+      }
+
+      const deleteStatements: D1PreparedStatement[] = [];
       for (const eventId of idsToDelete) {
         deleteStatements.push(
           session.prepare("DELETE FROM tags WHERE event_id = ?").bind(eventId),
@@ -902,9 +846,8 @@ async function processDeletionEvent(event: NostrEvent, env: Env): Promise<{ succ
         );
       }
 
-      // Execute in chunks of 100 (D1 batch limit)
-      for (let i = 0; i < deleteStatements.length; i += 100) {
-        await session.batch(deleteStatements.slice(i, i + 100));
+      for (let i = 0; i < deleteStatements.length; i += 90) {
+        await session.batch(deleteStatements.slice(i, i + 90));
       }
 
       deletedCount = idsToDelete.length;
@@ -929,7 +872,10 @@ async function processDeletionEvent(event: NostrEvent, env: Env): Promise<{ succ
   };
 }
 
-// Helper function to chunk arrays
+// ---------------------------------------------------------------------------
+// Query building (NIP-01 filters)
+// ---------------------------------------------------------------------------
+
 function chunkArray<T>(array: T[], chunkSize: number): T[][] {
   const chunks: T[][] = [];
   for (let i = 0; i < array.length; i += chunkSize) {
@@ -942,19 +888,20 @@ function chunkArray<T>(array: T[], chunkSize: number): T[][] {
 const EVENT_COLS = 'e.id, e.pubkey, e.created_at, e.kind, e.tags, e.content, e.sig';
 const EVENT_COLS_BARE = 'id, pubkey, created_at, kind, tags, content, sig';
 
-// Build COUNT query for precheck
+const CACHED_TAG_SET = new Set<string>(CACHED_TAG_NAMES as readonly string[]);
+
+// Build COUNT query for precheck + NIP-45
 function buildCountQuery(filter: NostrFilter): { sql: string; params: any[] } {
   const params: any[] = [];
   const conditions: string[] = [];
 
-  // Count and categorize tag filters
-  const directTags: Array<{ name: string; values: string[] }> = []; // Tags with direct columns (p, e, a, t, d, r)
+  const directTags: Array<{ name: string; values: string[] }> = [];
   const otherTags: Array<{ name: string; values: string[] }> = [];
 
   for (const [key, values] of Object.entries(filter)) {
     if (key.startsWith('#') && Array.isArray(values) && values.length > 0) {
       const tagName = key.substring(1);
-      if (['p', 'e', 'a', 't', 'd', 'r', 'L', 's', 'u'].includes(tagName)) {
+      if (CACHED_TAG_SET.has(tagName)) {
         directTags.push({ name: tagName, values });
       } else {
         otherTags.push({ name: tagName, values });
@@ -998,6 +945,7 @@ function buildCountQuery(filter: NostrFilter): { sql: string; params: any[] } {
       const firstHint = hasKindsMulti && filter.kinds!.length <= 10
         ? " INDEXED BY idx_cache_multi_kind_type_value"
         : " INDEXED BY idx_cache_multi_type_value_time";
+
       const additionalJoins = directTags.slice(1).map((t, i) => {
         const alias = `m${i + 1}`;
         const placeholders = t.values.map(() => '?').join(',');
@@ -1008,7 +956,6 @@ function buildCountQuery(filter: NostrFilter): { sql: string; params: any[] } {
         ${additionalJoins}
         WHERE m0.tag_type = ? AND m0.tag_value IN (${firstTag.values.map(() => '?').join(',')})`;
 
-      // First tag params, then additional tag params
       params.push(firstTag.name, ...firstTag.values);
       for (const tagFilter of directTags.slice(1)) {
         params.push(tagFilter.name, ...tagFilter.values);
@@ -1063,7 +1010,6 @@ function buildCountQuery(filter: NostrFilter): { sql: string; params: any[] } {
       }
       return { sql, params };
     } else {
-      // Multiple tags
       const tagConditions = allTags.map(t => {
         const placeholders = t.values.map(() => '?').join(',');
         return `(t.tag_name = ? AND t.tag_value IN (${placeholders}))`;
@@ -1097,7 +1043,6 @@ function buildCountQuery(filter: NostrFilter): { sql: string; params: any[] } {
       sql += ` GROUP BY e.id HAVING COUNT(DISTINCT t.tag_name) = ?`;
       params.push(allTags.length);
 
-      // Wrap in outer SELECT to count
       sql = `SELECT COUNT(*) as count FROM (${sql})`;
       return { sql, params };
     }
@@ -1139,9 +1084,8 @@ function buildQuery(filter: NostrFilter): { sql: string; params: any[] } {
   const params: any[] = [];
   const conditions: string[] = [];
 
-  // Count and categorize tag filters
   let tagCount = 0;
-  const directTags: Array<{ name: string; values: string[] }> = []; // Tags with direct columns (p, e, a, t, d, r, L, s, u)
+  const directTags: Array<{ name: string; values: string[] }> = [];
   const otherTags: Array<{ name: string; values: string[] }> = [];
 
   for (const [key, values] of Object.entries(filter)) {
@@ -1149,8 +1093,7 @@ function buildQuery(filter: NostrFilter): { sql: string; params: any[] } {
       tagCount += values.length;
       const tagName = key.substring(1);
 
-      // Check if this tag has a direct column in events table (p, e, a, t, d, r, L, s, u)
-      if (['p', 'e', 'a', 't', 'd', 'r', 'L', 's', 'u'].includes(tagName)) {
+      if (CACHED_TAG_SET.has(tagName)) {
         directTags.push({ name: tagName, values });
       } else {
         otherTags.push({ name: tagName, values });
@@ -1281,7 +1224,6 @@ function buildQuery(filter: NostrFilter): { sql: string; params: any[] } {
         params.push(filter.until);
       }
 
-      // Cursor-based pagination support
       if (filter.cursor) {
         const [timestamp, lastId] = filter.cursor.split(':');
         whereConditions.push("(e.created_at < ? OR (e.created_at = ? AND e.id > ?))");
@@ -1305,7 +1247,6 @@ function buildQuery(filter: NostrFilter): { sql: string; params: any[] } {
       return `(t.tag_name = ? AND t.tag_value IN (${placeholders}))`;
     }).join(' OR ');
 
-    // Add all parameters
     for (const tagFilter of allTags) {
       params.push(tagFilter.name, ...tagFilter.values);
     }
@@ -1341,7 +1282,6 @@ function buildQuery(filter: NostrFilter): { sql: string; params: any[] } {
       params.push(filter.until);
     }
 
-    // Cursor-based pagination support
     if (filter.cursor) {
       const [timestamp, lastId] = filter.cursor.split(':');
       whereConditions.push("(e.created_at < ? OR (e.created_at = ? AND e.id > ?))");
@@ -1372,7 +1312,6 @@ function buildQuery(filter: NostrFilter): { sql: string; params: any[] } {
   const authorCount = filter.authors?.length || 0;
   const kindCount = filter.kinds?.length || 0;
 
-  // Choose optimal index based on query pattern
   if (hasAuthors && hasKinds && authorCount <= 10 && kindCount <= 10) {
     if (authorCount <= kindCount) {
       indexHint = " INDEXED BY idx_events_pubkey_kind_created_at";
@@ -1416,7 +1355,6 @@ function buildQuery(filter: NostrFilter): { sql: string; params: any[] } {
     params.push(filter.until);
   }
 
-  // Cursor-based pagination support
   if (filter.cursor) {
     const [timestamp, lastId] = filter.cursor.split(':');
     conditions.push("(created_at < ? OR (created_at = ? AND id > ?))");
@@ -1437,9 +1375,8 @@ function buildQuery(filter: NostrFilter): { sql: string; params: any[] } {
 // Helper function to handle chunked queries
 async function queryDatabaseChunked(filter: NostrFilter, bookmark: string, env: Env): Promise<{ events: NostrEvent[] }> {
   const session = env.RELAY_DATABASE.withSession(bookmark);
-  const allRows = new Map<string, any>(); // Collect rows first, dedupe by ID
+  const allRows = new Map<string, any>();
 
-  // Create a base filter with everything except the large arrays
   const baseFilter: NostrFilter = { ...filter };
   const needsChunking = {
     ids: false,
@@ -1448,7 +1385,6 @@ async function queryDatabaseChunked(filter: NostrFilter, bookmark: string, env: 
     tags: {} as Record<string, boolean>
   };
 
-  // Identify what needs chunking and remove from base filter
   if (filter.ids && filter.ids.length > CHUNK_SIZE) {
     needsChunking.ids = true;
     delete baseFilter.ids;
@@ -1464,7 +1400,6 @@ async function queryDatabaseChunked(filter: NostrFilter, bookmark: string, env: 
     delete baseFilter.kinds;
   }
 
-  // Check tag filters
   for (const [key, values] of Object.entries(filter)) {
     if (key.startsWith('#') && Array.isArray(values) && values.length > CHUNK_SIZE) {
       needsChunking.tags[key] = true;
@@ -1472,7 +1407,6 @@ async function queryDatabaseChunked(filter: NostrFilter, bookmark: string, env: 
     }
   }
 
-  // Helper function to process string array chunks
   const processStringChunks = async (filterType: 'ids' | 'authors' | string, values: string[]) => {
     const chunks = chunkArray(values, CHUNK_SIZE);
 
@@ -1503,7 +1437,6 @@ async function queryDatabaseChunked(filter: NostrFilter, bookmark: string, env: 
     }
   };
 
-  // Helper function to process number array chunks
   const processNumberChunks = async (filterType: 'kinds', values: number[]) => {
     const chunks = chunkArray(values, CHUNK_SIZE);
 
@@ -1527,7 +1460,6 @@ async function queryDatabaseChunked(filter: NostrFilter, bookmark: string, env: 
     }
   };
 
-  // Process each filter type that needs chunking
   if (needsChunking.ids && filter.ids) {
     await processStringChunks('ids', filter.ids);
   }
@@ -1540,7 +1472,6 @@ async function queryDatabaseChunked(filter: NostrFilter, bookmark: string, env: 
     await processNumberChunks('kinds', filter.kinds);
   }
 
-  // Process tag filters
   for (const [tagKey, _] of Object.entries(needsChunking.tags)) {
     const tagValues = filter[tagKey];
     if (Array.isArray(tagValues) && tagValues.every((v: any) => typeof v === 'string')) {
@@ -1548,7 +1479,6 @@ async function queryDatabaseChunked(filter: NostrFilter, bookmark: string, env: 
     }
   }
 
-  // If nothing needed chunking, just run the query as-is
   if (!needsChunking.ids && !needsChunking.authors && !needsChunking.kinds && Object.keys(needsChunking.tags).length === 0) {
     const query = buildQuery(filter);
 
@@ -1565,7 +1495,6 @@ async function queryDatabaseChunked(filter: NostrFilter, bookmark: string, env: 
     }
   }
 
-  // Build events from collected rows
   const events = Array.from(allRows.values()).map(row => ({
     id: row.id as string,
     pubkey: row.pubkey as string,
@@ -1582,24 +1511,22 @@ async function queryDatabaseChunked(filter: NostrFilter, bookmark: string, env: 
 
 // Query handling
 async function queryEvents(filters: NostrFilter[], bookmark: string, env: Env): Promise<QueryResult> {
+  await ensureDatabase(env.RELAY_DATABASE);
   try {
     console.log(`Processing query with ${filters.length} filters and bookmark: ${bookmark}`);
     const session = env.RELAY_DATABASE.withSession(bookmark);
     const eventSet = new Map<string, NostrEvent>();
 
-    // Separate filters into chunked vs batchable
     const chunkedFilters: NostrFilter[] = [];
     const batchableFilters: NostrFilter[] = [];
 
     for (const filter of filters) {
-      // Check query complexity
       const complexity = calculateQueryComplexity(filter);
       if (complexity > MAX_QUERY_COMPLEXITY) {
         console.warn(`Query too complex (complexity: ${complexity}), skipping filter`);
         continue;
       }
 
-      // Check if any array in the filter exceeds chunk size
       const needsChunking = (
         (filter.ids && filter.ids.length > CHUNK_SIZE) ||
         (filter.authors && filter.authors.length > CHUNK_SIZE) ||
@@ -1616,7 +1543,6 @@ async function queryEvents(filters: NostrFilter[], bookmark: string, env: Env): 
       }
     }
 
-    // Execute chunked filters sequentially
     let totalEventsRead = 0;
     for (const filter of chunkedFilters) {
       if (totalEventsRead >= GLOBAL_MAX_EVENTS) {
@@ -1633,12 +1559,9 @@ async function queryEvents(filters: NostrFilter[], bookmark: string, env: Env): 
       }
     }
 
-    // Execute batchable filters in parallel using D1 batch API
     if (batchableFilters.length > 0 && totalEventsRead < GLOBAL_MAX_EVENTS) {
-      // Precheck expensive tag queries with COUNT
       const validFilters: NostrFilter[] = [];
       for (const filter of batchableFilters) {
-        // Only precheck if filter has tag filters
         const hasTagFilters = Object.keys(filter).some(key => key.startsWith('#'));
 
         if (hasTagFilters) {
@@ -1667,15 +1590,11 @@ async function queryEvents(filters: NostrFilter[], bookmark: string, env: Env): 
 
         try {
           const results = await session.batch(queries);
-
-          // Collect all rows first
           const allRows: any[] = [];
 
-          // Process all batch results
           for (let i = 0; i < results.length; i++) {
             const result = results[i];
 
-            // Log query metadata for first result
             if (i === 0 && result.meta) {
               console.log({
                 servedByRegion: result.meta.served_by_region ?? "",
@@ -1695,7 +1614,6 @@ async function queryEvents(filters: NostrFilter[], bookmark: string, env: Env): 
             }
           }
 
-          // Build events from collected rows
           for (const row of allRows) {
             const event: NostrEvent = {
               id: row.id as string,
@@ -1732,12 +1650,135 @@ async function queryEvents(filters: NostrFilter[], bookmark: string, env: Env): 
   }
 }
 
+// ---------------------------------------------------------------------------
+// NIP-45 COUNT
+// ---------------------------------------------------------------------------
+
+async function countEvents(filters: NostrFilter[], bookmark: string, env: Env): Promise<number> {
+  await ensureDatabase(env.RELAY_DATABASE);
+  const session = env.RELAY_DATABASE.withSession(bookmark);
+  let total = 0;
+
+  for (const filter of filters) {
+    const complexity = calculateQueryComplexity(filter);
+    if (complexity > MAX_QUERY_COMPLEXITY) {
+      console.warn(`COUNT filter too complex (${complexity}), skipping`);
+      continue;
+    }
+    const { sql, params } = buildCountQuery(filter);
+    try {
+      const result = await session.prepare(sql).bind(...params).first() as { count: number } | null;
+      total += (result?.count as number) || 0;
+      if (total > COUNT_MAX_ESTIMATE * 10) {
+        // Guard against unbounded aggregate scans.
+        break;
+      }
+    } catch (error) {
+      console.error('COUNT query failed:', error);
+    }
+  }
+
+  return total;
+}
+
+// ---------------------------------------------------------------------------
+// NIP-77 sync item loading
+// ---------------------------------------------------------------------------
+
+/**
+ * Load (created_at, id) pairs matching a filter for negentropy
+ * reconciliation, sorted ascending per the protocol. Bounded by
+ * NEG_MAX_ITEMS; the caller refuses the session when the cap is hit.
+ */
+async function querySyncItems(filter: NostrFilter, env: Env): Promise<{ items: Array<{ created_at: number; id: string }>; truncated: boolean }> {
+  await ensureDatabase(env.RELAY_DATABASE);
+  const session = env.RELAY_DATABASE.withSession('first-unconstrained');
+
+  const conditions: string[] = [];
+  const params: any[] = [];
+
+  if (filter.ids && filter.ids.length > 0) {
+    conditions.push(`id IN (${filter.ids.map(() => '?').join(',')})`);
+    params.push(...filter.ids);
+  }
+  if (filter.authors && filter.authors.length > 0) {
+    conditions.push(`pubkey IN (${filter.authors.map(() => '?').join(',')})`);
+    params.push(...filter.authors);
+  }
+  if (filter.kinds && filter.kinds.length > 0) {
+    conditions.push(`kind IN (${filter.kinds.map(() => '?').join(',')})`);
+    params.push(...filter.kinds);
+  }
+  if (filter.since) {
+    conditions.push('created_at >= ?');
+    params.push(filter.since);
+  }
+  if (filter.until) {
+    conditions.push('created_at <= ?');
+    params.push(filter.until);
+  }
+  for (const [key, values] of Object.entries(filter)) {
+    if (key.startsWith('#') && Array.isArray(values) && values.length > 0) {
+      const tagName = key.substring(1);
+      if (tagName.length !== 1) continue;
+      conditions.push(
+        `EXISTS (SELECT 1 FROM event_tags_cache_multi m WHERE m.event_id = events.id AND m.tag_type = ? AND m.tag_value IN (${values.map(() => '?').join(',')}))`,
+      );
+      params.push(tagName, ...values);
+    }
+  }
+
+  const sql = `
+    SELECT id, created_at FROM events
+    ${conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''}
+    ORDER BY created_at ASC, id ASC
+    LIMIT ?
+  `;
+  params.push(NEG_MAX_ITEMS + 1);
+
+  const result = await session.prepare(sql).bind(...params).all();
+  const rows = (result.results ?? []) as Array<{ id: string; created_at: number }>;
+  const truncated = rows.length > NEG_MAX_ITEMS;
+  return { items: rows.slice(0, NEG_MAX_ITEMS), truncated };
+}
+
+// ---------------------------------------------------------------------------
+// NIP-11 relay information document
+// ---------------------------------------------------------------------------
+
 function handleRelayInfoRequest(request: Request): Response {
   const responseInfo = { ...relayInfo };
 
-  if (PAY_TO_RELAY_ENABLED) {
+  // Advertise exactly what is enabled — never more.
+  const nips = new Set<number>([1, 5, 9, 11, 16, 33, 42]);
+  if (NIP45_ENABLED) nips.add(45);
+  if (NIP50_ENABLED) nips.add(50);
+  if (NIP77_ENABLED) nips.add(77);
+  responseInfo.supported_nips = [...nips].sort((a, b) => a - b);
+
+  // SIP-01 capability block (SIP-01 §15).
+  if (SIP01_ENABLED) {
+    responseInfo.uncaged_index = {
+      sip01: true,
+      nip50: NIP50_ENABLED,
+      nip77: NIP77_ENABLED,
+      document_kinds: [SIP01_KIND],
+      scope: config.SIP01_SCOPE,
+      domains: config.SIP01_SCOPE_DOMAINS,
+      languages: config.SIP01_SCOPE_LANGUAGES,
+      document_types: config.SIP01_SCOPE_DOCUMENT_TYPES,
+      filters: [...SUPPORTED_NIP50_OPERATORS],
+      relay_mode: RELAY_MODE,
+      validation: config.SIP01_VALIDATION,
+      schema_version: '1',
+    };
+  }
+
+  if (PAYMENT_MODE !== 'free') {
     const url = new URL(request.url);
     responseInfo.payments_url = `${url.protocol}//${url.host}`;
+  }
+  if (PAY_TO_RELAY_ENABLED) {
     responseInfo.fees = {
       admission: [{ amount: RELAY_ACCESS_PRICE_SATS * 1000, unit: "msats" }]
     };
@@ -1754,368 +1795,9 @@ function handleRelayInfoRequest(request: Request): Response {
   });
 }
 
-function serveLandingPage(): Response {
-  const payToRelaySection = PAY_TO_RELAY_ENABLED ? `
-    <div class="pay-section" id="paySection">
-      <p style="margin-bottom: 1rem;">Pay to access this relay:</p>
-      <button id="payButton" class="pay-button" data-npub="${relayNpub}" data-relays="wss://relay.damus.io,wss://relay.primal.net,wss://sendit.nosflare.com" data-sats-amount="${RELAY_ACCESS_PRICE_SATS}">
-        <img src="https://nosflare.com/images/pwb-button-min.png" alt="Pay with Bitcoin" style="height: 60px;">
-      </button>
-      <p class="price-info">${RELAY_ACCESS_PRICE_SATS.toLocaleString()} sats</p>
-    </div>
-    <div class="info-box" id="accessSection" style="display: none;">
-      <p style="margin-bottom: 1rem;">Connect your Nostr client to:</p>
-      <div class="url-display" onclick="copyToClipboard()" id="relay-url">
-        <!-- URL will be inserted by JavaScript -->
-      </div>
-      <p class="copy-hint">Click to copy</p>
-    </div>
-  ` : `
-    <div class="info-box">
-      <p style="margin-bottom: 1rem;">Connect your Nostr client to:</p>
-      <div class="url-display" onclick="copyToClipboard()" id="relay-url">
-        <!-- URL will be inserted by JavaScript -->
-      </div>
-      <p class="copy-hint">Click to copy</p>
-    </div>
-  `;
-
-  const html = `
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="A serverless Nostr relay through Cloudflare Worker and D1 database" />
-    <title>Nosflare - Nostr Relay</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-        
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-            background-color: #0a0a0a;
-            color: #ffffff;
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            position: relative;
-            overflow: hidden;
-        }
-        
-        body::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: radial-gradient(circle at 20% 50%, rgba(255, 69, 0, 0.1) 0%, transparent 50%),
-                        radial-gradient(circle at 80% 50%, rgba(255, 140, 0, 0.1) 0%, transparent 50%),
-                        radial-gradient(circle at 50% 100%, rgba(255, 0, 0, 0.05) 0%, transparent 50%);
-            animation: pulse 10s ease-in-out infinite;
-            z-index: -1;
-        }
-        
-        @keyframes pulse {
-            0%, 100% { opacity: 0.7; }
-            50% { opacity: 1; }
-        }
-        
-        .container {
-            text-align: center;
-            padding: 2rem;
-            max-width: 600px;
-            z-index: 1;
-        }
-        
-        .logo {
-            width: 400px;
-            height: auto;
-            filter: drop-shadow(0 0 30px rgba(255, 69, 0, 0.5));
-        }
-        
-        .tagline {
-            font-size: 1.2rem;
-            color: #999;
-            margin-bottom: 3rem;
-        }
-        
-        .info-box, .pay-section {
-            background: rgba(255, 255, 255, 0.05);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            border-radius: 12px;
-            padding: 2rem;
-            margin-bottom: 2rem;
-            backdrop-filter: blur(10px);
-        }
-        
-        .pay-button {
-            background: none;
-            border: none;
-            cursor: pointer;
-            padding: 0;
-            margin: 1rem 0;
-            transition: transform 0.3s ease;
-        }
-        
-        .pay-button:hover {
-            transform: scale(1.05);
-        }
-        
-        .price-info {
-            font-size: 1.2rem;
-            color: #ff8c00;
-            font-weight: 600;
-        }
-        
-        .url-display {
-            background: rgba(0, 0, 0, 0.5);
-            border: 1px solid rgba(255, 69, 0, 0.3);
-            border-radius: 8px;
-            padding: 1rem;
-            font-family: 'Courier New', monospace;
-            font-size: 1.1rem;
-            color: #ff8c00;
-            margin: 1rem 0;
-            word-break: break-all;
-            cursor: pointer;
-            transition: all 0.3s ease;
-        }
-        
-        .url-display:hover {
-            border-color: #ff4500;
-            background: rgba(255, 69, 0, 0.1);
-        }
-        
-        .copy-hint {
-            font-size: 0.9rem;
-            color: #666;
-            margin-top: 0.5rem;
-        }
-        
-        .stats {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-            gap: 1rem;
-            margin-top: 2rem;
-        }
-        
-        .stat-item {
-            background: rgba(255, 255, 255, 0.02);
-            border: 1px solid rgba(255, 255, 255, 0.1);
-            border-radius: 8px;
-            padding: 1rem;
-        }
-        
-        .stat-value {
-            font-size: 1.5rem;
-            font-weight: 700;
-            color: #ff4500;
-        }
-        
-        .stat-label {
-            font-size: 0.9rem;
-            color: #999;
-            margin-top: 0.25rem;
-        }
-        
-        .links {
-            margin-top: 3rem;
-            display: flex;
-            gap: 2rem;
-            justify-content: center;
-            flex-wrap: wrap;
-        }
-        
-        .link {
-            color: #ff8c00;
-            text-decoration: none;
-            font-size: 1rem;
-            transition: color 0.3s ease;
-        }
-        
-        .link:hover {
-            color: #ff4500;
-        }
-        
-        .toast {
-            position: fixed;
-            bottom: 2rem;
-            background: #ff4500;
-            color: white;
-            padding: 1rem 2rem;
-            border-radius: 8px;
-            transform: translateY(100px);
-            transition: transform 0.3s ease;
-            z-index: 1000;
-        }
-        
-        .toast.show {
-            transform: translateY(0);
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <img src="https://nosflare.com/images/nosflare.png" alt="Nosflare Logo" class="logo">
-        <p class="tagline">A serverless Nostr relay powered by Cloudflare</p>
-        
-        ${payToRelaySection}
-        
-        <div class="stats">
-            <div class="stat-item">
-                <div class="stat-value">${relayInfo.supported_nips.length}</div>
-                <div class="stat-label">Supported NIPs</div>
-            </div>
-            <div class="stat-item">
-                <div class="stat-value">${relayInfo.version}</div>
-                <div class="stat-label">Version</div>
-            </div>
-        </div>
-        
-        <div class="links">
-            <a href="https://github.com/Spl0itable/nosflare" class="link" target="_blank">GitHub</a>
-            <a href="https://nostr.com" class="link" target="_blank">Learn about Nostr</a>
-        </div>
-    </div>
-    
-    <div class="toast" id="toast">Copied to clipboard!</div>
-    
-    <script>
-        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const relayUrl = protocol + '//' + window.location.host;
-        const relayUrlElement = document.getElementById('relay-url');
-        if (relayUrlElement) {
-            relayUrlElement.textContent = relayUrl;
-        }
-        
-        function copyToClipboard() {
-            const relayUrl = document.getElementById('relay-url').textContent;
-            navigator.clipboard.writeText(relayUrl).then(() => {
-                const toast = document.getElementById('toast');
-                toast.classList.add('show');
-                setTimeout(() => {
-                    toast.classList.remove('show');
-                }, 2000);
-            });
-        }
-        
-        ${PAY_TO_RELAY_ENABLED ? `
-        // Payment handling code
-        let paymentCheckInterval;
-
-        async function checkPaymentStatus() {
-            if (!window.nostr || !window.nostr.getPublicKey) return false;
-            
-            try {
-                const pubkey = await window.nostr.getPublicKey();
-                const response = await fetch('/api/check-payment?pubkey=' + pubkey);
-                const data = await response.json();
-                
-                if (data.paid) {
-                    showRelayAccess();
-                    return true;
-                }
-                return false;
-            } catch (error) {
-                console.error('Error checking payment status:', error);
-                return false;
-            }
-        }
-
-        function showRelayAccess() {
-            const paySection = document.getElementById('paySection');
-            const accessSection = document.getElementById('accessSection');
-            
-            if (paySection && accessSection) {
-                paySection.style.transition = 'opacity 0.3s ease-out';
-                paySection.style.opacity = '0';
-                
-                setTimeout(() => {
-                    paySection.style.display = 'none';
-                    accessSection.style.display = 'block';
-                    accessSection.style.opacity = '0';
-                    accessSection.style.transition = 'opacity 0.3s ease-in';
-                    
-                    void accessSection.offsetHeight;
-                    
-                    accessSection.style.opacity = '1';
-                }, 300);
-            }
-            
-            if (paymentCheckInterval) {
-                clearInterval(paymentCheckInterval);
-                paymentCheckInterval = null;
-            }
-        }
-
-        window.addEventListener('payment-success', async (event) => {
-            console.log('Payment success event received');
-            setTimeout(() => {
-                showRelayAccess();
-            }, 500);
-        });
-
-        async function initPayment() {
-            const script = document.createElement('script');
-            script.src = 'https://cdn.jsdelivr.net/gh/Spl0itable/nosflare@main/nostr-zap.js';
-            script.onload = () => {
-                if (window.nostrZap) {
-                    window.nostrZap.initTargets('#payButton');
-                    
-                    document.getElementById('payButton').addEventListener('click', () => {
-                        if (!paymentCheckInterval) {
-                            paymentCheckInterval = setInterval(async () => {
-                                await checkPaymentStatus();
-                            }, 3000);
-                        }
-                    });
-                }
-            };
-            document.head.appendChild(script);
-            
-            await checkPaymentStatus();
-        }
-
-        if (document.readyState === 'loading') {
-            document.addEventListener('DOMContentLoaded', initPayment);
-        } else {
-            initPayment();
-        }
-        ` : ''}
-    </script>
-    ${PAY_TO_RELAY_ENABLED ? '<script src="https://unpkg.com/nostr-login@latest/dist/unpkg.js" data-perms="sign_event:1" data-methods="connect,extension,local" data-dark-mode="true"></script>' : ''}
-</body>
-</html>
-  `;
-
-  return new Response(html, {
-    status: 200,
-    headers: {
-      'Content-Type': 'text/html;charset=UTF-8',
-      'Cache-Control': 'public, max-age=3600'
-    }
-  });
-}
-
-async function serveFavicon(): Promise<Response> {
-  const response = await fetch(relayInfo.icon);
-  if (response.ok) {
-    const headers = new Headers(response.headers);
-    headers.set("Cache-Control", "max-age=3600");
-    return new Response(response.body, {
-      status: response.status,
-      headers: headers,
-    });
-  }
-  return new Response(null, { status: 404 });
-}
+// ---------------------------------------------------------------------------
+// NIP-05 endpoint
+// ---------------------------------------------------------------------------
 
 function handleNIP05Request(url: URL): Response {
   const name = url.searchParams.get("name");
@@ -2148,12 +1830,16 @@ function handleNIP05Request(url: URL): Response {
   });
 }
 
+// ---------------------------------------------------------------------------
+// Payment endpoints
+// ---------------------------------------------------------------------------
+
 async function handleCheckPayment(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const pubkey = url.searchParams.get('pubkey');
 
-  if (!pubkey) {
-    return new Response(JSON.stringify({ error: 'Missing pubkey' }), {
+  if (!pubkey || !/^[0-9a-f]{64}$/.test(pubkey)) {
+    return new Response(JSON.stringify({ error: 'Missing or invalid pubkey (hex)' }), {
       status: 400,
       headers: { 'Content-Type': 'application/json' }
     });
@@ -2177,29 +1863,42 @@ async function handleCheckPayment(request: Request, env: Env): Promise<Response>
   });
 }
 
+/**
+ * Payment notification: the client submits its kind 9735 zap receipt after
+ * paying the Lightning invoice; the relay verifies the receipt
+ * cryptographically and records the payer. (Replaces upstream's
+ * unauthenticated `?npub=` marking — see src/pay.ts.)
+ */
 async function handlePaymentNotification(request: Request, env: Env): Promise<Response> {
   if (request.method !== 'POST') {
     return new Response('Method not allowed', { status: 405 });
   }
 
   try {
-    const url = new URL(request.url);
-    const pubkey = url.searchParams.get('npub');
-
-    if (!pubkey) {
-      return new Response(JSON.stringify({ error: 'Missing pubkey' }), {
+    const body = await request.json() as { event?: NostrEvent };
+    const receipt = body?.event;
+    if (!receipt) {
+      return new Response(JSON.stringify({ error: 'Missing zap receipt event' }), {
         status: 400,
-        headers: {
-          'Content-Type': 'application/json',
-          'Access-Control-Allow-Origin': '*'
-        }
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
       });
     }
 
-    const success = await savePaidPubkey(pubkey, env);
+    const verified = await verifyZapReceipt(receipt, relayNpub, verifyEventSignature);
+    if (!verified) {
+      return new Response(JSON.stringify({ error: 'Invalid zap receipt' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      });
+    }
+
+    // Persist the receipt event itself (best-effort audit trail), then record access.
+    await saveEventToDatabase(receipt, env).catch(() => undefined);
+    const success = await savePaidPubkey(verified.payer, env, verified.amountSats, verified.receiptId);
 
     return new Response(JSON.stringify({
       success,
+      pubkey: verified.payer,
       message: success ? 'Payment recorded successfully' : 'Failed to save payment'
     }), {
       status: success ? 200 : 500,
@@ -2220,16 +1919,120 @@ async function handlePaymentNotification(request: Request, env: Env): Promise<Re
   }
 }
 
+// ---------------------------------------------------------------------------
+// Operator JSON API (consumed by the static dashboard UI)
+// ---------------------------------------------------------------------------
+
+function jsonResponse(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'no-store',
+    },
+  });
+}
+
+async function handleApiRequest(url: URL, request: Request, env: Env): Promise<Response> {
+  const path = url.pathname;
+
+  // Public relay configuration for the UI (never includes secrets).
+  if (path === '/api/relay-info') {
+    return jsonResponse({
+      name: relayInfo.name,
+      description: relayInfo.description,
+      version: relayInfo.version,
+      software: relayInfo.software,
+      icon: relayInfo.icon,
+      relay_mode: RELAY_MODE,
+      sip01_enabled: SIP01_ENABLED,
+      sip01_validation: SIP01_VALIDATION,
+      nip50: NIP50_ENABLED,
+      nip45: NIP45_ENABLED,
+      nip77: NIP77_ENABLED,
+      auth_required: config.AUTH_REQUIRED,
+      payment_mode: PAYMENT_MODE,
+      payment_sats: RELAY_ACCESS_PRICE_SATS,
+      payment_npub: relayNpub,
+      supported_operators: [...SUPPORTED_NIP50_OPERATORS],
+    });
+  }
+
+  if (path === '/api/health') {
+    const session = env.RELAY_DATABASE.withSession('first-unconstrained');
+    let events = 0;
+    try {
+      const row = await session.prepare('SELECT COUNT(*) AS n FROM events').first();
+      events = (row?.n as number) ?? 0;
+    } catch { /* initializing */ }
+    return jsonResponse({ status: 'ok', events, mode: RELAY_MODE, version: relayInfo.version, time: Math.floor(Date.now() / 1000) });
+  }
+
+  // Everything below requires SIP-01 indexing.
+  if (!SIP01_INDEXING) {
+    return jsonResponse({ error: 'SIP-01 indexing is disabled on this relay' }, 404);
+  }
+
+  const session = env.RELAY_DATABASE.withSession('first-unconstrained');
+
+  if (path === '/api/stats') {
+    return jsonResponse(await sipApi.getSip01Stats(session));
+  }
+
+  if (path === '/api/indexers') {
+    return jsonResponse(await sipApi.listIndexers(session, url));
+  }
+
+  if (path === '/api/indexer') {
+    const pubkey = url.searchParams.get('pubkey');
+    if (!pubkey || !/^[0-9a-f]{64}$/.test(pubkey)) {
+      return jsonResponse({ error: 'Missing or invalid pubkey (hex)' }, 400);
+    }
+    const result = await sipApi.getIndexer(session, pubkey);
+    return result ? jsonResponse(result) : jsonResponse({ error: 'Indexer not found' }, 404);
+  }
+
+  if (path === '/api/documents') {
+    return jsonResponse(await sipApi.listDocuments(session, url));
+  }
+
+  if (path === '/api/document') {
+    const d = url.searchParams.get('d');
+    if (!d || !/^widx:[0-9a-f]{32}$/.test(d)) {
+      return jsonResponse({ error: "Missing or invalid d (expected 'widx:' + 32 hex chars)" }, 400);
+    }
+    const result = await sipApi.getDocument(session, d);
+    return result ? jsonResponse(result) : jsonResponse({ error: 'Document not found' }, 404);
+  }
+
+  if (path === '/api/observations') {
+    return jsonResponse(await sipApi.listObservations(session, url));
+  }
+
+  // HTTP convenience mirror of NIP-50 search for the dashboard. The relay
+  // protocol itself stays standard Nostr over WebSocket.
+  if (path === '/api/search') {
+    if (!NIP50_ENABLED) return jsonResponse({ error: 'search disabled' }, 404);
+    const q = (url.searchParams.get('q') || '').slice(0, 500);
+    if (!q.trim()) return jsonResponse({ error: 'Missing q parameter' }, 400);
+    const limit = Math.min(parseInt(url.searchParams.get('limit') || '25', 10) || 25, 100);
+    await bumpMetric(env.RELAY_DATABASE.withSession('first-primary'), 'search_queries_http');
+    const events = await executeSearch(session, { kinds: [SIP01_KIND], search: q, limit });
+    return jsonResponse({ events, query: q, count: events.length });
+  }
+
+  return jsonResponse({ error: 'Unknown API endpoint' }, 404);
+}
+
+// ---------------------------------------------------------------------------
 // Multi-region DO selection logic with location hints
-async function getOptimalDO(cf: any, env: Env, url: URL): Promise<{ stub: DurableObjectStub; doName: string }> {
-  const continent = cf?.continent || 'NA';
+// ---------------------------------------------------------------------------
+
+async function getOptimalDO(cf: any, env: Env): Promise<{ stub: DurableObjectStub; doName: string }> {
   const country = cf?.country || 'US';
   const region = cf?.region || 'unknown';
-  const colo = cf?.colo || 'unknown';
 
-  console.log(`User location: continent=${continent}, country=${country}, region=${region}, colo=${colo}`);
-
-  // All 9 endpoints with their location hints
   const ALL_ENDPOINTS = [
     { name: 'relay-WNAM-primary', hint: 'wnam' },
     { name: 'relay-ENAM-primary', hint: 'enam' },
@@ -2242,38 +2045,24 @@ async function getOptimalDO(cf: any, env: Env, url: URL): Promise<{ stub: Durabl
     { name: 'relay-ME-primary', hint: 'me' }
   ];
 
-  // Country to hint mapping
   const countryToHint: Record<string, string> = {
-    // North America
     'US': 'enam', 'CA': 'enam', 'MX': 'wnam',
-
-    // Central America & Caribbean (route to WNAM)
     'GT': 'wnam', 'BZ': 'wnam', 'SV': 'wnam', 'HN': 'wnam', 'NI': 'wnam',
     'CR': 'wnam', 'PA': 'wnam', 'CU': 'wnam', 'DO': 'wnam', 'HT': 'wnam',
     'JM': 'wnam', 'PR': 'wnam', 'TT': 'wnam', 'BB': 'wnam',
-
-    // South America
     'BR': 'sam', 'AR': 'sam', 'CL': 'sam', 'CO': 'sam', 'PE': 'sam',
     'VE': 'sam', 'EC': 'sam', 'BO': 'sam', 'PY': 'sam', 'UY': 'sam',
     'GY': 'sam', 'SR': 'sam', 'GF': 'sam',
-
-    // Western Europe
     'GB': 'weur', 'FR': 'weur', 'DE': 'weur', 'ES': 'weur', 'IT': 'weur',
     'NL': 'weur', 'BE': 'weur', 'CH': 'weur', 'AT': 'weur', 'PT': 'weur',
     'IE': 'weur', 'LU': 'weur', 'MC': 'weur', 'AD': 'weur', 'SM': 'weur',
     'VA': 'weur', 'LI': 'weur', 'MT': 'weur',
-
-    // Nordic countries (route to WEUR)
     'SE': 'weur', 'NO': 'weur', 'DK': 'weur', 'FI': 'weur', 'IS': 'weur',
-
-    // Eastern Europe
     'PL': 'eeur', 'RU': 'eeur', 'UA': 'eeur', 'RO': 'eeur', 'CZ': 'eeur',
     'HU': 'eeur', 'GR': 'eeur', 'BG': 'eeur', 'SK': 'eeur', 'HR': 'eeur',
     'RS': 'eeur', 'SI': 'eeur', 'BA': 'eeur', 'AL': 'eeur', 'MK': 'eeur',
     'ME': 'eeur', 'XK': 'eeur', 'BY': 'eeur', 'MD': 'eeur', 'LT': 'eeur',
     'LV': 'eeur', 'EE': 'eeur', 'CY': 'eeur',
-
-    // Asia-Pacific
     'JP': 'apac', 'CN': 'apac', 'KR': 'apac', 'IN': 'apac', 'SG': 'apac',
     'TH': 'apac', 'ID': 'apac', 'MY': 'apac', 'VN': 'apac', 'PH': 'apac',
     'TW': 'apac', 'HK': 'apac', 'MO': 'apac', 'KH': 'apac', 'LA': 'apac',
@@ -2284,17 +2073,11 @@ async function getOptimalDO(cf: any, env: Env, url: URL): Promise<{ stub: Durabl
     'KI': 'apac', 'PW': 'apac', 'MH': 'apac', 'FM': 'apac', 'NR': 'apac',
     'TV': 'apac', 'CK': 'apac', 'NU': 'apac', 'TK': 'apac', 'GU': 'apac',
     'MP': 'apac', 'AS': 'apac',
-
-    // Oceania
     'AU': 'oc', 'NZ': 'oc',
-
-    // Middle East
     'AE': 'me', 'SA': 'me', 'IL': 'me', 'TR': 'me', 'EG': 'me',
     'IQ': 'me', 'IR': 'me', 'SY': 'me', 'JO': 'me', 'LB': 'me',
     'KW': 'me', 'QA': 'me', 'BH': 'me', 'OM': 'me', 'YE': 'me',
     'PS': 'me', 'GE': 'me', 'AM': 'me', 'AZ': 'me',
-
-    // Africa
     'ZA': 'afr', 'NG': 'afr', 'KE': 'afr', 'MA': 'afr', 'TN': 'afr',
     'DZ': 'afr', 'LY': 'afr', 'ET': 'afr', 'GH': 'afr', 'TZ': 'afr',
     'UG': 'afr', 'SD': 'afr', 'AO': 'afr', 'MZ': 'afr', 'MG': 'afr',
@@ -2306,19 +2089,13 @@ async function getOptimalDO(cf: any, env: Env, url: URL): Promise<{ stub: Durabl
     'LS': 'afr', 'GW': 'afr', 'GQ': 'afr', 'MU': 'afr', 'SZ': 'afr',
     'DJ': 'afr', 'KM': 'afr', 'CV': 'afr', 'SC': 'afr', 'ST': 'afr',
     'SS': 'afr', 'EH': 'afr', 'CG': 'afr', 'CD': 'afr',
-
-    // Central Asia (route to APAC)
     'KZ': 'apac', 'UZ': 'apac', 'TM': 'apac', 'TJ': 'apac', 'KG': 'apac',
   };
 
-  // US state-level routing
   const usStateToHint: Record<string, string> = {
-    // Western states -> WNAM
     'California': 'wnam', 'Oregon': 'wnam', 'Washington': 'wnam', 'Nevada': 'wnam', 'Arizona': 'wnam',
     'Utah': 'wnam', 'Idaho': 'wnam', 'Montana': 'wnam', 'Wyoming': 'wnam', 'Colorado': 'wnam',
     'New Mexico': 'wnam', 'Alaska': 'wnam', 'Hawaii': 'wnam',
-
-    // Eastern states -> ENAM
     'New York': 'enam', 'Florida': 'enam', 'Texas': 'enam', 'Illinois': 'enam', 'Georgia': 'enam',
     'Pennsylvania': 'enam', 'Ohio': 'enam', 'Michigan': 'enam', 'North Carolina': 'enam', 'Virginia': 'enam',
     'Massachusetts': 'enam', 'New Jersey': 'enam', 'Maryland': 'enam', 'Connecticut': 'enam', 'Maine': 'enam',
@@ -2327,48 +2104,30 @@ async function getOptimalDO(cf: any, env: Env, url: URL): Promise<{ stub: Durabl
     'Iowa': 'enam', 'Minnesota': 'enam', 'Wisconsin': 'enam', 'Indiana': 'enam', 'Kentucky': 'enam',
     'West Virginia': 'enam', 'Delaware': 'enam', 'Oklahoma': 'enam', 'Kansas': 'enam', 'Nebraska': 'enam',
     'South Dakota': 'enam', 'North Dakota': 'enam',
-
-    // DC
     'District of Columbia': 'enam',
   };
 
-  // Continent to hint fallback
   const continentToHint: Record<string, string> = {
-    'NA': 'enam',
-    'SA': 'sam',
-    'EU': 'weur',
-    'AS': 'apac',
-    'AF': 'afr',
-    'OC': 'oc'
+    'NA': 'enam', 'SA': 'sam', 'EU': 'weur', 'AS': 'apac', 'AF': 'afr', 'OC': 'oc'
   };
 
-  // Determine best hint 
   let bestHint: string;
-
-  // Only check US states if country is actually US
   if (country === 'US' && region && region !== 'unknown') {
     bestHint = usStateToHint[region] || 'enam';
   } else {
-    // First try country mapping, then continent fallback
-    bestHint = countryToHint[country] || continentToHint[continent] || 'enam';
+    bestHint = countryToHint[country] || continentToHint[cf?.continent || 'NA'] || 'enam';
   }
 
-  // Find the primary endpoint based on hint
-  const primaryEndpoint = ALL_ENDPOINTS.find(ep => ep.hint === bestHint) || ALL_ENDPOINTS[1]; // Default to ENAM
-
-  // Order endpoints by proximity (primary first, then others)
+  const primaryEndpoint = ALL_ENDPOINTS.find(ep => ep.hint === bestHint) || ALL_ENDPOINTS[1];
   const orderedEndpoints = [
     primaryEndpoint,
     ...ALL_ENDPOINTS.filter(ep => ep.name !== primaryEndpoint.name)
   ];
 
-  // Try each endpoint
   for (const endpoint of orderedEndpoints) {
     try {
       const id = env.RELAY_WEBSOCKET.idFromName(endpoint.name);
       const stub = env.RELAY_WEBSOCKET.get(id, { locationHint: endpoint.hint });
-
-      console.log(`Connected to DO: ${endpoint.name} (hint: ${endpoint.hint})`);
       // @ts-ignore
       return { stub, doName: endpoint.name };
     } catch (error) {
@@ -2376,23 +2135,21 @@ async function getOptimalDO(cf: any, env: Env, url: URL): Promise<{ stub: Durabl
     }
   }
 
-  // Fallback to ENAM
-  const fallback = ALL_ENDPOINTS[1]; // ENAM
+  const fallback = ALL_ENDPOINTS[1];
   const id = env.RELAY_WEBSOCKET.idFromName(fallback.name);
   const stub = env.RELAY_WEBSOCKET.get(id, { locationHint: fallback.hint });
-  console.log(`Fallback to DO: ${fallback.name} (hint: ${fallback.hint})`);
   // @ts-ignore
   return { stub, doName: fallback.name };
 }
 
-// Database pruning helper functions
+// ---------------------------------------------------------------------------
+// Database pruning (D1 has a 10GB limit)
+// ---------------------------------------------------------------------------
 
-// Get the current database size in bytes
 async function getDatabaseSizeBytes(session: D1DatabaseSession): Promise<number> {
   try {
     const result = await session.prepare('SELECT 1').run();
     const sizeAfter = (result.meta as { size_after?: number } | undefined)?.size_after;
-
     if (typeof sizeAfter === 'number' && sizeAfter > 0) {
       return sizeAfter;
     }
@@ -2403,23 +2160,20 @@ async function getDatabaseSizeBytes(session: D1DatabaseSession): Promise<number>
   }
 }
 
-// Prune old events to reduce database size
-// Returns the number of events deleted
 async function pruneOldEvents(session: D1DatabaseSession, targetSizeBytes: number): Promise<{ eventsDeleted: number; finalSizeBytes: number }> {
   let totalEventsDeleted = 0;
   let currentSize = await getDatabaseSizeBytes(session);
 
   console.log(`Starting database pruning. Current size: ${(currentSize / (1024 * 1024 * 1024)).toFixed(2)} GB, Target: ${(targetSizeBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`);
 
-  // Build the protected kinds clause for SQL
-  const protectedKindsArray = Array.from(pruneProtectedKinds);
+  const protectedKinds = new Set<number>(pruneProtectedKinds);
+  if (SIP01_PRUNE_ALLOWED) protectedKinds.delete(SIP01_KIND);
+  const protectedKindsArray = Array.from(protectedKinds);
   const protectedKindsClause = protectedKindsArray.length > 0
     ? `AND kind NOT IN (${protectedKindsArray.join(',')})`
     : '';
 
-  // Keep pruning in batches until we reach target size
   while (currentSize > targetSizeBytes) {
-    // Find the oldest events (excluding protected kinds)
     const oldestEvents = await session.prepare(`
       SELECT id FROM events
       WHERE 1=1 ${protectedKindsClause}
@@ -2435,22 +2189,25 @@ async function pruneOldEvents(session: D1DatabaseSession, targetSizeBytes: numbe
     const eventIds = oldestEvents.results.map((row: any) => row.id as string);
     const placeholders = eventIds.map(() => '?').join(',');
 
-    // Batch all deletes into a single D1 round-trip
+    if (SIP01_INDEXING) {
+      await removeSip01Observations(session, eventIds);
+    }
+
     const pruneResults = await session.batch([
+      session.prepare(`DELETE FROM tags WHERE event_id IN (${placeholders})`).bind(...eventIds),
+      session.prepare(`DELETE FROM content_hashes WHERE event_id IN (${placeholders})`).bind(...eventIds),
       session.prepare(`DELETE FROM event_tags_cache_multi WHERE event_id IN (${placeholders})`).bind(...eventIds),
       session.prepare(`DELETE FROM events WHERE id IN (${placeholders})`).bind(...eventIds),
     ]);
 
-    const deletedCount = pruneResults[1]?.meta?.changes || eventIds.length;
+    const deletedCount = pruneResults[3]?.meta?.changes || eventIds.length;
     totalEventsDeleted += deletedCount;
 
     console.log(`Pruned ${deletedCount} events (total: ${totalEventsDeleted})`);
 
-    // Check current size after deletion
     currentSize = await getDatabaseSizeBytes(session);
     console.log(`Current database size: ${(currentSize / (1024 * 1024 * 1024)).toFixed(2)} GB`);
 
-    // Safety break - don't delete more than 100,000 events in a single maintenance run
     if (totalEventsDeleted >= 100000) {
       console.log('Reached maximum pruning limit for this run (100,000 events)');
       break;
@@ -2460,16 +2217,50 @@ async function pruneOldEvents(session: D1DatabaseSession, targetSizeBytes: numbe
   return { eventsDeleted: totalEventsDeleted, finalSizeBytes: currentSize };
 }
 
-// Export functions for use by Durable Object
+// ---------------------------------------------------------------------------
+// Static UI serving
+// ---------------------------------------------------------------------------
+
+const UI_ROUTES = new Set([
+  '/', '/dashboard', '/search', '/explorer', '/indexers', '/documents',
+  '/relay', '/deploy', '/tests', '/docs',
+]);
+
+async function serveUi(request: Request, env: Env, url: URL): Promise<Response> {
+  if (env.ASSETS) {
+    // SPA routes serve index.html; asset paths serve themselves.
+    if (UI_ROUTES.has(url.pathname)) {
+      const indexUrl = new URL('/index.html', url);
+      return env.ASSETS.fetch(new Request(indexUrl.toString(), request));
+    }
+    const asset = await env.ASSETS.fetch(request);
+    if (asset.status !== 404) return asset;
+    return new Response('Not found', { status: 404 });
+  }
+  // Single-script deploy fallback.
+  return serveMiniLanding(url.host);
+}
+
+// ---------------------------------------------------------------------------
+// Exports for the Durable Object
+// ---------------------------------------------------------------------------
+
 export {
   verifyEventSignature,
   hasPaidForRelay,
   processEvent,
   queryEvents,
-  calculateQueryComplexity
+  countEvents,
+  executeSearch,
+  querySyncItems,
+  calculateQueryComplexity,
+  initializeDatabase,
 };
 
-// Main worker export with Durable Object
+// ---------------------------------------------------------------------------
+// Main worker
+// ---------------------------------------------------------------------------
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try {
@@ -2484,16 +2275,18 @@ export default {
         return await handleCheckPayment(request, env);
       }
 
-      // Main endpoints
+      // Operator JSON API
+      if (url.pathname.startsWith('/api/')) {
+        await ensureDatabase(env.RELAY_DATABASE);
+        return await handleApiRequest(url, request, env);
+      }
+
+      // Main endpoint
       if (url.pathname === "/") {
         if (request.headers.get("Upgrade") === "websocket") {
-          // Get Cloudflare location info
           const cf = (request as any).cf;
+          const { stub, doName } = await getOptimalDO(cf, env);
 
-          // Get optimal DO based on user location
-          const { stub, doName } = await getOptimalDO(cf, env, url);
-
-          // Add location info to the request
           const newUrl = new URL(request.url);
           newUrl.searchParams.set('region', cf?.region || 'unknown');
           newUrl.searchParams.set('colo', cf?.colo || 'unknown');
@@ -2502,20 +2295,16 @@ export default {
           newUrl.searchParams.set('doName', doName);
 
           return stub.fetch(new Request(newUrl, request));
-        } else if (request.headers.get("Accept") === "application/nostr+json") {
+        } else if ((request.headers.get("Accept") || "").includes("application/nostr+json")) {
           return handleRelayInfoRequest(request);
         } else {
-          // Initialize database in background
-          ctx.waitUntil(
-            initializeDatabase(env.RELAY_DATABASE)
-              .catch(e => console.error("DB init error:", e))
-          );
-          return serveLandingPage();
+          ctx.waitUntil(ensureDatabase(env.RELAY_DATABASE));
+          return serveUi(request, env, url);
         }
       } else if (url.pathname === "/.well-known/nostr.json") {
         return handleNIP05Request(url);
-      } else if (url.pathname === "/favicon.ico") {
-        return await serveFavicon();
+      } else if (request.method === 'GET') {
+        return await serveUi(request, env, url);
       } else {
         return new Response("Invalid request", { status: 400 });
       }
@@ -2532,7 +2321,6 @@ export default {
     try {
       const session = env.RELAY_DATABASE.withSession('first-primary');
 
-      // Check database size and prune if necessary (D1 has a 10GB limit)
       if (DB_PRUNING_ENABLED) {
         const currentSizeBytes = await getDatabaseSizeBytes(session);
         const currentSizeGB = currentSizeBytes / (1024 * 1024 * 1024);
@@ -2550,18 +2338,17 @@ export default {
         console.log('Database pruning is disabled.');
       }
 
-      // Run PRAGMA optimize (SQLite's intelligent optimization)
       console.log('Running PRAGMA optimize...');
       await session.prepare('PRAGMA optimize').run();
-      console.log('PRAGMA optimize completed');
 
-      // Run ANALYZE to update query planner statistics
       console.log('Running ANALYZE on all tables...');
       await session.prepare('ANALYZE events').run();
       await session.prepare('ANALYZE tags').run();
       await session.prepare('ANALYZE event_tags_cache_multi').run();
       await session.prepare('ANALYZE content_hashes').run();
-      console.log('ANALYZE completed - query planner statistics updated');
+      await session.prepare('ANALYZE sip01_documents').run().catch(() => undefined);
+      await session.prepare('ANALYZE sip01_observations').run().catch(() => undefined);
+      await session.prepare('ANALYZE sip01_indexers').run().catch(() => undefined);
 
       console.log('Scheduled 24hr database maintenance completed successfully');
     } catch (error) {

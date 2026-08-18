@@ -4,27 +4,153 @@ import { RelayInfo } from './types';
 // ** BEGIN EDITABLE SETTINGS ** //
 // ***************************** //
 
-// Settings below can be configured to your preferences
+// Settings below can be configured to your preferences. Everything here is
+// static compile-time configuration — the same values are baked into the
+// NIP-11 relay information document, so keep them truthful.
 
-// Pay to relay
+// ---------------------------------------------------------------------------
+// Relay operating mode
+// ---------------------------------------------------------------------------
+
+/**
+ * RELAY_MODE controls what this relay accepts:
+ *
+ *  - "sip01"   — SIP-01 optimized index relay. Only kind 39697 observations
+ *                (plus kind 5 deletions and kind 9735 zap receipts when
+ *                payment is enabled) are accepted for storage. Reads stay
+ *                fully NIP-01 compatible. This is the recommended mode for
+ *                a dedicated search-index node.
+ *  - "hybrid"  — General Nostr relay + first-class SIP-01 indexing. All
+ *                kinds are accepted (subject to the allow/block lists
+ *                below); kind 39697 additionally gets validated and indexed.
+ *  - "general" — Plain Nostr relay (upstream Nosflare behavior). SIP-01
+ *                validation is off; kind 39697 events are stored like any
+ *                other addressable event. SIP-01 search/index APIs disable
+ *                themselves.
+ */
+export const RELAY_MODE: 'general' | 'hybrid' | 'sip01' = 'sip01';
+
+// ---------------------------------------------------------------------------
+// SIP-01 (Search Index Protocol) settings
+// ---------------------------------------------------------------------------
+
+export const SIP01_ENABLED = RELAY_MODE !== 'general';
+
+/** Validate kind 39697 events at ingestion (SIP-01 §12.4) and reject
+ *  malformed observations with `OK false invalid: ...`. */
+export const SIP01_VALIDATION = true;
+
+/** Maintain the SIP-01 document/observation/indexer tables and serve the
+ *  document-aware NIP-50 search operators. */
+export const SIP01_INDEXING = SIP01_ENABLED;
+
+/** Kinds accepted for storage in "sip01" mode (kind 5 = deletions, kind
+ *  9735 = zap receipts for payment verification). NIP-42 auth events
+ *  (kind 22242) are never stored by any mode. */
+export const SIP01_MODE_ALLOWED_KINDS = new Set<number>([39697, 5, 9735]);
+
+/** Per-indexer write rate limit for kind 39697 (token bucket: sustained
+ *  rate per ms + burst capacity). Crawlers publish bursts of observations;
+ *  the default allows ~120 observations/minute with a burst of 240. */
+export const SIP01_INDEXER_RATE_LIMIT = { rate: 120 / 60000, capacity: 240 };
+
+/** Maximum accepted byte size of a single kind 39697 event message. The
+ *  spec's field caps make legit events far smaller than this. */
+export const SIP01_MAX_EVENT_BYTES = 64 * 1024; // 64 KB
+
+/** Indexer allow/block policy for kind 39697 publishers.
+ *  - "open"      — any valid signed observation is accepted (default)
+ *  - "allowlist" — only pubkeys in sip01AllowedIndexers may publish
+ *  - "blocklist" — pubkeys in sip01BlockedIndexers are rejected
+ */
+export const SIP01_INDEXER_POLICY: 'open' | 'allowlist' | 'blocklist' = 'open';
+
+export const sip01AllowedIndexers = new Set<string>([
+  // ... hex pubkeys of explicitly allowed indexers (allowlist policy)
+]);
+
+export const sip01BlockedIndexers = new Set<string>([
+  // ... hex pubkeys of blocked indexers (blocklist policy)
+]);
+
+// ---------------------------------------------------------------------------
+// Search (NIP-50)
+// ---------------------------------------------------------------------------
+
+export const NIP50_ENABLED = true;
+
+/** Hard cap on search results per query (also clamps `limit`). */
+export const SEARCH_MAX_RESULTS = 100;
+
+/** Maximum parsed length of a `search` string. */
+export const SEARCH_MAX_QUERY_LENGTH = 500;
+
+// ---------------------------------------------------------------------------
+// Federation (NIP-77 negentropy)
+// ---------------------------------------------------------------------------
+
+export const NIP77_ENABLED = true;
+
+/** Maximum events loaded into a single NEG-OPEN reconciliation session.
+ *  Larger requests are refused with `NEG-ERR blocked:` (clients can narrow
+ *  the filter, e.g. by time range). */
+export const NEG_MAX_ITEMS = 100000;
+
+/** Maximum size of a single negentropy wire message (bytes, pre-hex). */
+export const NEG_FRAME_SIZE_LIMIT = 256 * 1024; // 256 KB
+
+/** Idle timeout after which a NEG session is reclaimed (NEG-ERR closed:). */
+export const NEG_SESSION_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+
+// ---------------------------------------------------------------------------
+// Event counts (NIP-45)
+// ---------------------------------------------------------------------------
+
+export const NIP45_ENABLED = true;
+
+/** Upper bound of rows a single COUNT may scan before being refused. */
+export const COUNT_MAX_ESTIMATE = 50000;
+
+// ---------------------------------------------------------------------------
+// Payment (OPTIONAL — SIP-01 itself is open; payment is relay policy)
+// ---------------------------------------------------------------------------
+
+/**
+ * PAYMENT_MODE:
+ *  - "free"         — no payment required; no payment UI (default)
+ *  - "donation"     — payment optional; the landing page shows a zap button
+ *  - "pay-to-relay" — publishing requires a paid pubkey (Nostr zap to
+ *                     relayNpub of RELAY_ACCESS_PRICE_SATS; verified from
+ *                     kind 9735 zap receipts)
+ */
+export const PAYMENT_MODE: 'free' | 'donation' | 'pay-to-relay' = 'free';
+
+// Derived for upstream-compatible checks.
+export const PAY_TO_RELAY_ENABLED = PAYMENT_MODE === 'pay-to-relay';
+
 export const relayNpub = "npub16jdfqgazrkapk0yrqm9rdxlnys7ck39c7zmdzxtxqlmmpxg04r0sd733sv"; // Use your own npub
-export const PAY_TO_RELAY_ENABLED = true; // Set to false to disable pay to relay
 export const RELAY_ACCESS_PRICE_SATS = 212121; // Price in SATS for relay access
 
+/** Hex pubkey of the relay operator (payment recipient). Derived from
+ *  relayNpub at startup in relay-worker.ts. */
+
 // NIP-42 Authentication
-export const AUTH_REQUIRED = true; // Set to false to disable NIP-42 authentication requirement
+export const AUTH_REQUIRED = false; // Set to true to require NIP-42 auth for reads+writes
 export const AUTH_TIMEOUT_MS = 600000; // 10 minutes - how long the challenge is valid
 
-// Relay info
+// ---------------------------------------------------------------------------
+// Relay info (NIP-11)
+// ---------------------------------------------------------------------------
+
 export const relayInfo: RelayInfo = {
-  name: "Nosflare",
-  description: "A serverless Nostr relay through Cloudflare Worker and D1 database",
+  name: "UNCAGED SIP Relay",
+  description: "A serverless SIP-01 search index relay — decentralized web-index observations (Nostr kind 39697) on Cloudflare Workers + D1. One shared decentralized index. Many independent indexers. No single owner.",
   pubkey: "d49a9023a21dba1b3c8306ca369bf3243d8b44b8f0b6d1196607f7b0990fa8df",
   contact: "lux@fed.wtf",
-  supported_nips: [1, 2, 4, 5, 9, 11, 12, 13, 15, 16, 17, 20, 22, 25, 28, 33, 40, 42, 57],
-  software: "https://github.com/Spl0itable/nosflare",
-  version: "7.9.45",
-  icon: "https://raw.githubusercontent.com/Spl0itable/nosflare/main/images/flare.png",
+  supported_nips: [1, 5, 9, 11, 16, 33, 42, 45, 50, 77],
+  software: "https://github.com/NostrDanish/SIP-Booster-Relay",
+  version: "1.0.0",
+  icon: "https://raw.githubusercontent.com/NostrDanish/SIP-Booster-Relay/main/images/icon.png",
 
   // Optional fields (uncomment as needed):
   // banner: "https://example.com/banner.jpg",
@@ -33,51 +159,50 @@ export const relayInfo: RelayInfo = {
 
   // Relay limitations
   limitation: {
-    // max_message_length: 524288, // 512KB
-    // max_subscriptions: 300,
-    // max_limit: 10000,
-    // max_subid_length: 256,
-    // max_event_tags: 2000,
-    // max_content_length: 70000,
+    max_message_length: 262144, // 256KB
+    max_subscriptions: 100,
+    max_limit: 500,
+    max_subid_length: 64,
+    max_event_tags: 2000,
+    max_content_length: 70000,
     // min_pow_difficulty: 0,
     auth_required: AUTH_REQUIRED,
     payment_required: PAY_TO_RELAY_ENABLED,
-    restricted_writes: PAY_TO_RELAY_ENABLED,
+    restricted_writes: PAY_TO_RELAY_ENABLED || SIP01_INDEXER_POLICY === 'allowlist',
     // created_at_lower_limit: 0,
-    // created_at_upper_limit: 2147483647,
-    // default_limit: 10000
+    created_at_upper_limit: 900, // reject events more than 15 min in the future
+    default_limit: 100,
   },
 
   // Event retention policies (uncomment and configure as needed):
   // retention: [
-  //   { kinds: [0, 1, [5, 7], [40, 49]], time: 3600 },
-  //   { kinds: [[40000, 49999]], time: 100 },
-  //   { kinds: [[30000, 39999]], count: 1000 },
-  //   { time: 3600, count: 10000 }
+  //   { kinds: [[30000, 39999]], count: 100000 },
   // ],
 
   // Content limitations by country (uncomment as needed):
-  // relay_countries: ["*"], // Use ["US", "CA", "EU"] for specific countries, ["*"] for global
+  // relay_countries: ["*"],
 
-  // Community preferences (uncomment as needed):
-  // language_tags: ["en", "en-419"], // IETF language tags, use ["*"] for all languages
-  // tags: ["sfw-only", "bitcoin-only", "anime"], // Community/content tags
-  // posting_policy: "https://example.com/posting-policy.html",
-
-  // Payment configuration (added dynamically in handleRelayInfoRequest if PAY_TO_RELAY_ENABLED):
-  // payments_url: "https://my-relay/payments",
-  // fees: {
-  //   admission: [{ amount: 1000000, unit: "msats" }],
-  //   subscription: [{ amount: 5000000, unit: "msats", period: 2592000 }],
-  //   publication: [{ kinds: [4], amount: 100, unit: "msats" }],
-  // }
+  // Payment configuration (added dynamically in handleRelayInfoRequest when enabled):
+  // payments_url / fees
 };
+
+/** SIP-01 capability block advertised in the NIP-11 document under the
+ *  `uncaged_index` custom field (SIP-01 §15). Values are assembled
+ *  dynamically from this configuration in relay-worker.ts. */
+export const SIP01_SCOPE: 'global' | 'regional' | 'community' | 'private' = 'global';
+export const SIP01_SCOPE_DOMAINS: string[] = ["*"];      // e.g. ["docs.example.com"] to specialize
+export const SIP01_SCOPE_LANGUAGES: string[] = [];        // e.g. ["en", "de"]; empty = all
+export const SIP01_SCOPE_DOCUMENT_TYPES: string[] = [];   // e.g. ["page", "repository"]; empty = all
 
 // Nostr address NIP-05 verified users (for verified checkmark like username@your-relay.com)
 export const nip05Users: Record<string, string> = {
-  "Luxas": "d49a9023a21dba1b3c8306ca369bf3243d8b44b8f0b6d1196607f7b0990fa8df",
+  // "name": "hexpubkey",
   // ... more NIP-05 verified users
 };
+
+// ---------------------------------------------------------------------------
+// Anti-spam / filtering (upstream Nosflare policy engine, preserved)
+// ---------------------------------------------------------------------------
 
 // Anti-spam settings
 export const enableAntiSpam = false; // Set to true to enable hashing and duplicate content checking
@@ -92,11 +217,7 @@ export const antiSpamKinds = new Set([
 // Blocked pubkeys
 // Add pubkeys in hex format to block write access
 export const blockedPubkeys = new Set([
-  "3c7f5948b5d80900046a67d8e3bf4971d6cba013abece1dd542eca223cf3dd3f",
-  "fed5c0c3c8fe8f51629a0b39951acdf040fd40f53a327ae79ee69991176ba058",
-  "e810fafa1e89cdf80cced8e013938e87e21b699b24c8570537be92aec4b12c18",
-  "05aee96dd41429a3ae97a9dac4dfc6867fdfacebca3f3bdc051e5004b0751f01",
-  "53a756bb596055219d93e888f71d936ec6c47d960320476c955efd8941af4362"
+  // ... pubkeys that are explicitly blocked
 ]);
 
 // Allowed pubkeys
@@ -107,7 +228,7 @@ export const allowedPubkeys = new Set<string>([
 
 // Blocked event kinds
 // Add comma-separated kinds Ex: 1064, 4, 22242
-export const blockedEventKinds = new Set([
+export const blockedEventKinds = new Set<number>([
   1064
 ]);
 
@@ -160,18 +281,26 @@ export const excludedRateLimitKinds = new Set<number>([
   // ... kinds to exclude from EVENT rate limiting Ex: 1, 2, 3
 ]);
 
-// Database pruning settings (D1 has a 10GB limit)
+// ---------------------------------------------------------------------------
+// Database pruning (D1 has a 10GB limit)
+// ---------------------------------------------------------------------------
+
 export const DB_PRUNING_ENABLED = true; // Set to false to disable automatic pruning
 export const DB_SIZE_THRESHOLD_GB = 9; // Start pruning when database exceeds this size (in GB)
 export const DB_PRUNE_BATCH_SIZE = 1000; // Number of events to delete per batch
 export const DB_PRUNE_TARGET_GB = 8; // Target size to prune down to (in GB)
 
-// Event kinds to preserve during pruning (replaceable events critical for user identity)
-// Kind 0: Profile metadata, Kind 3: Contact list, Kind 10002: Relay list
+// Event kinds to preserve during pruning. In sip01/hybrid mode kind 39697
+// observations are protected by default: an addressable index record's value
+// is its latest state, not its age, and age-based eviction silently shrinks
+// the searchable index. Set SIP01_PRUNE_ALLOWED to true to let pruning
+// reclaim old observations anyway.
+export const SIP01_PRUNE_ALLOWED = false;
 export const pruneProtectedKinds = new Set<number>([
   0,      // Profile metadata
   3,      // Contact list / follows
   10002,  // Relay list metadata
+  39697,  // SIP-01 web index observations (see SIP01_PRUNE_ALLOWED)
 ]);
 
 // *************************** //
@@ -189,10 +318,23 @@ export function isPubkeyAllowed(pubkey: string): boolean {
 }
 
 export function isEventKindAllowed(kind: number): boolean {
+  if (RELAY_MODE === 'sip01' && !SIP01_MODE_ALLOWED_KINDS.has(kind)) {
+    return false;
+  }
   if (allowedEventKinds.size > 0 && !allowedEventKinds.has(kind)) {
     return false;
   }
   return !blockedEventKinds.has(kind);
+}
+
+export function isIndexerAllowed(pubkey: string): boolean {
+  if (SIP01_INDEXER_POLICY === 'allowlist') {
+    return sip01AllowedIndexers.has(pubkey);
+  }
+  if (SIP01_INDEXER_POLICY === 'blocklist') {
+    return !sip01BlockedIndexers.has(pubkey);
+  }
+  return true;
 }
 
 export function containsBlockedContent(event: NostrEvent): boolean {

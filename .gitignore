@@ -1,25 +1,14 @@
-# Dependencies
 node_modules/
-
-# Build output
-package-lock.json
+dist/
+worker.js
 worker.js.map
-
-# TypeScript
+package-lock.json
 *.tsbuildinfo
-
-# Environment files
 .env
 .env.local
-
-# Wrangler
 .wrangler/
 .dev.vars
-
-# OS files
 .DS_Store
 Thumbs.db
-
-# IDE
 .vscode/
 .idea/

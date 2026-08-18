@@ -1,17 +1,47 @@
-import { NostrEvent, NostrFilter, RateLimiter, WebSocketSession, Env, DOBroadcastRequest, QueryResult } from './types';
+/**
+ * RelayWebSocket Durable Object — the Nostr protocol endpoint.
+ *
+ * Holds the long-lived WebSocket connections (with hibernation), enforces
+ * relay policy (rate limits, allow/block lists, payment, NIP-42), drives
+ * SIP-01 validation/indexing through the worker module, and implements:
+ *
+ *   NIP-01  EVENT / REQ / CLOSE / OK / EOSE / CLOSED / NOTICE
+ *   NIP-42  AUTH (optional, config-gated)
+ *   NIP-45  COUNT
+ *   NIP-50  search filters (SIP-01-aware operators for kind 39697)
+ *   NIP-77  NEG-OPEN / NEG-MSG / NEG-CLOSE / NEG-ERR (negentropy sync)
+ *
+ * Forked from Nosflare's Durable Object (MIT) — see UPSTREAM.md.
+ *
+ * @module src/durable-object
+ */
+
+import { NostrEvent, NostrFilter, RateLimiter, WebSocketSession, Env, DOBroadcastRequest, QueryResult, NegSession } from './types';
 import {
   PUBKEY_RATE_LIMIT,
   REQ_RATE_LIMIT,
+  SIP01_INDEXER_RATE_LIMIT,
   PAY_TO_RELAY_ENABLED,
   AUTH_REQUIRED,
   AUTH_TIMEOUT_MS,
+  NIP50_ENABLED,
+  NIP45_ENABLED,
+  NIP77_ENABLED,
+  NEG_FRAME_SIZE_LIMIT,
+  NEG_SESSION_TIMEOUT_MS,
+  SIP01_ENABLED,
   isPubkeyAllowed,
   isEventKindAllowed,
   containsBlockedContent,
   isTagAllowed,
-  excludedRateLimitKinds
+  excludedRateLimitKinds,
+  relayInfo,
 } from './config';
-import { verifyEventSignature, hasPaidForRelay, processEvent, queryEvents } from './relay-worker';
+import { verifyEventSignature, hasPaidForRelay, processEvent, queryEvents, countEvents, executeSearch, querySyncItems, calculateQueryComplexity, ensureDatabase, NEG_MAX_ITEMS } from './relay-worker';
+import { Negentropy, NegentropyStorageVector, hexToBytes as negHexToBytes, bytesToHex as negBytesToHex } from '../shared/negentropy.js';
+import { SIP01_KIND, extractSip01Fields } from '../shared/sip01.js';
+import { parseSearchQuery, matchSip01Search } from '../shared/search-query.js';
+import { bumpMetric } from './sip01/ingest';
 
 // Session attachment data structure (minimal - auth state stored in session)
 interface SessionAttachment {
@@ -63,6 +93,13 @@ export class RelayWebSocket implements DurableObject {
   private paymentCache: Map<string, PaymentCacheEntry> = new Map();
   private readonly PAYMENT_CACHE_TTL = 60000;
 
+  // NIP-77 negentropy sessions: `${sessionId}:${subId}` → state (in-memory;
+  // reclaimed on hibernation/timeout with NEG-ERR closed:)
+  private negSessions: Map<string, NegSession> = new Map();
+
+  // Parsed NIP-50 queries cached per filter object (live delivery matching)
+  private parsedSearchCache: WeakMap<NostrFilter, ReturnType<typeof parseSearchQuery>> = new WeakMap();
+
   // Alarm and cleanup configuration
   private readonly IDLE_TIMEOUT = 5 * 60 * 1000; // 5 minutes
   private lastActivityTime: number = Date.now();
@@ -88,9 +125,9 @@ export class RelayWebSocket implements DurableObject {
     'relay-EEUR-primary': 'eeur',
     'relay-APAC-primary': 'apac',
     'relay-OC-primary': 'oc',
-    'relay-SAM-primary': 'enam',  // SAM redirects to ENAM
-    'relay-AFR-primary': 'weur',   // AFR redirects to WEUR
-    'relay-ME-primary': 'eeur'     // ME redirects to EEUR
+    'relay-SAM-primary': 'enam',
+    'relay-AFR-primary': 'weur',
+    'relay-ME-primary': 'eeur'
   };
 
   constructor(state: DurableObjectState, env: Env) {
@@ -105,6 +142,7 @@ export class RelayWebSocket implements DurableObject {
     this.queryCacheIndex = new Map();
     this.activeQueries = new Map();
     this.paymentCache = new Map();
+    this.negSessions = new Map();
     this.lastActivityTime = Date.now();
   }
 
@@ -115,53 +153,44 @@ export class RelayWebSocket implements DurableObject {
     const now = Date.now();
     const idleTime = now - this.lastActivityTime;
 
-    // Get active WebSocket count
     const activeWebSockets = this.state.getWebSockets();
     const activeCount = activeWebSockets.length;
 
     console.log(`DO ${this.doName} - Active WebSockets: ${activeCount}, Idle time: ${idleTime}ms`);
 
-    // If no active connections, clean up and don't reschedule
+    // Reclaim idle NEG sessions
+    this.reclaimIdleNegSessions();
+
     if (activeCount === 0) {
       console.log(`Cleaning up DO ${this.doName} - no active connections`);
       await this.cleanup();
-      // Don't set another alarm - let the DO be evicted
       return;
     }
 
-    // If still active, schedule next cleanup check
     const nextAlarm = now + this.IDLE_TIMEOUT;
     await this.state.storage.setAlarm(nextAlarm);
     console.log(`Next alarm scheduled for DO ${this.doName} in ${this.IDLE_TIMEOUT}ms`);
   }
 
-  // Cleanup method to clear caches and sessions
   private async cleanup(): Promise<void> {
     console.log(`Running cleanup for DO ${this.doName}`);
 
-    // Clear in-memory caches
     this.queryCache.clear();
     this.queryCacheIndex.clear();
     this.activeQueries.clear();
     this.paymentCache.clear();
     this.processedEvents.clear();
-
-    // Clear sessions
+    this.negSessions.clear();
     this.sessions.clear();
 
-    // Clean up orphaned subscription storage data
     await this.cleanupOrphanedSubscriptions();
 
     console.log(`Cleanup complete for DO ${this.doName}`);
   }
 
-  // Remove orphaned subscription data from storage
   private async cleanupOrphanedSubscriptions(): Promise<void> {
     try {
-      // Get all keys from storage
       const allKeys = await this.state.storage.list();
-
-      // Get current active WebSocket sessions
       const activeWebSockets = this.state.getWebSockets();
       const activeSessionIds = new Set<string>();
 
@@ -172,7 +201,6 @@ export class RelayWebSocket implements DurableObject {
         }
       }
 
-      // Find and delete orphaned subscription keys
       const keysToDelete: string[] = [];
       for (const [key] of allKeys) {
         if (key.startsWith('subs:')) {
@@ -192,11 +220,9 @@ export class RelayWebSocket implements DurableObject {
     }
   }
 
-  // Schedule alarm if one doesn't exist
   private async scheduleAlarmIfNeeded(): Promise<void> {
     const existingAlarm = await this.state.storage.getAlarm();
 
-    // Only schedule if no alarm exists
     if (existingAlarm === null) {
       const alarmTime = Date.now() + this.IDLE_TIMEOUT;
       await this.state.storage.setAlarm(alarmTime);
@@ -228,7 +254,6 @@ export class RelayWebSocket implements DurableObject {
     if (cached && Date.now() - cached.timestamp < this.PAYMENT_CACHE_TTL) {
       return cached.hasPaid;
     }
-    // Remove expired entry
     if (cached) {
       this.paymentCache.delete(pubkey);
     }
@@ -241,12 +266,10 @@ export class RelayWebSocket implements DurableObject {
       timestamp: Date.now()
     });
 
-    // Clean up old payment cache entries if too large
     if (this.paymentCache.size > 1000) {
       const sortedEntries = Array.from(this.paymentCache.entries())
         .sort((a, b) => a[1].timestamp - b[1].timestamp);
 
-      // Remove oldest 20%
       const toRemove = Math.floor(this.paymentCache.size * 0.2);
       for (let i = 0; i < toRemove; i++) {
         this.paymentCache.delete(sortedEntries[i][0]);
@@ -261,15 +284,13 @@ export class RelayWebSocket implements DurableObject {
     const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
     const hashArray = Array.from(new Uint8Array(hashBuffer));
     const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-    return `https://nosflare-query-cache/${hashHex}`;
+    return `https://siprelay-query-cache/${hashHex}`;
   }
 
   // Query cache methods with deduplication and global caching
   private async getCachedOrQuery(filters: NostrFilter[], bookmark: string): Promise<QueryResult> {
-    // Create cache key from filters and bookmark
     const cacheKey = JSON.stringify({ filters, bookmark });
 
-    // Check if identical query is in flight (deduplication)
     if (this.activeQueries.has(cacheKey)) {
       console.log('Returning in-flight query result (deduplication)');
       return await this.activeQueries.get(cacheKey)!;
@@ -282,7 +303,6 @@ export class RelayWebSocket implements DurableObject {
       const globalCached = await globalCache.match(globalCacheKey);
 
       if (globalCached) {
-        // Check if the cached response has expired (max-age not enforced by Cache API internally)
         const cachedDate = globalCached.headers.get('X-Cache-Time');
         if (cachedDate && Date.now() - parseInt(cachedDate) > 300000) {
           console.log('Global cache entry expired, deleting');
@@ -291,7 +311,6 @@ export class RelayWebSocket implements DurableObject {
           console.log('Returning globally cached query result');
           const result = await globalCached.json() as QueryResult;
 
-          // Also update local cache for faster subsequent access
           this.queryCache.set(cacheKey, {
             result,
             timestamp: Date.now(),
@@ -305,27 +324,22 @@ export class RelayWebSocket implements DurableObject {
       }
     } catch (error) {
       console.error('Error checking global cache:', error);
-      // Continue to local cache/query if global cache fails
     }
 
     // Check local cache
     const cached = this.queryCache.get(cacheKey);
     if (cached && Date.now() - cached.timestamp < this.QUERY_CACHE_TTL) {
-      console.log('Returning locally cached query result');
-      // Update access tracking
       cached.accessCount++;
       cached.lastAccessed = Date.now();
       return cached.result;
     }
 
-    // Execute query and track as active
     const queryPromise = queryEvents(filters, bookmark, this.env);
     this.activeQueries.set(cacheKey, queryPromise);
 
     try {
       const result = await queryPromise;
 
-      // Cache the result locally
       this.queryCache.set(cacheKey, {
         result,
         timestamp: Date.now(),
@@ -333,15 +347,12 @@ export class RelayWebSocket implements DurableObject {
         lastAccessed: Date.now()
       });
 
-      // Index this cache entry for efficient invalidation
       this.addToCacheIndex(cacheKey, filters);
 
-      // Clean up old cache entries if cache is too large
       if (this.queryCache.size > this.MAX_CACHE_SIZE) {
         this.cleanupQueryCache();
       }
 
-      // Store in Cloudflare global cache
       try {
         const globalCache = caches.default;
         const globalCacheKey = await this.generateGlobalCacheKey(filters, bookmark);
@@ -353,21 +364,17 @@ export class RelayWebSocket implements DurableObject {
           }
         });
         await globalCache.put(globalCacheKey, response);
-        console.log('Stored query result in global cache');
       } catch (error) {
         console.error('Error storing in global cache:', error);
-        // Continue even if global cache storage fails
       }
 
       return result;
     } finally {
-      // Remove from active queries
       this.activeQueries.delete(cacheKey);
     }
   }
 
   private cleanupQueryCache(): void {
-    // Remove expired entries first
     const now = Date.now();
     for (const [key, entry] of this.queryCache.entries()) {
       if (now - entry.timestamp > this.QUERY_CACHE_TTL) {
@@ -376,7 +383,6 @@ export class RelayWebSocket implements DurableObject {
       }
     }
 
-    // If still too large, use frequency-weighted eviction
     if (this.queryCache.size > this.MAX_CACHE_SIZE) {
       const entries = Array.from(this.queryCache.entries());
       const scoredEntries = entries.map(([key, entry]) => {
@@ -387,10 +393,8 @@ export class RelayWebSocket implements DurableObject {
         return { key, score: evictionScore };
       });
 
-      // Sort by score (ascending) to evict lowest-scoring entries
       scoredEntries.sort((a, b) => a.score - b.score);
 
-      // Remove lowest 20% scoring entries
       const toRemove = Math.floor(this.MAX_CACHE_SIZE * 0.2);
       for (let i = 0; i < toRemove; i++) {
         const key = scoredEntries[i].key;
@@ -402,10 +406,8 @@ export class RelayWebSocket implements DurableObject {
     }
   }
 
-  // Add cache entry to index for efficient invalidation
   private addToCacheIndex(cacheKey: string, filters: NostrFilter[]): void {
     for (const filter of filters) {
-      // Index by kinds
       if (filter.kinds) {
         for (const kind of filter.kinds) {
           const indexKey = `kind:${kind}`;
@@ -416,7 +418,6 @@ export class RelayWebSocket implements DurableObject {
         }
       }
 
-      // Index by authors
       if (filter.authors) {
         for (const author of filter.authors) {
           const indexKey = `author:${author}`;
@@ -427,7 +428,6 @@ export class RelayWebSocket implements DurableObject {
         }
       }
 
-      // Index by tag filters (#p, #e, #a, etc.)
       for (const [key, values] of Object.entries(filter)) {
         if (key.startsWith('#') && Array.isArray(values)) {
           const tagName = key.substring(1);
@@ -443,12 +443,9 @@ export class RelayWebSocket implements DurableObject {
     }
   }
 
-  // Remove cache entry from index
   private removeFromCacheIndex(cacheKey: string): void {
-    // Remove this cache key from all index entries
     for (const [indexKey, cacheKeys] of this.queryCacheIndex.entries()) {
       cacheKeys.delete(cacheKey);
-      // Clean up empty index entries
       if (cacheKeys.size === 0) {
         this.queryCacheIndex.delete(indexKey);
       }
@@ -456,10 +453,8 @@ export class RelayWebSocket implements DurableObject {
   }
 
   private invalidateRelevantCaches(event: NostrEvent): void {
-    // Optimized cache invalidation using index (for local cache only)
     const keysToInvalidate = new Set<string>();
 
-    // O(1) lookup by kind
     const kindKey = `kind:${event.kind}`;
     if (this.queryCacheIndex.has(kindKey)) {
       for (const cacheKey of this.queryCacheIndex.get(kindKey)!) {
@@ -467,7 +462,6 @@ export class RelayWebSocket implements DurableObject {
       }
     }
 
-    // O(1) lookup by author
     const authorKey = `author:${event.pubkey}`;
     if (this.queryCacheIndex.has(authorKey)) {
       for (const cacheKey of this.queryCacheIndex.get(authorKey)!) {
@@ -475,7 +469,6 @@ export class RelayWebSocket implements DurableObject {
       }
     }
 
-    // O(1) lookup by tags (p, e, a, etc.)
     for (const tag of event.tags) {
       if (tag.length >= 2) {
         const tagKey = `tag:${tag[0]}:${tag[1]}`;
@@ -487,7 +480,6 @@ export class RelayWebSocket implements DurableObject {
       }
     }
 
-    // Invalidate collected keys from local cache
     for (const key of keysToInvalidate) {
       this.queryCache.delete(key);
       this.removeFromCacheIndex(key);
@@ -501,7 +493,6 @@ export class RelayWebSocket implements DurableObject {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
 
-    // Extract and set DO name from URL if provided
     const urlDoName = url.searchParams.get('doName');
     if (urlDoName && urlDoName !== 'unknown' && RelayWebSocket.ALLOWED_ENDPOINTS.includes(urlDoName)) {
       this.doName = urlDoName;
@@ -512,13 +503,11 @@ export class RelayWebSocket implements DurableObject {
       return await this.handleDOBroadcast(request);
     }
 
-    // Handle WebSocket upgrade
     const upgradeHeader = request.headers.get('Upgrade');
     if (!upgradeHeader || upgradeHeader !== 'websocket') {
       return new Response('Expected Upgrade: websocket', { status: 426 });
     }
 
-    // Extract region info and DO name
     this.region = url.searchParams.get('region') || this.region || 'unknown';
     const colo = url.searchParams.get('colo') || 'default';
 
@@ -527,45 +516,28 @@ export class RelayWebSocket implements DurableObject {
     const webSocketPair = new WebSocketPair();
     const [client, server] = Object.values(webSocketPair);
 
-    // Create session data
     const sessionId = crypto.randomUUID();
     const host = request.headers.get('host') || url.host;
 
-    // Create session object with NIP-42 auth state
-    const session: WebSocketSession = {
-      id: sessionId,
-      webSocket: server,
-      subscriptions: new Map(),
-      pubkeyRateLimiter: new RateLimiter(PUBKEY_RATE_LIMIT.rate, PUBKEY_RATE_LIMIT.capacity),
-      reqRateLimiter: new RateLimiter(REQ_RATE_LIMIT.rate, REQ_RATE_LIMIT.capacity),
-      bookmark: 'first-unconstrained',
-      host,
-      challenge: AUTH_REQUIRED ? this.generateAuthChallenge() : undefined,
-      authenticatedPubkeys: new Set()
-    };
+    const session = this.createSession(sessionId, server, 'first-unconstrained', host, []);
     this.sessions.set(sessionId, session);
 
-    // Serialize minimal attachment to the WebSocket
     const attachment: SessionAttachment = {
       sessionId,
       bookmark: session.bookmark,
       host,
       doName: this.doName,
-      // NIP-42: Persist auth state for hibernation survival
       authenticatedPubkeys: [],
       challenge: session.challenge
     };
     server.serializeAttachment(attachment);
 
-    // Use hibernatable WebSocket accept
     this.state.acceptWebSocket(server);
 
-    // NIP-42: Send AUTH challenge immediately if required
     if (AUTH_REQUIRED && session.challenge) {
       this.sendAuth(server, session.challenge);
     }
 
-    // Update activity time and schedule alarm
     this.lastActivityTime = Date.now();
     await this.scheduleAlarmIfNeeded();
 
@@ -577,9 +549,35 @@ export class RelayWebSocket implements DurableObject {
     });
   }
 
+  /** Construct a session object with fresh rate limiters and auth state. */
+  private createSession(
+    sessionId: string,
+    ws: WebSocket,
+    bookmark: string,
+    host: string,
+    authenticatedPubkeys: string[],
+    challenge?: string,
+    hasPaid?: boolean,
+    subscriptions?: Map<string, NostrFilter[]>,
+  ): WebSocketSession {
+    return {
+      id: sessionId,
+      webSocket: ws,
+      subscriptions: subscriptions ?? new Map(),
+      pubkeyRateLimiter: new RateLimiter(PUBKEY_RATE_LIMIT.rate, PUBKEY_RATE_LIMIT.capacity),
+      // SIP-01 indexers get their own, roomier bucket (crawlers burst).
+      sipRateLimiter: new RateLimiter(SIP01_INDEXER_RATE_LIMIT.rate, SIP01_INDEXER_RATE_LIMIT.capacity),
+      reqRateLimiter: new RateLimiter(REQ_RATE_LIMIT.rate, REQ_RATE_LIMIT.capacity),
+      bookmark,
+      host,
+      challenge: challenge ?? (AUTH_REQUIRED ? this.generateAuthChallenge() : undefined),
+      authenticatedPubkeys: new Set(authenticatedPubkeys),
+      hasPaid
+    };
+  }
+
   // WebSocket Hibernation API handler methods
   async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string): Promise<void> {
-    // Track activity
     this.lastActivityTime = Date.now();
 
     const attachment = ws.deserializeAttachment() as SessionAttachment | null;
@@ -592,41 +590,39 @@ export class RelayWebSocket implements DurableObject {
     // Get or recreate session
     let session = this.sessions.get(attachment.sessionId);
     if (!session) {
-      // Restore DO name from attachment
       if (attachment.doName && this.doName === 'unknown') {
         this.doName = attachment.doName;
       }
-      // Load subscriptions from storage
       const subscriptions = await this.loadSubscriptions(attachment.sessionId);
+      const restoredPubkeys = attachment.authenticatedPubkeys || [];
 
-      // Recreate session from attachment (after hibernation)
-      // NIP-42: Restore auth state from attachment - auth persists for connection lifetime per spec
-      const restoredPubkeys = new Set(attachment.authenticatedPubkeys || []);
-      const isAuthenticated = restoredPubkeys.size > 0;
-
-      session = {
-        id: attachment.sessionId,
-        webSocket: ws,
+      session = this.createSession(
+        attachment.sessionId,
+        ws,
+        attachment.bookmark,
+        attachment.host,
+        restoredPubkeys,
+        attachment.challenge || (AUTH_REQUIRED ? this.generateAuthChallenge() : undefined),
+        attachment.hasPaid,
         subscriptions,
-        pubkeyRateLimiter: new RateLimiter(PUBKEY_RATE_LIMIT.rate, PUBKEY_RATE_LIMIT.capacity),
-        reqRateLimiter: new RateLimiter(REQ_RATE_LIMIT.rate, REQ_RATE_LIMIT.capacity),
-        bookmark: attachment.bookmark,
-        host: attachment.host,
-        // NIP-42: Restore challenge from attachment, or generate new one if not present
-        challenge: attachment.challenge || (AUTH_REQUIRED ? this.generateAuthChallenge() : undefined),
-        authenticatedPubkeys: restoredPubkeys,
-        // Restore payment status from attachment (survives hibernation)
-        hasPaid: attachment.hasPaid
-      };
+      );
       this.sessions.set(attachment.sessionId, session);
 
-      // Only send AUTH challenge after hibernation if client is NOT already authenticated
-      if (AUTH_REQUIRED && !isAuthenticated && session.challenge) {
+      if (AUTH_REQUIRED && restoredPubkeys.length === 0 && session.challenge) {
         this.sendAuth(ws, session.challenge);
       }
     }
 
     try {
+      // Hard message size cap before any parsing (advertised in NIP-11).
+      const maxMessageLength = relayInfo.limitation?.max_message_length ?? 262144;
+      const messageLength = typeof message === 'string' ? message.length : message.byteLength;
+      if (messageLength > maxMessageLength) {
+        this.sendError(ws, `error: message exceeds ${maxMessageLength} bytes`);
+        ws.close(1009, 'message too large');
+        return;
+      }
+
       let parsedMessage: any;
 
       if (typeof message === 'string') {
@@ -639,7 +635,6 @@ export class RelayWebSocket implements DurableObject {
 
       await this.handleMessage(session, parsedMessage);
 
-      // Update attachment with latest session state (including NIP-42 auth)
       const updatedAttachment: SessionAttachment = {
         sessionId: session.id,
         bookmark: session.bookmark,
@@ -667,10 +662,15 @@ export class RelayWebSocket implements DurableObject {
       console.log(`WebSocket closed: ${attachment.sessionId} on DO ${this.doName}`);
       this.sessions.delete(attachment.sessionId);
 
-      // Clean up stored subscriptions
+      // Reclaim this connection's NEG sessions
+      for (const key of [...this.negSessions.keys()]) {
+        if (key.startsWith(`${attachment.sessionId}:`)) {
+          this.negSessions.delete(key);
+        }
+      }
+
       await this.deleteSubscriptions(attachment.sessionId);
 
-      // If no more active WebSockets, delete the alarm to allow DO eviction
       const activeWebSockets = this.state.getWebSockets();
       if (activeWebSockets.length === 0) {
         await this.state.storage.deleteAlarm();
@@ -692,7 +692,6 @@ export class RelayWebSocket implements DurableObject {
       const data: DOBroadcastRequest = await request.json();
       const { event, sourceDoId } = data;
 
-      // Prevent duplicate processing
       if (this.processedEvents.has(event.id)) {
         return new Response(JSON.stringify({ success: true, duplicate: true }));
       }
@@ -701,19 +700,13 @@ export class RelayWebSocket implements DurableObject {
 
       console.log(`DO ${this.doName} received event ${event.id} from ${sourceDoId}`);
 
-      // Invalidate local query caches that match this event so stale results aren't served
       this.invalidateRelevantCaches(event);
-
-      // Broadcast to local sessions
       await this.broadcastToLocalSessions(event);
 
-      // Clean up old processed events periodically
       const fiveMinutesAgo = Date.now() - 300000;
-      let cleaned = 0;
       for (const [eventId, timestamp] of this.processedEvents) {
         if (timestamp < fiveMinutesAgo) {
           this.processedEvents.delete(eventId);
-          cleaned++;
         }
       }
 
@@ -750,6 +743,18 @@ export class RelayWebSocket implements DurableObject {
         case 'AUTH':
           await this.handleAuth(session, args[0]);
           break;
+        case 'COUNT':
+          await this.handleCount(session, message);
+          break;
+        case 'NEG-OPEN':
+          await this.handleNegOpen(session, message);
+          break;
+        case 'NEG-MSG':
+          await this.handleNegMsg(session, message);
+          break;
+        case 'NEG-CLOSE':
+          await this.handleNegClose(session, message);
+          break;
         default:
           this.sendError(session.webSocket, `Unknown message type: ${type}`);
       }
@@ -775,6 +780,30 @@ export class RelayWebSocket implements DurableObject {
         return;
       }
 
+      // Field shape checks (cheap, before any crypto)
+      if (!/^[0-9a-f]{64}$/.test(event.id) || !/^[0-9a-f]{64}$/.test(event.pubkey) || !/^[0-9a-f]{128}$/.test(event.sig)) {
+        this.sendOK(session.webSocket, event.id || '', false, 'invalid: id, pubkey and sig must be lowercase hex');
+        return;
+      }
+      if (!Number.isInteger(event.kind) || event.kind < 0 || event.kind > 65535) {
+        this.sendOK(session.webSocket, event.id, false, 'invalid: kind must be an integer in range [0, 65535]');
+        return;
+      }
+      if (!Number.isInteger(event.created_at)) {
+        this.sendOK(session.webSocket, event.id, false, 'invalid: created_at must be an integer');
+        return;
+      }
+      const maxTags = relayInfo.limitation?.max_event_tags ?? 2000;
+      if (event.tags.length > maxTags) {
+        this.sendOK(session.webSocket, event.id, false, `invalid: event has more than ${maxTags} tags`);
+        return;
+      }
+      const maxContent = relayInfo.limitation?.max_content_length ?? 70000;
+      if (typeof event.content !== 'string' || event.content.length > maxContent) {
+        this.sendOK(session.webSocket, event.id, false, `invalid: content exceeds ${maxContent} characters`);
+        return;
+      }
+
       // NIP-42: Reject kind 22242 events - they are for authentication only, not publishing
       if (event.kind === 22242) {
         this.sendOK(session.webSocket, event.id, false, 'invalid: kind 22242 events are for authentication only');
@@ -784,24 +813,23 @@ export class RelayWebSocket implements DurableObject {
       // NIP-42: Check authentication
       if (AUTH_REQUIRED) {
         if (session.authenticatedPubkeys.size === 0) {
-          // Not authenticated at all
           this.sendOK(session.webSocket, event.id, false, 'auth-required: authenticate to publish events');
           return;
         }
-        // Kind 1059 (gift wrap / NIP-59) uses throwaway pubkeys, so only require
-        // connection-level auth, not per-pubkey auth
         if (event.kind !== 1059 && !session.authenticatedPubkeys.has(event.pubkey)) {
-          // Authenticated but event pubkey doesn't match - use "restricted:" per NIP-42
-          // so the client knows not to retry auth
           this.sendOK(session.webSocket, event.id, false, 'restricted: event pubkey does not match authenticated pubkey');
           return;
         }
       }
 
-      // Rate limiting (skip for excluded kinds)
+      // Rate limiting (kind 39697 indexers get their own bucket; excluded
+      // kinds skip EVENT rate limiting entirely)
       if (!excludedRateLimitKinds.has(event.kind)) {
-        if (!session.pubkeyRateLimiter.removeToken()) {
-          console.log(`Rate limit exceeded for pubkey ${event.pubkey}`);
+        const limiter = (event.kind === SIP01_KIND && SIP01_ENABLED)
+          ? session.sipRateLimiter
+          : session.pubkeyRateLimiter;
+        if (!limiter.removeToken()) {
+          console.log(`Rate limit exceeded for pubkey ${event.pubkey} (kind ${event.kind})`);
           this.sendOK(session.webSocket, event.id, false, 'rate-limited: slow down there chief');
           return;
         }
@@ -816,13 +844,10 @@ export class RelayWebSocket implements DurableObject {
       }
 
       // Check if pay to relay is enabled
-      // Skip for kind 1059 (gift wrap) since the pubkey is a throwaway key with no payment record
       if (PAY_TO_RELAY_ENABLED && event.kind !== 1059) {
-        // Check per-pubkey cache first, then fall back to D1
         let hasPaid = await this.getCachedPaymentStatus(event.pubkey);
 
         if (hasPaid === null) {
-          // Not in cache, check database
           hasPaid = await hasPaidForRelay(event.pubkey, this.env);
           if (hasPaid !== null) {
             this.setCachedPaymentStatus(event.pubkey, hasPaid);
@@ -830,10 +855,8 @@ export class RelayWebSocket implements DurableObject {
         }
 
         // Block unless we know for certain they've paid.
-        // On DB errors (null), deny the event to prevent unpaid access.
         if (hasPaid !== true) {
-          const protocol = 'https:';
-          const relayUrl = `${protocol}//${session.host}`;
+          const relayUrl = `https://${session.host}`;
           console.error(`Event denied. Pubkey ${event.pubkey} has not paid for relay access.`);
           this.sendOK(session.webSocket, event.id, false, `blocked: payment required. Visit ${relayUrl} to pay for relay access.`);
           return;
@@ -847,10 +870,10 @@ export class RelayWebSocket implements DurableObject {
         return;
       }
 
-      // Check if event kind is allowed
+      // Check if event kind is allowed (RELAY_MODE gating happens in config)
       if (!isEventKindAllowed(event.kind)) {
         console.error(`Event denied. Event kind ${event.kind} is not allowed.`);
-        this.sendOK(session.webSocket, event.id, false, `blocked: event kind ${event.kind} not allowed`);
+        this.sendOK(session.webSocket, event.id, false, `blocked: event kind ${event.kind} not allowed on this relay`);
         return;
       }
 
@@ -870,25 +893,19 @@ export class RelayWebSocket implements DurableObject {
         }
       }
 
-      // Process the event (save to database)
+      // Process the event (SIP-01 validation + storage)
       const result = await processEvent(event, session.id, this.env);
 
-      // Update session bookmark for read-after-write consistency
       if (result.bookmark) {
         session.bookmark = result.bookmark;
       }
 
       if (result.success) {
-        // Send OK to the sender
         this.sendOK(session.webSocket, event.id, true, result.message);
 
-        // Mark as processed
         this.processedEvents.set(event.id, Date.now());
-
-        // Invalidate relevant query caches
         this.invalidateRelevantCaches(event);
 
-        // Broadcast to all (local + remote)
         console.log(`DO ${this.doName} broadcasting event ${event.id}`);
         await this.broadcastEvent(event);
       } else {
@@ -909,33 +926,39 @@ export class RelayWebSocket implements DurableObject {
       return;
     }
 
-    // NIP-42: Check authentication if required
     if (AUTH_REQUIRED && session.authenticatedPubkeys.size === 0) {
       this.sendClosed(session.webSocket, subscriptionId, 'auth-required: authentication required to subscribe');
       return;
     }
 
-    // Rate limiting
     if (!session.reqRateLimiter.removeToken()) {
       console.error(`REQ rate limit exceeded for subscription: ${subscriptionId}`);
       this.sendClosed(session.webSocket, subscriptionId, 'rate-limited: slow down there chief');
       return;
     }
 
-    // Validate filters
     if (filters.length === 0) {
       this.sendClosed(session.webSocket, subscriptionId, 'error: at least one filter required');
       return;
     }
 
-    // Validate each filter
+    if (filters.length > 20) {
+      this.sendClosed(session.webSocket, subscriptionId, 'error: too many filters (max 20)');
+      return;
+    }
+
+    const maxSubscriptions = relayInfo.limitation?.max_subscriptions ?? 100;
+    if (session.subscriptions.size >= maxSubscriptions && !session.subscriptions.has(subscriptionId)) {
+      this.sendClosed(session.webSocket, subscriptionId, `error: max subscriptions (${maxSubscriptions}) reached`);
+      return;
+    }
+
     for (const filter of filters) {
       if (typeof filter !== 'object' || filter === null) {
         this.sendClosed(session.webSocket, subscriptionId, 'invalid: filter must be an object');
         return;
       }
 
-      // Validate IDs format
       if (filter.ids) {
         for (const id of filter.ids) {
           if (!/^[a-f0-9]{64}$/.test(id)) {
@@ -945,7 +968,6 @@ export class RelayWebSocket implements DurableObject {
         }
       }
 
-      // Validate authors format
       if (filter.authors) {
         for (const author of filter.authors) {
           if (!/^[a-f0-9]{64}$/.test(author)) {
@@ -955,7 +977,6 @@ export class RelayWebSocket implements DurableObject {
         }
       }
 
-      // Check blocked kinds
       if (filter.kinds) {
         const blockedKinds = filter.kinds.filter((kind: number) => !isEventKindAllowed(kind));
         if (blockedKinds.length > 0) {
@@ -965,13 +986,23 @@ export class RelayWebSocket implements DurableObject {
         }
       }
 
-      // Validate limits
       if (filter.ids && filter.ids.length > 5000) {
         this.sendClosed(session.webSocket, subscriptionId, 'invalid: too many event IDs (max 5000)');
         return;
       }
 
-      // Cap limit at 5000 if it's too high or set default if not provided
+      // NIP-50 search field validation
+      if (filter.search !== undefined) {
+        if (!NIP50_ENABLED) {
+          this.sendClosed(session.webSocket, subscriptionId, 'blocked: search is not supported by this relay');
+          return;
+        }
+        if (typeof filter.search !== 'string' || filter.search.length > 500) {
+          this.sendClosed(session.webSocket, subscriptionId, 'invalid: search must be a string of max 500 chars');
+          return;
+        }
+      }
+
       if (filter.limit && filter.limit > 500) {
         filter.limit = 500;
       } else if (!filter.limit) {
@@ -979,29 +1010,43 @@ export class RelayWebSocket implements DurableObject {
       }
     }
 
-    // Store subscription
     session.subscriptions.set(subscriptionId, filters);
-
-    // Save to storage
     await this.saveSubscriptions(session.id, session.subscriptions);
 
     console.log(`New subscription ${subscriptionId} for session ${session.id} on DO ${this.doName}`);
 
     try {
-      // Query events with caching
-      const result = await this.getCachedOrQuery(filters, session.bookmark);
+      await ensureDatabase(this.env.RELAY_DATABASE);
 
-      // Update session bookmark
-      if (result.bookmark) {
-        session.bookmark = result.bookmark;
+      // Partition search filters from plain filters (NIP-50 results are
+      // rank-ordered and never served from the query cache).
+      const searchFilters = filters.filter((f: NostrFilter) => typeof f.search === 'string' && f.search.trim() !== '');
+      const plainFilters = filters.filter((f: NostrFilter) => !(typeof f.search === 'string' && f.search.trim() !== ''));
+
+      const seenIds = new Set<string>();
+
+      if (plainFilters.length > 0) {
+        const result = await this.getCachedOrQuery(plainFilters, session.bookmark);
+        if (result.bookmark) {
+          session.bookmark = result.bookmark;
+        }
+        for (const event of result.events) {
+          if (seenIds.has(event.id)) continue;
+          seenIds.add(event.id);
+          this.sendEvent(session.webSocket, subscriptionId, event);
+        }
       }
 
-      // Send events to client
-      for (const event of result.events) {
-        this.sendEvent(session.webSocket, subscriptionId, event);
+      for (const filter of searchFilters) {
+        const events = await executeSearch(this.env.RELAY_DATABASE.withSession(session.bookmark), filter);
+        for (const event of events) {
+          if (seenIds.has(event.id)) continue;
+          seenIds.add(event.id);
+          this.sendEvent(session.webSocket, subscriptionId, event);
+        }
+        bumpMetric(this.env.RELAY_DATABASE.withSession('first-primary'), 'search_queries_ws').catch(() => undefined);
       }
 
-      // Send EOSE
       this.sendEOSE(session.webSocket, subscriptionId);
 
     } catch (error: any) {
@@ -1018,9 +1063,7 @@ export class RelayWebSocket implements DurableObject {
 
     const deleted = session.subscriptions.delete(subscriptionId);
     if (deleted) {
-      // Save updated subscriptions to storage
       await this.saveSubscriptions(session.id, session.subscriptions);
-
       console.log(`Closed subscription ${subscriptionId} for session ${session.id} on DO ${this.doName}`);
       this.sendClosed(session.webSocket, subscriptionId, 'Subscription closed');
     } else {
@@ -1028,16 +1071,194 @@ export class RelayWebSocket implements DurableObject {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // NIP-45 COUNT
+  // -------------------------------------------------------------------------
+
+  private async handleCount(session: WebSocketSession, message: any[]): Promise<void> {
+    const [_, queryId, ...filters] = message;
+
+    if (!queryId || typeof queryId !== 'string' || queryId === '' || queryId.length > 64) {
+      this.sendError(session.webSocket, 'Invalid query ID for COUNT');
+      return;
+    }
+
+    if (!NIP45_ENABLED) {
+      this.sendClosed(session.webSocket, queryId, 'blocked: COUNT is not supported by this relay');
+      return;
+    }
+
+    if (AUTH_REQUIRED && session.authenticatedPubkeys.size === 0) {
+      this.sendClosed(session.webSocket, queryId, 'auth-required: authentication required');
+      return;
+    }
+
+    if (!session.reqRateLimiter.removeToken()) {
+      this.sendClosed(session.webSocket, queryId, 'rate-limited: slow down there chief');
+      return;
+    }
+
+    if (filters.length === 0 || filters.length > 10) {
+      this.sendClosed(session.webSocket, queryId, 'error: COUNT requires 1-10 filters');
+      return;
+    }
+
+    for (const filter of filters) {
+      if (typeof filter !== 'object' || filter === null) {
+        this.sendClosed(session.webSocket, queryId, 'invalid: filter must be an object');
+        return;
+      }
+      if (calculateQueryComplexity(filter) > 500) {
+        this.sendClosed(session.webSocket, queryId, 'blocked: filter too complex to count');
+        return;
+      }
+    }
+
+    try {
+      const count = await countEvents(filters, session.bookmark, this.env);
+      this.sendCount(session.webSocket, queryId, count);
+      bumpMetric(this.env.RELAY_DATABASE.withSession('first-primary'), 'count_queries').catch(() => undefined);
+    } catch (error) {
+      console.error('COUNT failed:', error);
+      this.sendClosed(session.webSocket, queryId, 'error: could not compute count');
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // NIP-77 negentropy sync
+  // -------------------------------------------------------------------------
+
+  private negKey(sessionId: string, subId: string): string {
+    return `${sessionId}:${subId}`;
+  }
+
+  private reclaimIdleNegSessions(): void {
+    const now = Date.now();
+    for (const [key, neg] of this.negSessions) {
+      if (now - neg.createdAt > NEG_SESSION_TIMEOUT_MS) {
+        this.negSessions.delete(key);
+        console.log(`Reclaimed idle NEG session ${key}`);
+      }
+    }
+  }
+
+  private async handleNegOpen(session: WebSocketSession, message: any[]): Promise<void> {
+    const [_, subId, filter, initialMessage] = message;
+
+    if (!subId || typeof subId !== 'string' || subId === '' || subId.length > 64) {
+      this.sendError(session.webSocket, 'Invalid NEG subscription ID');
+      return;
+    }
+
+    if (!NIP77_ENABLED) {
+      this.sendNegErr(session.webSocket, subId, 'disabled: negentropy sync is not enabled on this relay');
+      return;
+    }
+
+    if (AUTH_REQUIRED && session.authenticatedPubkeys.size === 0) {
+      this.sendNegErr(session.webSocket, subId, 'auth-required: authentication required to sync');
+      return;
+    }
+
+    if (!session.reqRateLimiter.removeToken()) {
+      this.sendNegErr(session.webSocket, subId, 'rate-limited: slow down there chief');
+      return;
+    }
+
+    if (typeof filter !== 'object' || filter === null) {
+      this.sendNegErr(session.webSocket, subId, 'invalid: filter must be an object');
+      return;
+    }
+
+    if (typeof initialMessage !== 'string' || !/^[0-9a-fA-F]*$/.test(initialMessage)) {
+      this.sendNegErr(session.webSocket, subId, 'invalid: initial message must be hex-encoded');
+      return;
+    }
+
+    try {
+      // Re-opening an existing id replaces the old session (NIP-77).
+      this.negSessions.delete(this.negKey(session.id, subId));
+      this.reclaimIdleNegSessions();
+
+      // Load our side's record set for the filter.
+      const { items, truncated } = await querySyncItems(filter, this.env);
+      if (truncated) {
+        this.sendNegErr(session.webSocket, subId, 'blocked: this query is too big', String(NEG_MAX_ITEMS));
+        return;
+      }
+
+      const storage = new NegentropyStorageVector();
+      for (const item of items) {
+        storage.insertHex(item.created_at, item.id);
+      }
+      storage.seal();
+
+      const neg = new Negentropy(storage, NEG_FRAME_SIZE_LIMIT);
+      const result = neg.reconcile(negHexToBytes(initialMessage));
+
+      this.negSessions.set(this.negKey(session.id, subId), {
+        neg,
+        filter,
+        createdAt: Date.now(),
+        itemCount: items.length,
+      });
+
+      bumpMetric(this.env.RELAY_DATABASE.withSession('first-primary'), 'neg_sessions').catch(() => undefined);
+
+      console.log(`NEG-OPEN ${subId}: reconciling ${items.length} items for session ${session.id}`);
+      this.sendNegMsg(session.webSocket, subId, negBytesToHex(result.message!));
+    } catch (error: any) {
+      console.error('NEG-OPEN failed:', error);
+      this.sendNegErr(session.webSocket, subId, `invalid: ${error.message || 'bad negentropy message'}`);
+    }
+  }
+
+  private async handleNegMsg(session: WebSocketSession, message: any[]): Promise<void> {
+    const [_, subId, theirMessage] = message;
+
+    if (!subId || typeof subId !== 'string') {
+      this.sendError(session.webSocket, 'Invalid NEG subscription ID');
+      return;
+    }
+
+    const negSession = this.negSessions.get(this.negKey(session.id, subId));
+    if (!negSession) {
+      this.sendNegErr(session.webSocket, subId, 'closed: no such NEG session (expired or never opened)');
+      return;
+    }
+
+    if (typeof theirMessage !== 'string' || !/^[0-9a-fA-F]*$/.test(theirMessage)) {
+      this.sendNegErr(session.webSocket, subId, 'invalid: message must be hex-encoded');
+      this.negSessions.delete(this.negKey(session.id, subId));
+      return;
+    }
+
+    try {
+      negSession.createdAt = Date.now();
+      const result = negSession.neg.reconcile(negHexToBytes(theirMessage));
+      this.sendNegMsg(session.webSocket, subId, negBytesToHex(result.message!));
+    } catch (error: any) {
+      console.error('NEG-MSG failed:', error);
+      this.sendNegErr(session.webSocket, subId, `invalid: ${error.message || 'bad negentropy message'}`);
+      this.negSessions.delete(this.negKey(session.id, subId));
+    }
+  }
+
+  private async handleNegClose(session: WebSocketSession, message: any[]): Promise<void> {
+    const [_, subId] = message;
+    if (typeof subId === 'string') {
+      this.negSessions.delete(this.negKey(session.id, subId));
+    }
+  }
+
   // NIP-42: Handle AUTH message from client
   private async handleAuth(session: WebSocketSession, authEvent: NostrEvent): Promise<void> {
     try {
-      // Validate auth event object
       if (!authEvent || typeof authEvent !== 'object') {
         this.sendOK(session.webSocket, '', false, 'invalid: auth event object required');
         return;
       }
 
-      // Check required fields
       if (!authEvent.id || !authEvent.pubkey || !authEvent.sig || !authEvent.created_at ||
         authEvent.kind === undefined || !Array.isArray(authEvent.tags) ||
         authEvent.content === undefined) {
@@ -1045,20 +1266,17 @@ export class RelayWebSocket implements DurableObject {
         return;
       }
 
-      // Verify kind is 22242
       if (authEvent.kind !== 22242) {
         this.sendOK(session.webSocket, authEvent.id, false, 'invalid: auth event must be kind 22242');
         return;
       }
 
-      // Verify signature
       const isValidSignature = await verifyEventSignature(authEvent);
       if (!isValidSignature) {
         this.sendOK(session.webSocket, authEvent.id, false, 'invalid: signature verification failed');
         return;
       }
 
-      // Check created_at is within timeout of current time
       const now = Math.floor(Date.now() / 1000);
       const timeDiff = Math.abs(now - authEvent.created_at);
       const timeoutSeconds = AUTH_TIMEOUT_MS / 1000;
@@ -1067,14 +1285,12 @@ export class RelayWebSocket implements DurableObject {
         return;
       }
 
-      // Find challenge tag
       const challengeTag = authEvent.tags.find(tag => tag[0] === 'challenge');
       if (!challengeTag || !challengeTag[1]) {
         this.sendOK(session.webSocket, authEvent.id, false, 'invalid: missing challenge tag');
         return;
       }
 
-      // Verify challenge matches
       if (!session.challenge) {
         this.sendOK(session.webSocket, authEvent.id, false, 'invalid: no challenge was issued');
         return;
@@ -1085,14 +1301,12 @@ export class RelayWebSocket implements DurableObject {
         return;
       }
 
-      // Find relay tag
       const relayTag = authEvent.tags.find(tag => tag[0] === 'relay');
       if (!relayTag || !relayTag[1]) {
         this.sendOK(session.webSocket, authEvent.id, false, 'invalid: missing relay tag');
         return;
       }
 
-      // Verify relay URL matches (check domain at minimum)
       try {
         const authRelayUrl = new URL(relayTag[1]);
         const sessionHost = session.host.toLowerCase().replace(/:\d+$/, '');
@@ -1107,10 +1321,8 @@ export class RelayWebSocket implements DurableObject {
         return;
       }
 
-      // All checks passed - add pubkey to authenticated list
       session.authenticatedPubkeys.add(authEvent.pubkey);
 
-      // Check payment status at auth time so we don't hit D1 on every EVENT
       if (PAY_TO_RELAY_ENABLED) {
         const paid = await hasPaidForRelay(authEvent.pubkey, this.env);
         if (paid !== null) {
@@ -1128,42 +1340,33 @@ export class RelayWebSocket implements DurableObject {
   }
 
   private async broadcastEvent(event: NostrEvent): Promise<void> {
-    // Broadcast to local sessions
     await this.broadcastToLocalSessions(event);
-
-    // Broadcast to other DOs
     await this.broadcastToOtherDOs(event);
   }
 
   private async broadcastToLocalSessions(event: NostrEvent): Promise<void> {
     let broadcastCount = 0;
 
-    // Get all active WebSockets (including hibernated ones)
     const activeWebSockets = this.state.getWebSockets();
 
     for (const ws of activeWebSockets) {
       const attachment = ws.deserializeAttachment() as SessionAttachment | null;
       if (!attachment) continue;
 
-      // Get or recreate session
       let session = this.sessions.get(attachment.sessionId);
       if (!session) {
-        // Load subscriptions from storage
         const subscriptions = await this.loadSubscriptions(attachment.sessionId);
 
-        // Recreate minimal session for broadcast (restore NIP-42 auth state from attachment)
-        session = {
-          id: attachment.sessionId,
-          webSocket: ws,
+        session = this.createSession(
+          attachment.sessionId,
+          ws,
+          attachment.bookmark,
+          attachment.host,
+          attachment.authenticatedPubkeys || [],
+          attachment.challenge,
+          attachment.hasPaid,
           subscriptions,
-          pubkeyRateLimiter: new RateLimiter(PUBKEY_RATE_LIMIT.rate, PUBKEY_RATE_LIMIT.capacity),
-          reqRateLimiter: new RateLimiter(REQ_RATE_LIMIT.rate, REQ_RATE_LIMIT.capacity),
-          bookmark: attachment.bookmark,
-          host: attachment.host,
-          challenge: attachment.challenge || (AUTH_REQUIRED ? this.generateAuthChallenge() : undefined),
-          authenticatedPubkeys: new Set(attachment.authenticatedPubkeys || []),
-          hasPaid: attachment.hasPaid
-        };
+        );
         this.sessions.set(attachment.sessionId, session);
       }
 
@@ -1187,14 +1390,11 @@ export class RelayWebSocket implements DurableObject {
   private async broadcastToOtherDOs(event: NostrEvent): Promise<void> {
     const broadcasts: Promise<Response>[] = [];
 
-    // Broadcast to all allowed endpoints except ourselves
     for (const endpoint of RelayWebSocket.ALLOWED_ENDPOINTS) {
       if (endpoint === this.doName) continue;
-
       broadcasts.push(this.sendToSpecificDO(endpoint, event));
     }
 
-    // Execute broadcasts in parallel with timeout
     const results = await Promise.allSettled(
       broadcasts.map(p => Promise.race([
         p,
@@ -1210,7 +1410,6 @@ export class RelayWebSocket implements DurableObject {
 
   private async sendToSpecificDO(doName: string, event: NostrEvent): Promise<Response> {
     try {
-      // Ensure we're only using allowed endpoints
       if (!RelayWebSocket.ALLOWED_ENDPOINTS.includes(doName)) {
         throw new Error(`Invalid DO name: ${doName}`);
       }
@@ -1219,7 +1418,6 @@ export class RelayWebSocket implements DurableObject {
       const locationHint = RelayWebSocket.ENDPOINT_HINTS[doName] || 'auto';
       const stub = this.env.RELAY_WEBSOCKET.get(id, { locationHint });
 
-      // Include the target DO name in the URL
       const url = new URL('https://internal/do-broadcast');
       url.searchParams.set('doName', doName);
 
@@ -1241,22 +1439,18 @@ export class RelayWebSocket implements DurableObject {
   }
 
   private matchesFilter(event: NostrEvent, filter: NostrFilter): boolean {
-    // Check IDs
     if (filter.ids && filter.ids.length > 0 && !filter.ids.includes(event.id)) {
       return false;
     }
 
-    // Check authors
     if (filter.authors && filter.authors.length > 0 && !filter.authors.includes(event.pubkey)) {
       return false;
     }
 
-    // Check kinds
     if (filter.kinds && filter.kinds.length > 0 && !filter.kinds.includes(event.kind)) {
       return false;
     }
 
-    // Check time bounds
     if (filter.since && event.created_at < filter.since) {
       return false;
     }
@@ -1264,7 +1458,6 @@ export class RelayWebSocket implements DurableObject {
       return false;
     }
 
-    // Check tag filters
     for (const [key, values] of Object.entries(filter)) {
       if (key.startsWith('#') && Array.isArray(values) && values.length > 0) {
         const tagName = key.substring(1);
@@ -1272,7 +1465,6 @@ export class RelayWebSocket implements DurableObject {
           .filter(tag => tag[0] === tagName)
           .map(tag => tag[1]);
 
-        // Check if any of the filter values match any of the event's tag values
         const hasMatch = values.some(v => eventTagValues.includes(v));
         if (!hasMatch) {
           return false;
@@ -1280,10 +1472,39 @@ export class RelayWebSocket implements DurableObject {
       }
     }
 
+    // NIP-50 live matching (same semantics as the SQL path).
+    if (typeof filter.search === 'string' && filter.search.trim() !== '') {
+      let parsed = this.parsedSearchCache.get(filter);
+      if (!parsed) {
+        parsed = parseSearchQuery(filter.search);
+        this.parsedSearchCache.set(filter, parsed);
+      }
+
+      if (event.kind === SIP01_KIND && SIP01_ENABLED) {
+        const fields = extractSip01Fields(event as any);
+        if (!fields) return false;
+        if (!matchSip01Search(parsed, { ...fields, indexer: event.pubkey } as any)) {
+          return false;
+        }
+      } else {
+        // Generic content matching for non-SIP kinds; operators ignored.
+        const content = (event.content || '').toLowerCase();
+        for (const kw of parsed.keywords) {
+          if (!content.includes(kw)) return false;
+        }
+        for (const ph of parsed.phrases) {
+          if (!content.includes(ph.toLowerCase())) return false;
+        }
+      }
+    }
+
     return true;
   }
 
-  // NIP-42: Send AUTH challenge to client
+  // -------------------------------------------------------------------------
+  // Wire senders
+  // -------------------------------------------------------------------------
+
   private sendAuth(ws: WebSocket, challenge: string): void {
     try {
       const authMessage = ['AUTH', challenge];
@@ -1293,7 +1514,6 @@ export class RelayWebSocket implements DurableObject {
     }
   }
 
-  // NIP-42: Generate a cryptographically secure challenge string
   private generateAuthChallenge(): string {
     const array = new Uint8Array(32);
     crypto.getRandomValues(array);
@@ -1342,6 +1562,33 @@ export class RelayWebSocket implements DurableObject {
       ws.send(JSON.stringify(eventMessage));
     } catch (error) {
       console.error('Error sending EVENT:', error);
+    }
+  }
+
+  private sendCount(ws: WebSocket, queryId: string, count: number): void {
+    try {
+      const countMessage = ['COUNT', queryId, { count, approximate: false }];
+      ws.send(JSON.stringify(countMessage));
+    } catch (error) {
+      console.error('Error sending COUNT:', error);
+    }
+  }
+
+  private sendNegMsg(ws: WebSocket, subId: string, hexMessage: string): void {
+    try {
+      ws.send(JSON.stringify(['NEG-MSG', subId, hexMessage]));
+    } catch (error) {
+      console.error('Error sending NEG-MSG:', error);
+    }
+  }
+
+  private sendNegErr(ws: WebSocket, subId: string, reason: string, maxRecords?: string): void {
+    try {
+      const msg: any[] = ['NEG-ERR', subId, reason];
+      if (maxRecords !== undefined) msg.push(maxRecords);
+      ws.send(JSON.stringify(msg));
+    } catch (error) {
+      console.error('Error sending NEG-ERR:', error);
     }
   }
 }

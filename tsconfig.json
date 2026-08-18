@@ -4,7 +4,8 @@
     "module": "ESNext",
     "lib": ["ES2020"],
     "types": ["@cloudflare/workers-types"],
-    "moduleResolution": "node",
+    "moduleResolution": "bundler",
+    "allowJs": true,
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
@@ -13,6 +14,6 @@
     "isolatedModules": true,
     "noEmit": true
   },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "worker.js"]
+  "include": ["src/**/*", "shared/**/*", "worker.ts"],
+  "exclude": ["node_modules", "worker.js", "ui", "tests", "dist"]
 }
