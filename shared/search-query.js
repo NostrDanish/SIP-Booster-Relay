@@ -8,6 +8,17 @@
  * category:, network:, country:, mime:, filetype:, source:, lang:, before:,
  * after:, distinct:domain — each with a negated `-op:` form.
  *
+ * Semantics are aligned with the SIP-01 relay profile (UNCAGED-Index-Relay):
+ *   - repeated operators of the same kind OR together (site:a site:b);
+ *   - `title:`/`inurl:` tokens AND;
+ *   - `url:`/`before:`/`after:` take the first usable token;
+ *   - `before:`/`after:` filter on the page's claimed publication time
+ *     (the `published` tag) — documents without one never match the positive
+ *     form; observation time stays available via the NIP-01 since/until
+ *     filter fields;
+ *   - `language:` is accepted as an alias of `lang:`;
+ *   - unusable operator values add no clause (never an error).
+ *
  * This relay additionally supports the relay-profile operators `indexer:`,
  * `x:` and `d:` (documented in docs/API.md). Unknown operators are ignored
  * per NIP-50, so mixed-reality query fan-out stays safe.
@@ -29,7 +40,7 @@ export const SUPPORTED_NIP50_OPERATORS = /** @type {const} */ ([
 
 /**
  * @typedef {Object} SearchOp
- * @property {string} op       Operator name (lowercased).
+ * @property {string} op       Operator name (lowercased; `language` aliased to `lang`).
  * @property {string} value    Raw operator value.
  * @property {boolean} negated True for the `-op:value` form.
  */
@@ -45,7 +56,7 @@ export const SUPPORTED_NIP50_OPERATORS = /** @type {const} */ ([
  * @property {string} raw         Original query string.
  */
 
-const KNOWN_OPS = new Set(SUPPORTED_NIP50_OPERATORS.filter((op) => op !== 'distinct:domain'));
+const KNOWN_OPS = new Set([...SUPPORTED_NIP50_OPERATORS.filter((op) => op !== 'distinct:domain'), 'language']);
 
 /**
  * Parse a NIP-50 search string. Grammar:
@@ -83,12 +94,12 @@ export function parseSearchQuery(input) {
     const text = token.text;
     if (!text) continue;
 
-    // Operator shape: [-]name:value (value may be "quoted"; `distinct:domain`
-    // tokenizes as op `distinct` + value `domain`).
+    // Operator shape: [-]name:value (`distinct:domain` tokenizes as
+    // op `distinct` + value `domain`).
     const opMatch = /^(-?)([a-zA-Z][a-zA-Z0-9]*(?::[a-zA-Z]+)?):(.+)$/.exec(text);
     if (!token.quoted && opMatch) {
       const negated = opMatch[1] === '-';
-      const op = opMatch[2].toLowerCase();
+      let op = opMatch[2].toLowerCase();
       let value = opMatch[3];
       // Strip surrounding quotes from values like site:"github.com".
       if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
@@ -102,6 +113,8 @@ export function parseSearchQuery(input) {
         }
         continue;
       }
+      // NIP-50's own registered `language:` extension aliases to `lang:`.
+      if (op === 'language') op = 'lang';
       if (KNOWN_OPS.has(op)) {
         out.ops.push({ op, value, negated });
       } else {
@@ -127,19 +140,19 @@ export function parseSearchQuery(input) {
 }
 
 /**
- * Parse a before:/after: value: unix seconds or an ISO date (YYYY-MM-DD,
- * optionally with time). Returns unix seconds or null.
+ * Parse a before:/after: value: unix seconds or an ISO calendar date
+ * (YYYY-MM-DD, UTC midnight). Anything else returns null and adds no clause —
+ * matching the reference relay profile.
  * @param {string} value
  * @returns {number | null}
  */
 export function parseDateValue(value) {
-  const v = value.trim();
+  const v = String(value).trim();
   if (/^\d{1,16}$/.test(v)) return Number.parseInt(v, 10);
-  if (/^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2})?)?$/.test(v)) {
-    const ts = Date.parse(v.includes('T') ? v : v.replace(' ', 'T') + (v.includes(':') ? '' : 'T00:00:00') + 'Z');
-    if (Number.isFinite(ts)) return Math.floor(ts / 1000);
-  }
-  return null;
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(v);
+  if (!m) return null;
+  const ms = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  return Number.isNaN(ms) ? null : Math.floor(ms / 1000);
 }
 
 /** Common filetype → MIME aliases (the `filetype:` operator). */
@@ -168,24 +181,179 @@ export function escapeLike(s) {
   return s.replace(/[\\%_]/g, (c) => '\\' + c);
 }
 
+/* ------------------------------------------------------------------ */
+/* Operator grouping — one shared definition of how ops combine        */
+/* ------------------------------------------------------------------ */
+
+/** Operators that OR across repeated values (`terms` semantics). */
+export const OR_OPERATORS = new Set([
+  'site', 'domain', 'topic', 'type', 'platform', 'category', 'network',
+  'country', 'lang', 'mime', 'filetype', 'source', 'indexer', 'x', 'd',
+]);
+
+/** Text operators that AND across repeated tokens (one clause each). */
+export const AND_TEXT_OPERATORS = new Set(['title', 'inurl']);
+
+/** Operators where only the first usable token applies. */
+export const FIRST_ONLY_OPERATORS = new Set(['url', 'before', 'after']);
+
 /**
- * In-memory match of a parsed query against extracted SIP-01 fields (the
- * exact same semantics as the SQL builder — used for live subscription
- * delivery in the Durable Object and by tests).
+ * @typedef {Object} GroupedOps
+ * @property {{ op: string, values: string[], negated: boolean }[]} orGroups
+ * @property {{ op: 'title'|'inurl', value: string, negated: boolean }[]} andText
+ * @property {SearchOp[]} firstOnly   url:/before:/after: winners (per op+polarity)
+ */
+
+/**
+ * Group parsed operators exactly the way both execution paths (SQL and the
+ * in-memory matcher) combine them. Parity here is the whole point: live
+ * subscription delivery must return the same set the stored query returns.
  *
  * @param {ParsedSearchQuery} parsed
- * @param {import('./sip01.js').Sip01Fields & { indexer?: string, observation_count?: number, indexer_count?: number, last_seen?: number }} fields
+ * @returns {GroupedOps}
+ */
+export function groupSearchOps(parsed) {
+  /** @type {GroupedOps} */
+  const out = { orGroups: [], andText: [], firstOnly: [] };
+
+  /** @type {Map<string, { op: string, values: string[], negated: boolean }>} */
+  const orMap = new Map();
+  /** @type {Set<string>} */
+  const firstSeen = new Set();
+
+  for (const op of parsed.ops) {
+    const key = `${op.negated ? '-' : ''}${op.op}`;
+    if (OR_OPERATORS.has(op.op)) {
+      const group = orMap.get(key) || { op: op.op, values: [], negated: op.negated };
+      group.values.push(op.value);
+      orMap.set(key, group);
+    } else if (AND_TEXT_OPERATORS.has(op.op)) {
+      out.andText.push({ op: /** @type {'title'|'inurl'} */ (op.op), value: op.value, negated: op.negated });
+    } else if (FIRST_ONLY_OPERATORS.has(op.op)) {
+      if (!firstSeen.has(key)) {
+        firstSeen.add(key);
+        out.firstOnly.push(op);
+      }
+    }
+    // anything else was already filtered by the parser
+  }
+
+  out.orGroups = [...orMap.values()];
+  return out;
+}
+
+/* ------------------------------------------------------------------ */
+/* In-memory matcher (live subscription delivery + tests)              */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Evaluate one grouped OR operation against extracted fields.
+ * Returns undefined when no usable value exists (→ adds no clause),
+ * otherwise true/false for "the document matches these values".
+ */
+function matchOrGroup(group, fields) {
+  const host = (fields.url_host || '').toLowerCase();
+  const url = (fields.url || '').toLowerCase();
+  const topics = fields.topics || [];
+  let sawUsable = false;
+  let any = false;
+
+  for (const value of group.values) {
+    let hit;
+    switch (group.op) {
+      case 'site': {
+        const h = searchHostValue(value);
+        if (h === undefined) continue;
+        sawUsable = true;
+        hit = host === h || host.endsWith('.' + h);
+        break;
+      }
+      case 'domain': {
+        const h = searchHostValue(value);
+        if (h === undefined) continue;
+        sawUsable = true;
+        hit = host === h;
+        break;
+      }
+      case 'topic':
+        sawUsable = true;
+        hit = topics.includes(value.toLowerCase());
+        break;
+      case 'type':
+        sawUsable = true;
+        hit = fields.doc_type === value.toLowerCase();
+        break;
+      case 'platform':
+        sawUsable = true;
+        hit = fields.platform === value.toLowerCase();
+        break;
+      case 'category':
+        sawUsable = true;
+        hit = fields.category === value.toLowerCase();
+        break;
+      case 'network':
+        sawUsable = true;
+        hit = fields.network === value.toLowerCase();
+        break;
+      case 'country':
+        sawUsable = true;
+        hit = fields.country === value.toUpperCase();
+        break;
+      case 'lang':
+        sawUsable = true;
+        hit = fields.language === value.toLowerCase();
+        break;
+      case 'mime':
+        sawUsable = true;
+        hit = (fields.content_type || '') === value.toLowerCase();
+        break;
+      case 'filetype': {
+        sawUsable = true;
+        const ft = value.replace(/^\./, '').toLowerCase();
+        const alias = FILETYPE_MIME_MAP[ft];
+        hit = fields.file_ext === ft || (alias !== undefined && fields.content_type === alias);
+        break;
+      }
+      case 'source':
+        sawUsable = true;
+        hit = fields.source === value || fields.software === value;
+        break;
+      case 'indexer':
+        sawUsable = true;
+        hit = fields.indexer === value.toLowerCase();
+        break;
+      case 'x':
+        sawUsable = true;
+        hit = fields.content_hash === value.toLowerCase();
+        break;
+      case 'd':
+        sawUsable = true;
+        hit = fields.d === value;
+        break;
+      default:
+        continue;
+    }
+    if (hit) any = true;
+  }
+
+  return sawUsable ? any : undefined;
+}
+
+/**
+ * In-memory match of a parsed query against extracted SIP-01 fields — the
+ * exact semantics of the SQL path (used for live subscription delivery in
+ * the Durable Object and by tests).
+ *
+ * @param {ParsedSearchQuery} parsed
+ * @param {import('./sip01.js').Sip01Fields & { indexer?: string, last_seen?: number }} fields
  *   Document fields. `indexer` (event pubkey) enables the indexer: operator;
- *   `last_seen`/`observed_at` drive before:/after:.
+ *   `published_at` drives before:/after: (page-claimed publication time).
  * @returns {boolean}
  */
 export function matchSip01Search(parsed, fields) {
   const title = (fields.title || '').toLowerCase();
   const description = (fields.description || '').toLowerCase();
   const url = (fields.url || '').toLowerCase();
-  const host = (fields.url_host || '').toLowerCase();
-  const topics = fields.topics || [];
-  const observed = fields.last_seen ?? fields.observed_at ?? 0;
 
   const textHit = (needleRaw) => {
     const needle = needleRaw.toLowerCase();
@@ -195,86 +363,40 @@ export function matchSip01Search(parsed, fields) {
   for (const kw of parsed.keywords) if (!textHit(kw)) return false;
   for (const ph of parsed.phrases) if (!textHit(ph)) return false;
 
-  for (const { op, value, negated } of parsed.ops) {
-    let hit = false;
-    switch (op) {
-      case 'site': {
-        const h = searchHostValue(value);
-        hit = h !== undefined && (host === h || host.endsWith('.' + h));
-        break;
-      }
-      case 'domain': {
-        const h = searchHostValue(value);
-        hit = h !== undefined && host === h;
-        break;
-      }
-      case 'url': {
-        const n = normalizeIndexUrl(value);
-        hit = n !== null && (fields.url === n || url === value.toLowerCase());
-        break;
-      }
-      case 'inurl':
-        hit = url.includes(value.toLowerCase());
-        break;
-      case 'title':
-        hit = title.includes(value.toLowerCase());
-        break;
-      case 'topic':
-        hit = topics.includes(value.toLowerCase());
-        break;
-      case 'type':
-        hit = fields.doc_type === value.toLowerCase();
-        break;
-      case 'platform':
-        hit = fields.platform === value.toLowerCase();
-        break;
-      case 'category':
-        hit = fields.category === value.toLowerCase();
-        break;
-      case 'network':
-        hit = fields.network === value.toLowerCase();
-        break;
-      case 'country':
-        hit = fields.country === value.toUpperCase();
-        break;
-      case 'lang':
-        hit = fields.language === value.toLowerCase();
-        break;
-      case 'mime':
-        hit = (fields.content_type || '') === value.toLowerCase();
-        break;
-      case 'filetype': {
-        const ft = value.toLowerCase();
-        const mimeAlias = FILETYPE_MIME_MAP[ft];
-        hit = fields.file_ext === ft || (mimeAlias !== undefined && fields.content_type === mimeAlias);
-        break;
-      }
-      case 'source':
-        hit = fields.source === value || fields.software === value;
-        break;
-      case 'indexer':
-        hit = fields.indexer === value.toLowerCase();
-        break;
-      case 'x':
-        hit = fields.content_hash === value.toLowerCase();
-        break;
-      case 'd':
-        hit = fields.d === value;
-        break;
-      case 'before': {
-        const ts = parseDateValue(value);
-        hit = ts !== null && observed > 0 && observed < ts;
-        break;
-      }
-      case 'after': {
-        const ts = parseDateValue(value);
-        hit = ts !== null && observed >= ts;
-        break;
-      }
-      default:
-        hit = true; // unknown ops are ignored per NIP-50
-    }
+  const grouped = groupSearchOps(parsed);
+
+  // OR groups: a group with no usable value adds no clause.
+  for (const group of grouped.orGroups) {
+    const result = matchOrGroup(group, fields);
+    if (result === undefined) continue;
+    if (group.negated ? result : !result) return false;
+  }
+
+  // title:/inurl: AND per token.
+  for (const { op, value, negated } of grouped.andText) {
+    const haystack = op === 'title' ? title : url;
+    const hit = haystack.includes(value.toLowerCase());
     if (negated ? hit : !hit) return false;
+  }
+
+  // First-only operators.
+  for (const { op, value, negated } of grouped.firstOnly) {
+    if (op === 'url') {
+      const n = normalizeIndexUrl(value);
+      // Reference behavior: an unparseable value falls back to the raw string
+      // (which simply matches nothing for the positive form).
+      const hit = n !== null ? fields.url === n : url === value.toLowerCase();
+      if (negated ? hit : !hit) return false;
+    } else {
+      const ts = parseDateValue(value);
+      if (ts === null) continue; // unusable → no clause
+      const published = fields.published_at;
+      // Positive: documents without a published date never match.
+      // Negated:  only documents *with* a matching date are excluded.
+      const hit = published !== undefined && published !== null &&
+        (op === 'before' ? published < ts : published >= ts);
+      if (negated ? hit : !hit) return false;
+    }
   }
 
   return true;
@@ -291,129 +413,187 @@ export function matchSip01Search(parsed, fields) {
  */
 
 /**
- * Build the WHERE conditions over `sip01_documents` (alias `doc`) for a
- * parsed query. Returns conditions + params; the caller assembles the full
- * statement (so it can wrap for distinct:domain, ranking, etc.).
- *
- * `indexer:` and `source:` correlate against the observations table.
+ * SQL WHERE fragments for one OR group over `sip01_documents` (alias `doc`)
+ * and, for event-level operators, the observations join (alias `o`).
+ * Returns null when no usable value exists (→ adds no clause).
+ */
+function sqlForOrGroup(group) {
+  /** @type {string[]} */
+  const clauses = [];
+  /** @type {any[]} */
+  const params = [];
+
+  const usable = [];
+  for (const value of group.values) {
+    if ((group.op === 'site' || group.op === 'domain')) {
+      const h = searchHostValue(value);
+      if (h !== undefined) usable.push(h);
+    } else {
+      usable.push(value);
+    }
+  }
+  if (usable.length === 0) return null;
+
+  const lower = usable.map((v) => v.toLowerCase());
+  const inList = (n) => `(${Array(n).fill('?').join(',')})`;
+
+  switch (group.op) {
+    case 'site': {
+      for (const h of usable) {
+        clauses.push(`(doc.url_host = ? OR doc.url_host LIKE '%.' || ?)`);
+        params.push(h, h);
+      }
+      break;
+    }
+    case 'domain':
+      clauses.push(`doc.url_host IN ${inList(usable.length)}`);
+      params.push(...usable);
+      break;
+    case 'topic':
+      clauses.push(`EXISTS (SELECT 1 FROM json_each(doc.topics) je WHERE je.value IN ${inList(usable.length)})`);
+      params.push(...lower);
+      break;
+    case 'type':
+      clauses.push(`doc.doc_type IN ${inList(usable.length)}`);
+      params.push(...lower);
+      break;
+    case 'platform':
+      clauses.push(`doc.platform IN ${inList(usable.length)}`);
+      params.push(...lower);
+      break;
+    case 'category':
+      clauses.push(`doc.category IN ${inList(usable.length)}`);
+      params.push(...lower);
+      break;
+    case 'network':
+      clauses.push(`doc.network IN ${inList(usable.length)}`);
+      params.push(...lower);
+      break;
+    case 'country':
+      clauses.push(`doc.country IN ${inList(usable.length)}`);
+      params.push(...usable.map((v) => v.toUpperCase()));
+      break;
+    case 'lang':
+      clauses.push(`doc.language IN ${inList(usable.length)}`);
+      params.push(...lower);
+      break;
+    case 'mime':
+      clauses.push(`doc.content_type IN ${inList(usable.length)}`);
+      params.push(...lower);
+      break;
+    case 'filetype': {
+      for (const raw of usable) {
+        const ft = raw.replace(/^\./, '').toLowerCase();
+        const alias = FILETYPE_MIME_MAP[ft];
+        if (alias) {
+          clauses.push(`(doc.file_ext = ? OR doc.content_type = ?)`);
+          params.push(ft, alias);
+        } else {
+          clauses.push(`doc.file_ext = ?`);
+          params.push(ft);
+        }
+      }
+      break;
+    }
+    case 'source':
+      // event-level: this observation's crawler software
+      clauses.push(`o.source IN ${inList(usable.length)}`);
+      params.push(...usable);
+      break;
+    case 'indexer':
+      // event-level: this observation's indexer pubkey
+      clauses.push(`o.pubkey IN ${inList(usable.length)}`);
+      params.push(...lower);
+      break;
+    case 'x':
+      clauses.push(`o.content_hash IN ${inList(usable.length)}`);
+      params.push(...lower);
+      break;
+    case 'd':
+      clauses.push(`doc.d IN ${inList(usable.length)}`);
+      params.push(...usable);
+      break;
+    default:
+      return null;
+  }
+
+  const joined = clauses.length === 1 ? clauses[0] : `(${clauses.join(' OR ')})`;
+  return { sql: group.negated ? `NOT (${joined})` : `(${joined})`, params };
+}
+
+/**
+ * Build the WHERE conditions for a parsed query, split by the relation they
+ * target: `doc.*` (document index, applied in the inner query) and
+ * `o.*`/`e.*` (observation/event level, applied after the join).
  *
  * @param {ParsedSearchQuery} parsed
- * @returns {{ conditions: string[], params: any[] }}
+ * @returns {{ docConditions: string[], docParams: any[], eventConditions: string[], eventParams: any[] }}
  */
 export function buildSip01SearchConditions(parsed) {
   /** @type {string[]} */
-  const conditions = [];
+  const docConditions = [];
   /** @type {any[]} */
-  const params = [];
+  const docParams = [];
+  /** @type {string[]} */
+  const eventConditions = [];
+  /** @type {any[]} */
+  const eventParams = [];
 
   const pushText = (needleRaw, negated) => {
     const needle = `%${escapeLike(needleRaw.toLowerCase())}%`;
     const clause =
       `(lower(doc.title) LIKE ? ESCAPE '\\' OR lower(doc.description) LIKE ? ESCAPE '\\' OR lower(doc.canonical_url) LIKE ? ESCAPE '\\')`;
-    conditions.push(negated ? `NOT ${clause}` : clause);
-    params.push(needle, needle, needle);
+    docConditions.push(negated ? `NOT ${clause}` : clause);
+    docParams.push(needle, needle, needle);
   };
 
   for (const kw of parsed.keywords) pushText(kw, false);
   for (const ph of parsed.phrases) pushText(ph, false);
 
-  for (const { op, value, negated } of parsed.ops) {
-    /** @param {string} clause @param {any[]} values */
-    const push = (clause, values) => {
-      conditions.push(negated ? `NOT (${clause})` : `(${clause})`);
-      params.push(...values);
-    };
+  const grouped = groupSearchOps(parsed);
 
-    switch (op) {
-      case 'site': {
-        const h = searchHostValue(value);
-        if (h) push(`(doc.url_host = ? OR doc.url_host LIKE '%.' || ?)`, [h, h]);
-        break;
-      }
-      case 'domain': {
-        const h = searchHostValue(value);
-        if (h) push(`doc.url_host = ?`, [h]);
-        break;
-      }
-      case 'url': {
-        const n = normalizeIndexUrl(value);
-        push(`doc.canonical_url = ?`, [n ?? value]);
-        break;
-      }
-      case 'inurl':
-        push(`lower(doc.canonical_url) LIKE ? ESCAPE '\\'`, [`%${escapeLike(value.toLowerCase())}%`]);
-        break;
-      case 'title':
-        push(`lower(doc.title) LIKE ? ESCAPE '\\'`, [`%${escapeLike(value.toLowerCase())}%`]);
-        break;
-      case 'topic':
-        push(`EXISTS (SELECT 1 FROM json_each(doc.topics) je WHERE je.value = ?)`, [value.toLowerCase()]);
-        break;
-      case 'type':
-        push(`doc.doc_type = ?`, [value.toLowerCase()]);
-        break;
-      case 'platform':
-        push(`doc.platform = ?`, [value.toLowerCase()]);
-        break;
-      case 'category':
-        push(`doc.category = ?`, [value.toLowerCase()]);
-        break;
-      case 'network':
-        push(`doc.network = ?`, [value.toLowerCase()]);
-        break;
-      case 'country':
-        push(`doc.country = ?`, [value.toUpperCase()]);
-        break;
-      case 'lang':
-        push(`doc.language = ?`, [value.toLowerCase()]);
-        break;
-      case 'mime':
-        push(`doc.content_type = ?`, [value.toLowerCase()]);
-        break;
-      case 'filetype': {
-        const ft = value.toLowerCase();
-        const mimeAlias = FILETYPE_MIME_MAP[ft];
-        if (mimeAlias) {
-          push(`(doc.file_ext = ? OR doc.content_type = ?)`, [ft, mimeAlias]);
-        } else {
-          push(`doc.file_ext = ?`, [ft]);
-        }
-        break;
-      }
-      case 'source':
-        push(
-          `EXISTS (SELECT 1 FROM sip01_observations so WHERE so.d = doc.d AND so.source = ?)`,
-          [value],
-        );
-        break;
-      case 'indexer':
-        push(
-          `EXISTS (SELECT 1 FROM sip01_observations io WHERE io.d = doc.d AND io.pubkey = ?)`,
-          [value.toLowerCase()],
-        );
-        break;
-      case 'x':
-        push(`doc.content_hash = ?`, [value.toLowerCase()]);
-        break;
-      case 'd':
-        push(`doc.d = ?`, [value]);
-        break;
-      case 'before': {
-        const ts = parseDateValue(value);
-        if (ts !== null) push(`doc.last_seen < ?`, [ts]);
-        break;
-      }
-      case 'after': {
-        const ts = parseDateValue(value);
-        if (ts !== null) push(`doc.last_seen >= ?`, [ts]);
-        break;
-      }
-      default:
-        break; // unknown operators ignored per NIP-50
+  for (const group of grouped.orGroups) {
+    const fragment = sqlForOrGroup(group);
+    if (!fragment) continue; // no usable values → no clause
+    // Event-level groups (source:/indexer:/x:) join the outer query.
+    if (group.op === 'source' || group.op === 'indexer' || group.op === 'x') {
+      eventConditions.push(fragment.sql);
+      eventParams.push(...fragment.params);
+    } else {
+      docConditions.push(fragment.sql);
+      docParams.push(...fragment.params);
     }
   }
 
-  return { conditions, params };
+  for (const { op, value, negated } of grouped.andText) {
+    const column = op === 'title' ? 'doc.title' : 'doc.canonical_url';
+    const clause = `lower(${column}) LIKE ? ESCAPE '\\'`;
+    docConditions.push(negated ? `NOT (${clause})` : `(${clause})`);
+    docParams.push(`%${escapeLike(value.toLowerCase())}%`);
+  }
+
+  for (const { op, value, negated } of grouped.firstOnly) {
+    if (op === 'url') {
+      const n = normalizeIndexUrl(value);
+      // Reference behavior: unparseable values fall back to the raw string
+      // (which matches nothing in the positive form).
+      const clause = `doc.canonical_url = ?`;
+      docConditions.push(negated ? `NOT (${clause})` : `(${clause})`);
+      docParams.push(n ?? value);
+    } else {
+      const ts = parseDateValue(value);
+      if (ts === null) continue; // unusable → no clause
+      // before:/after: filter the page's claimed publication time
+      // (`published` tag). Positive: docs without published_at never match
+      // (NULL comparison is not true). Negated: only docs *with* a matching
+      // date are excluded, so NULL rows are kept explicitly.
+      const range = op === 'before' ? `doc.published_at < ?` : `doc.published_at >= ?`;
+      docConditions.push(negated ? `(doc.published_at IS NULL OR NOT (${range}))` : `(${range})`);
+      docParams.push(ts);
+    }
+  }
+
+  return { docConditions, docParams, eventConditions, eventParams };
 }
 
 /**
@@ -441,7 +621,7 @@ export function buildSip01Rank(parsed) {
     params.push(term);
   }
 
-  // Independent indexer agreement: log-ish bounded boost (capped at +8).
+  // Independent indexer agreement: bounded boost (capped at +8).
   parts.push(`(CASE WHEN doc.indexer_count >= 8 THEN 8 ELSE doc.indexer_count END)`);
 
   // Recency tiebreak, small bounded term (newer last_seen → up to +2).
@@ -465,10 +645,10 @@ export function buildSip01Rank(parsed) {
  * @returns {SqlFragment}
  */
 export function buildSip01SearchSql(parsed, limit, extras = {}) {
-  const { conditions, params } = buildSip01SearchConditions(parsed);
+  const { docConditions, docParams, eventConditions, eventParams } = buildSip01SearchConditions(parsed);
   const { rankSql, params: rankParams } = buildSip01Rank(parsed);
 
-  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const where = docConditions.length > 0 ? `WHERE ${docConditions.join(' AND ')}` : '';
 
   const docSelect = `
     SELECT doc.d AS d, doc.last_seen AS last_seen, (${rankSql}) AS rank
@@ -488,23 +668,22 @@ export function buildSip01SearchSql(parsed, limit, extras = {}) {
   `
     : docSelect;
 
-  const extraWhere = extras.extraConditions && extras.extraConditions.length > 0
-    ? `WHERE ${extras.extraConditions.join(' AND ')}`
-    : '';
+  const outerConditions = [...eventConditions, ...(extras.extraConditions ?? [])];
+  const outerWhere = outerConditions.length > 0 ? `WHERE ${outerConditions.join(' AND ')}` : '';
 
   const sql = `
     SELECT e.id, e.pubkey, e.created_at, e.kind, e.tags, e.content, e.sig, r.rank
     FROM (${docSet}) r
     JOIN sip01_observations o ON o.d = r.d
     JOIN events e ON e.id = o.event_id
-    ${extraWhere}
+    ${outerWhere}
     ORDER BY r.rank DESC, e.created_at DESC
     LIMIT ?
   `;
 
   // Parameter order follows textual order in the assembled statement:
-  // rank expression (SELECT), document WHERE, event-level WHERE, LIMIT.
-  const baseParams = [...rankParams, ...params, ...(extras.extraParams ?? []), limit];
+  // rank expression (SELECT list), document WHERE, outer WHERE, LIMIT.
+  const baseParams = [...rankParams, ...docParams, ...eventParams, ...(extras.extraParams ?? []), limit];
 
   return { sql, params: baseParams };
 }

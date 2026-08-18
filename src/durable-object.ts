@@ -858,7 +858,7 @@ export class RelayWebSocket implements DurableObject {
         if (hasPaid !== true) {
           const relayUrl = `https://${session.host}`;
           console.error(`Event denied. Pubkey ${event.pubkey} has not paid for relay access.`);
-          this.sendOK(session.webSocket, event.id, false, `blocked: payment required. Visit ${relayUrl} to pay for relay access.`);
+          this.sendOK(session.webSocket, event.id, false, `blocked: payment required. Visit ${relayUrl} to pay for relay access. If you just paid, retry in ~60 seconds (payment cache).`);
           return;
         }
       }
@@ -977,12 +977,20 @@ export class RelayWebSocket implements DurableObject {
         }
       }
 
+      // Blocked kinds: narrow the filter to what this relay carries instead
+      // of rejecting the whole subscription (a mixed-kinds filter still gets
+      // its SIP-01 results in sip01 mode).
       if (filter.kinds) {
+        const allowedKinds = filter.kinds.filter((kind: number) => isEventKindAllowed(kind));
         const blockedKinds = filter.kinds.filter((kind: number) => !isEventKindAllowed(kind));
-        if (blockedKinds.length > 0) {
+        if (allowedKinds.length === 0) {
           console.error(`Blocked kinds in subscription: ${blockedKinds.join(', ')}`);
-          this.sendClosed(session.webSocket, subscriptionId, `blocked: kinds ${blockedKinds.join(', ')} not allowed`);
+          this.sendClosed(session.webSocket, subscriptionId, `blocked: kinds ${blockedKinds.join(', ')} not carried by this relay`);
           return;
+        }
+        if (blockedKinds.length > 0) {
+          filter.kinds = allowedKinds;
+          this.sendError(session.webSocket, `note: kinds ${blockedKinds.join(', ')} not carried by this relay, filter narrowed`);
         }
       }
 
@@ -1108,6 +1116,10 @@ export class RelayWebSocket implements DurableObject {
         this.sendClosed(session.webSocket, queryId, 'invalid: filter must be an object');
         return;
       }
+      if (filter.search !== undefined) {
+        this.sendClosed(session.webSocket, queryId, 'blocked: COUNT with search is not supported by this relay');
+        return;
+      }
       if (calculateQueryComplexity(filter) > 500) {
         this.sendClosed(session.webSocket, queryId, 'blocked: filter too complex to count');
         return;
@@ -1168,6 +1180,18 @@ export class RelayWebSocket implements DurableObject {
     if (typeof filter !== 'object' || filter === null) {
       this.sendNegErr(session.webSocket, subId, 'invalid: filter must be an object');
       return;
+    }
+
+    // Sync filters are NIP-01 filters. Fields that only make sense for live
+    // queries would silently produce a superset of what the client asked for
+    // — refuse them explicitly instead.
+    const SYNC_FILTER_KEYS = new Set(['ids', 'authors', 'kinds', 'since', 'until', 'limit']);
+    for (const key of Object.keys(filter)) {
+      if (key.startsWith('#')) continue; // single-letter tag filters are fine
+      if (!SYNC_FILTER_KEYS.has(key)) {
+        this.sendNegErr(session.webSocket, subId, `invalid: unsupported filter field '${key}' for sync`);
+        return;
+      }
     }
 
     if (typeof initialMessage !== 'string' || !/^[0-9a-fA-F]*$/.test(initialMessage)) {

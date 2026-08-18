@@ -51,7 +51,11 @@ indexed in the multi-value tag cache.
 
 NIP-50 acceleration with the SIP-01 operator set (§15) plus relay-profile
 operators `indexer:`, `x:`, `d:` — see docs/API.md for the full reference
-and ranking rules.
+and ranking rules. Operator semantics follow the relay profile exactly:
+repeated operators OR, `before:`/`after:` map to the page's claimed
+publication time (`published` tag; observation time stays on `since`/
+`until`), `language:` aliases to `lang:`, and unusable operator values add
+no clause.
 
 NIP-45 `COUNT` for cheap counts (e.g. observations per `#d`).
 

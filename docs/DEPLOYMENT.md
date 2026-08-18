@@ -75,8 +75,10 @@ Optional but recommended:
 - **D1 read replication**: D1 → your database → Settings → enable read
   replication (the relay uses the D1 Session API; this lowers global read
   latency).
-- **CPU time limit**: Settings → CPU time limit → 30000 ms minimum for busy
-  relays (the shipped wrangler.toml requests this).
+- **CPU time limit (paid plan only)**: Settings → CPU time limit → raise, and
+  add `[limits] cpu_ms = 300000` to wrangler.toml. Do NOT commit a `[limits]`
+  block for free-plan deploys — the Cloudflare API rejects it (error 100328)
+  and the deployment fails.
 
 ## C. Shakespeare (cloud IDE)
 

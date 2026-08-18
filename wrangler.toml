@@ -30,9 +30,11 @@ database_id = "REPLACE_WITH_YOUR_D1_DATABASE_ID"
 [triggers]
 crons = ["0 0 * * *"]
 
-# CPU limits (lower to 10 if not on the paid Workers plan)
-[limits]
-cpu_ms = 300000
+# CPU limits: DO NOT ship a [limits] block for free-plan deploys — the
+# Cloudflare API rejects it outright ("CPU limits are not supported for the
+# Free plan", error 100328). On the paid plan you may opt into:
+# [limits]
+# cpu_ms = 300000
 
 # Enable logs (off by default, but can enable)
 [observability.logs]

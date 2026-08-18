@@ -66,10 +66,19 @@ page for D1 incidents.
 
 ## Payment not recognized after zapping
 
-The relay records payment from the **zap receipt** (kind 9735) — a zap from a
-wallet that doesn't produce receipts (or to the wrong npub) cannot be
-verified. Check the operator npub in `/api/relay-info`, and that the receipt
-reached the relay (`POST /?notify-zap`). Donation mode never gates access.
+The relay records payment from the **zap receipt** (kind 9735), submitted by
+the paying client to `POST /?notify-zap` as `{ "event": {…} }` and verified
+cryptographically (see docs/SECURITY.md). The operator UI does this
+automatically after a successful zap. If it didn't:
+
+- the receipt may not have propagated to public relays yet — wait ~30 s and
+  retry the page;
+- the wallet/LNURL path may not have produced a receipt at all — check the
+  operator npub in `/api/relay-info` matches what you zapped;
+- a just-paid publisher may hit the relay's 60-second negative payment
+  cache — retry after a minute.
+
+Donation mode never gates access.
 
 ## The landing page is minimal (no dashboard)
 

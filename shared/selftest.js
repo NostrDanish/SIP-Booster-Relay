@@ -242,10 +242,11 @@ export async function runAllTests(log = () => {}) {
     eq(JSON.stringify(p.ignored), '["sentiment:positive"]', 'ignored list');
   });
 
-  await test('nip50: date values (unix + ISO)', async () => {
+  await test('nip50: date values (unix + ISO calendar only)', async () => {
     eq(parseDateValue('1786200000'), 1786200000, 'unix');
     eq(parseDateValue('2026-01-01'), 1767225600, 'ISO date');
     eq(parseDateValue('banana'), null, 'garbage');
+    eq(parseDateValue('2026-01-01 12:00'), null, 'datetime forms rejected (reference parity)');
   });
 
   await test('nip50: matchSip01Search in-memory semantics', async () => {
@@ -253,7 +254,7 @@ export async function runAllTests(log = () => {}) {
       d: 'widx:abc', url: 'https://github.com/nostr-protocol/nips', url_host: 'github.com',
       title: 'Nostr NIPs', description: 'Protocol specs', topics: ['nostr', 'protocol'],
       language: 'en', content_type: 'text/html', doc_type: 'repository', platform: 'github',
-      observed_at: 1786200000, indexer: 'ab'.repeat(32),
+      observed_at: 1786200000, published_at: 1786100000, indexer: 'ab'.repeat(32),
     };
     assert(matchSip01Search(parseSearchQuery('nostr site:github.com'), fields), 'site match');
     assert(matchSip01Search(parseSearchQuery('nostr site:nostr-protocol.github.io'), fields) === false, 'subdomain mismatch');
@@ -262,8 +263,72 @@ export async function runAllTests(log = () => {}) {
     assert(matchSip01Search(parseSearchQuery('nostr lang:de'), fields) === false, 'lang mismatch');
     assert(matchSip01Search(parseSearchQuery(`indexer:${'ab'.repeat(32)}`), fields), 'indexer match');
     assert(matchSip01Search(parseSearchQuery('type:repository'), fields), 'type match');
-    assert(matchSip01Search(parseSearchQuery('before:2026-01-01'), fields) === false, 'before boundary');
-    assert(matchSip01Search(parseSearchQuery('after:2026-01-01'), fields), 'after match');
+  });
+
+  await test('nip50: before:/after: use published_at (page claim), not observation time', async () => {
+    const withPublished = {
+      title: 'A page', url: 'https://example.com/a', url_host: 'example.com',
+      topics: [], observed_at: 1786200000, published_at: 1768000000, // page claims Jan 2026; observed Aug 2026
+    };
+    const noPublished = {
+      title: 'A page', url: 'https://example.com/b', url_host: 'example.com',
+      topics: [], observed_at: 1786200000,
+    };
+    // Positive forms filter on published_at…
+    assert(matchSip01Search(parseSearchQuery('after:2026-01-01'), withPublished), 'after: matches published');
+    assert(matchSip01Search(parseSearchQuery('before:2026-01-01'), withPublished) === false, 'before: excludes newer published');
+    // …documents without published never match the positive form…
+    assert(matchSip01Search(parseSearchQuery('after:2026-01-01'), noPublished) === false, 'no published → no positive after match');
+    assert(matchSip01Search(parseSearchQuery('before:2026-01-01'), noPublished) === false, 'no published → no positive before match');
+    // …but the negated form only excludes documents that HAVE a matching date.
+    assert(matchSip01Search(parseSearchQuery('-before:2026-01-01'), noPublished), 'negated before keeps undocumented dates');
+    assert(matchSip01Search(parseSearchQuery('-after:2026-01-01'), withPublished) === false, 'negated after excludes published match');
+    // Unusable values add no clause (reference parity).
+    assert(matchSip01Search(parseSearchQuery('page before:banana'), withPublished), 'unusable before ignored');
+    // Observation time stays with since/until, NOT before:/after:.
+    assert(matchSip01Search(parseSearchQuery('before:2027-01-01'), withPublished), 'before far future keeps doc');
+  });
+
+  await test('nip50: repeated operators OR together (reference parity)', async () => {
+    const fields = {
+      d: 'widx:abc', url: 'https://docs.example.com/x', url_host: 'docs.example.com',
+      title: 'Guide', description: '', topics: ['nostr'], language: 'en',
+      doc_type: 'page', observed_at: 1786200000,
+    };
+    assert(matchSip01Search(parseSearchQuery('site:github.com site:example.com'), fields), 'site OR');
+    assert(matchSip01Search(parseSearchQuery('site:github.com site:example.org'), fields) === false, 'site OR neither');
+    assert(matchSip01Search(parseSearchQuery('lang:de lang:en'), fields), 'lang OR');
+    assert(matchSip01Search(parseSearchQuery('type:article type:page'), fields), 'type OR');
+    // title: ANDs across tokens instead
+    const titled = { title: 'Nostr Protocol Guide', url: 'https://x.io/p', url_host: 'x.io', topics: [] };
+    assert(matchSip01Search(parseSearchQuery('title:nostr title:protocol'), titled), 'title AND both');
+    assert(matchSip01Search(parseSearchQuery('title:nostr title:missing'), titled) === false, 'title AND missing one');
+  });
+
+  await test('nip50: language: aliases to lang:', async () => {
+    const p = parseSearchQuery('nostr language:en');
+    const lang = p.ops.find((o) => o.op === 'lang');
+    assert(lang && lang.value === 'en', 'language: normalized to lang:');
+    const fields = { title: 'nostr', url: 'https://x.io', url_host: 'x.io', topics: [], language: 'en' };
+    assert(matchSip01Search(p, fields), 'language: matches');
+  });
+
+  await test('nip50: unusable operator values add no clause (matcher/SQL parity)', async () => {
+    const fields = { title: 'nostr guide', url: 'https://x.io/a', url_host: 'x.io', topics: [] };
+    // site:"" (empty value) → unusable → ignored entirely by both paths
+    assert(
+      matchSip01Search(parseSearchQuery('nostr site:""'), fields) ===
+        matchSip01Search(parseSearchQuery('nostr'), fields),
+      'matcher ignores unusable site:',
+    );
+    const withBad = buildSip01SearchSql(parseSearchQuery('nostr site:""'), 10);
+    const withoutBad = buildSip01SearchSql(parseSearchQuery('nostr'), 10);
+    eq(
+      withBad.sql.replace(/\s+/g, ' ').includes('url_host'),
+      false,
+      'SQL path adds no url_host clause for unusable site:',
+    );
+    assert(withoutBad.sql.length > 0, 'baseline SQL built');
   });
 
   await test('nip50: buildSip01SearchSql assembles sane SQL', async () => {

@@ -7,6 +7,8 @@
 
 import { relayBannerHtml, bindRelayBanner, pageHeader } from '../app.js';
 import { escapeHtml, toast, getRelayWsUrl } from '../api.js';
+import { reqEvents } from '../ws.js';
+import { npubToHex } from '../../shared/bech32.js';
 
 export async function renderHome(root, ctx) {
   const info = ctx.localRelay;
@@ -174,9 +176,14 @@ function renderPayment(info) {
 }
 
 /**
- * Zap flow (pay-to-relay / donation): the nostr-zap library opens the zap
- * dialog; after the zap lands, the zap receipt (kind 9735) is submitted to
- * the relay, which verifies it cryptographically (see src/pay.ts).
+ * Zap flow (pay-to-relay / donation):
+ *
+ *  1. nostr-zap.js runs the zap dialog; the wallet pays; the operator's
+ *     LNURL server publishes a kind 9735 zap receipt to public relays.
+ *  2. We fetch the receipt (9735, `#P` = payer, `p` = operator) from those
+ *     relays and submit it to the relay (`POST /?notify-zap`), which
+ *     verifies it cryptographically (src/pay.ts) before granting access.
+ *  3. We poll /api/check-payment until the relay confirms.
  */
 function initPayment(info) {
   const statusEl = document.getElementById('pay-status');
@@ -205,24 +212,91 @@ function initPayment(info) {
   })();
 
   window.addEventListener('payment-success', async () => {
-    if (statusEl) statusEl.textContent = 'payment sent — verifying…';
-    // The zap receipt is fetched from relays by the caller's client in a full
-    // deployment; here we poll the relay's payment status endpoint.
-    if (!window.nostr || !window.nostr.getPublicKey) return;
-    const pubkey = await window.nostr.getPublicKey();
+    if (statusEl) statusEl.textContent = 'payment sent — locating zap receipt…';
+    if (!window.nostr || !window.nostr.getPublicKey) {
+      if (statusEl) statusEl.textContent = 'paid — no Nostr signer available to claim access; contact the operator';
+      return;
+    }
+
+    const payer = await window.nostr.getPublicKey();
+    const operatorHex = npubToHex(info.payment_npub || '');
+
+    // Relays the zap request was published to (and where the LNURL server's
+    // receipt typically lands first). Matches the pay button's data-relays.
+    const receiptRelays = ['wss://relay.damus.io', 'wss://relay.primal.net', 'wss://sendit.nosflare.com'];
+    const since = Math.floor(Date.now() / 1000) - 3600;
+
+    let submitted = false;
     const started = Date.now();
+
+    while (!submitted && Date.now() - started < 90000) {
+      for (const relay of receiptRelays) {
+        try {
+          // Preferred: receipts addressed TO the payer (`P` tag = sender per
+          // NIP-57: `p` = recipient, `P` = sender/pubkey that zapped).
+          let { events } = await reqEvents(relay, [
+            { kinds: [9735], '#P': [payer], since, limit: 10 },
+          ], { timeoutMs: 6000 });
+
+          // Fallback: receipts ABOUT the operator, filtered client-side.
+          if (events.length === 0 && operatorHex) {
+            const fallback = await reqEvents(relay, [
+              { kinds: [9735], '#p': [operatorHex], since, limit: 25 },
+            ], { timeoutMs: 6000 });
+            events = fallback.events.filter((ev) =>
+              ev.tags.some((t) => t[0] === 'P' && t[1] === payer));
+          }
+
+          // Newest plausible receipt for this payment.
+          const receipt = events
+            .filter((ev) =>
+              ev.kind === 9735 &&
+              (!operatorHex || ev.tags.some((t) => t[0] === 'p' && t[1] === operatorHex)) &&
+              ev.tags.some((t) => t[0] === 'P' && t[1] === payer) &&
+              ev.tags.some((t) => t[0] === 'bolt11'))
+            .sort((a, b) => b.created_at - a.created_at)[0];
+
+          if (receipt) {
+            const res = await fetch('./?notify-zap', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ event: receipt }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (res.ok && data.success) {
+              submitted = true;
+              if (statusEl) statusEl.textContent = 'receipt verified — access granted ✓';
+              break;
+            } else {
+              console.warn('[pay] receipt rejected:', data.error || res.status);
+            }
+          }
+        } catch (error) {
+          console.warn(`[pay] receipt fetch from ${relay} failed:`, error);
+        }
+      }
+      if (!submitted) {
+        if (statusEl) statusEl.textContent = 'waiting for the zap receipt to propagate…';
+        await new Promise((r) => setTimeout(r, 5000));
+      }
+    }
+
+    // Final confirmation loop against the relay itself.
+    const pollStart = Date.now();
     const poll = setInterval(async () => {
       try {
-        const res = await fetch(`./api/check-payment?pubkey=${pubkey}`);
+        const res = await fetch(`./api/check-payment?pubkey=${payer}`);
         const data = await res.json();
         if (data.paid) {
           clearInterval(poll);
           if (statusEl) statusEl.textContent = 'access granted ✓';
-        } else if (Date.now() - started > 60000) {
+        } else if (Date.now() - pollStart > 120000) {
           clearInterval(poll);
-          if (statusEl) statusEl.textContent = 'still waiting for confirmation…';
+          if (statusEl && !submitted) {
+            statusEl.textContent = 'payment sent — receipt not found on public relays yet; contact the operator with your zap proof';
+          }
         }
       } catch { /* keep polling */ }
-    }, 3000);
+    }, 4000);
   });
 }

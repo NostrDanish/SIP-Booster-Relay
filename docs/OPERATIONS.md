@@ -60,9 +60,10 @@ The cron also runs `PRAGMA optimize` + `ANALYZE` for the query planner.
 
 ## Tuning
 
-- Free Workers plan: lower `cpu_ms` to 10000 in wrangler.toml and keep
-  `NEG_MAX_ITEMS` modest.
-- Busy public relays: paid plan + 30000 ms CPU + D1 read replication ON.
+- Free Workers plan: ship **no** `[limits]` block (the Cloudflare API rejects
+  `cpu_ms` on free plans, error 100328) and keep `NEG_MAX_ITEMS` modest.
+- Busy public relays: paid plan + `[limits] cpu_ms = 300000` + D1 read
+  replication ON.
 - Crawler-heavy relays: raise `SIP01_INDEXER_RATE_LIMIT` if legitimate
   crawlers report `rate-limited:` OKs; lower it if abused.
 

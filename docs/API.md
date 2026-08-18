@@ -50,12 +50,18 @@ signal.
 | `mime:` | exact MIME | `mime:application/pdf` |
 | `filetype:` | file extension (with common MIME aliases) | `filetype:pdf` |
 | `source:` | crawler software (`source` tag) | `source:crawlstr/1` |
-| `lang:` | `l` tag | `lang:en` |
-| `before:` / `after:` | latest-observation time; unix or `YYYY-MM-DD` | `after:2026-01-01` |
+| `lang:` | `l` tag (`language:` accepted as an alias) | `lang:en` |
+| `before:` / `after:` | the page's **claimed publication time** (`published` tag; unix or `YYYY-MM-DD`). Documents without one never match the positive form. Observation time uses the native `since`/`until` filter fields | `after:2026-01-01` |
 | `indexer:` *(profile)* | observed by pubkey | `indexer:<hex>` |
 | `x:` / `d:` *(profile)* | exact content hash / document id | `d:widx:…` |
 | `distinct:domain` | one best-ranked document per host | `nostr distinct:domain` |
 | `-op:` | negation | `-site:x.com` |
+
+Combining rules (aligned with the SIP-01 relay profile): repeated
+`site:`/`domain:`/`topic:`/`type:`/`platform:`/`category:`/`network:`/
+`country:`/`lang:`/`mime:`/`filetype:`/`source:`/`indexer:`/`x:`/`d:` tokens
+**OR** together; `title:`/`inurl:` tokens **AND**; `url:`/`before:`/`after:`
+take the first usable token; unusable operator values add no clause.
 
 Plain words and `"quoted phrases"` match title/description/URL
 (case-insensitive, AND semantics). Unknown operators are ignored (NIP-50).
@@ -70,6 +76,10 @@ ranking.
 ["COUNT", "c1", { "kinds": [39697], "#d": ["widx:3641c5f2274c5471278ab5bf1df6d185"] }]
 // → ["COUNT", "c1", { "count": 3, "approximate": false }]
 ```
+
+Multiple filters are OR'd into one deduplicated count (an event matching
+several filters is counted once). `COUNT` with a `search` field is refused
+with `CLOSED` — count structured filters, search with NIP-50.
 
 ### NIP-77 sync
 
@@ -100,7 +110,7 @@ All endpoints return JSON with CORS enabled.
 | `GET /api/observations?limit=&offset=&pubkey=&d=` | Recent observation events |
 | `GET /api/search?q=…&limit=` | HTTP mirror of NIP-50 (dashboard convenience) |
 | `GET /api/check-payment?pubkey=<hex>` | Payment status (pay-to-relay mode) |
-| `POST /?notify-zap` | Submit kind 9735 zap receipt → grants access |
+| `POST /?notify-zap` | Submit the kind 9735 zap receipt as JSON `{ "event": {…} }` → verified, then grants access (see docs/SECURITY.md) |
 
 ## Client examples
 

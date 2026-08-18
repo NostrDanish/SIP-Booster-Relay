@@ -56,7 +56,6 @@ const {
   NIP45_ENABLED,
   NIP77_ENABLED,
   NEG_MAX_ITEMS,
-  COUNT_MAX_ESTIMATE,
   DB_PRUNING_ENABLED,
   DB_SIZE_THRESHOLD_GB,
   DB_PRUNE_BATCH_SIZE,
@@ -890,8 +889,12 @@ const EVENT_COLS_BARE = 'id, pubkey, created_at, kind, tags, content, sig';
 
 const CACHED_TAG_SET = new Set<string>(CACHED_TAG_NAMES as readonly string[]);
 
-// Build COUNT query for precheck + NIP-45
-function buildCountQuery(filter: NostrFilter): { sql: string; params: any[] } {
+/**
+ * Build a `SELECT DISTINCT id` statement for one filter. Shared by
+ * {@link buildCountQuery} (single-filter counts) and {@link countEvents}
+ * (NIP-45 multi-filter OR via UNION), so both shapes always agree.
+ */
+function buildIdSelect(filter: NostrFilter): { sql: string; params: any[] } {
   const params: any[] = [];
   const conditions: string[] = [];
 
@@ -910,15 +913,13 @@ function buildCountQuery(filter: NostrFilter): { sql: string; params: any[] } {
   }
 
   if (directTags.length > 0 && otherTags.length === 0) {
-    const cacheAlias = directTags.length === 1 ? "m" : "m0";
-
     if (directTags.length === 1) {
       const tagFilter = directTags[0];
       const hasKinds = filter.kinds && filter.kinds.length > 0;
       const indexHint = hasKinds && filter.kinds!.length <= 10
         ? " INDEXED BY idx_cache_multi_kind_type_value"
         : " INDEXED BY idx_cache_multi_type_value_time";
-      let sql = `SELECT COUNT(DISTINCT m.event_id) as count FROM event_tags_cache_multi m${indexHint}
+      let sql = `SELECT DISTINCT m.event_id AS id FROM event_tags_cache_multi m${indexHint}
         WHERE m.tag_type = ? AND m.tag_value IN (${tagFilter.values.map(() => '?').join(',')})`;
       params.push(tagFilter.name, ...tagFilter.values);
 
@@ -952,7 +953,7 @@ function buildCountQuery(filter: NostrFilter): { sql: string; params: any[] } {
         return `INNER JOIN event_tags_cache_multi ${alias} ON m0.event_id = ${alias}.event_id AND ${alias}.tag_type = ? AND ${alias}.tag_value IN (${placeholders})`;
       }).join('\n        ');
 
-      let sql = `SELECT COUNT(DISTINCT m0.event_id) as count FROM event_tags_cache_multi m0${firstHint}
+      let sql = `SELECT DISTINCT m0.event_id AS id FROM event_tags_cache_multi m0${firstHint}
         ${additionalJoins}
         WHERE m0.tag_type = ? AND m0.tag_value IN (${firstTag.values.map(() => '?').join(',')})`;
 
@@ -987,7 +988,7 @@ function buildCountQuery(filter: NostrFilter): { sql: string; params: any[] } {
 
     if (allTags.length === 1) {
       const tagFilter = allTags[0];
-      let sql = `SELECT COUNT(DISTINCT e.id) as count FROM events e
+      let sql = `SELECT DISTINCT e.id FROM events e
         INNER JOIN tags t ON e.id = t.event_id
         WHERE t.tag_name = ? AND t.tag_value IN (${tagFilter.values.map(() => '?').join(',')})`;
       params.push(tagFilter.name, ...tagFilter.values);
@@ -1019,7 +1020,7 @@ function buildCountQuery(filter: NostrFilter): { sql: string; params: any[] } {
         params.push(tagFilter.name, ...tagFilter.values);
       }
 
-      let sql = `SELECT COUNT(DISTINCT e.id) as count FROM events e
+      let sql = `SELECT e.id FROM events e
         INNER JOIN tags t ON e.id = t.event_id
         WHERE ${tagConditions}`;
 
@@ -1043,13 +1044,12 @@ function buildCountQuery(filter: NostrFilter): { sql: string; params: any[] } {
       sql += ` GROUP BY e.id HAVING COUNT(DISTINCT t.tag_name) = ?`;
       params.push(allTags.length);
 
-      sql = `SELECT COUNT(*) as count FROM (${sql})`;
       return { sql, params };
     }
   }
 
   // No tag filters
-  let sql = "SELECT COUNT(*) as count FROM events";
+  let sql = "SELECT id FROM events";
 
   if (filter.ids && filter.ids.length > 0) {
     conditions.push(`id IN (${filter.ids.map(() => '?').join(',')})`);
@@ -1077,6 +1077,12 @@ function buildCountQuery(filter: NostrFilter): { sql: string; params: any[] } {
   }
 
   return { sql, params };
+}
+
+// Build COUNT query for the query precheck + single-filter counts
+function buildCountQuery(filter: NostrFilter): { sql: string; params: any[] } {
+  const { sql, params } = buildIdSelect(filter);
+  return { sql: `SELECT COUNT(*) as count FROM (${sql})`, params };
 }
 
 // Query builder
@@ -1654,10 +1660,17 @@ async function queryEvents(filters: NostrFilter[], bookmark: string, env: Env): 
 // NIP-45 COUNT
 // ---------------------------------------------------------------------------
 
+/**
+ * NIP-45 COUNT: multiple filters are OR'd together and aggregated into a
+ * single count. Implemented as a UNION of per-filter id selects (UNION
+ * dedupes), so events matching several filters are counted exactly once.
+ */
 async function countEvents(filters: NostrFilter[], bookmark: string, env: Env): Promise<number> {
   await ensureDatabase(env.RELAY_DATABASE);
   const session = env.RELAY_DATABASE.withSession(bookmark);
-  let total = 0;
+
+  const selects: string[] = [];
+  const params: any[] = [];
 
   for (const filter of filters) {
     const complexity = calculateQueryComplexity(filter);
@@ -1665,20 +1678,24 @@ async function countEvents(filters: NostrFilter[], bookmark: string, env: Env): 
       console.warn(`COUNT filter too complex (${complexity}), skipping`);
       continue;
     }
-    const { sql, params } = buildCountQuery(filter);
-    try {
-      const result = await session.prepare(sql).bind(...params).first() as { count: number } | null;
-      total += (result?.count as number) || 0;
-      if (total > COUNT_MAX_ESTIMATE * 10) {
-        // Guard against unbounded aggregate scans.
-        break;
-      }
-    } catch (error) {
-      console.error('COUNT query failed:', error);
-    }
+    const { sql, params: p } = buildIdSelect(filter);
+    selects.push(sql);
+    params.push(...p);
   }
 
-  return total;
+  if (selects.length === 0) return 0;
+
+  const sql = selects.length === 1
+    ? `SELECT COUNT(*) as count FROM (${selects[0]})`
+    : `SELECT COUNT(*) as count FROM (${selects.join(' UNION ')})`;
+
+  try {
+    const result = await session.prepare(sql).bind(...params).first() as { count: number } | null;
+    return (result?.count as number) || 0;
+  } catch (error) {
+    console.error('COUNT query failed:', error);
+    return 0;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1728,18 +1745,31 @@ async function querySyncItems(filter: NostrFilter, env: Env): Promise<{ items: A
     }
   }
 
+  // `limit` narrows the sync window to the most recent N events (the
+  // protocol requires ascending (created_at, id) order for the sync set
+  // itself, so we window first, then re-sort).
+  const windowLimit = typeof filter.limit === 'number' && filter.limit > 0
+    ? Math.min(filter.limit, NEG_MAX_ITEMS)
+    : undefined;
+
   const sql = `
     SELECT id, created_at FROM events
     ${conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''}
-    ORDER BY created_at ASC, id ASC
+    ORDER BY created_at ${windowLimit ? 'DESC' : 'ASC'}, id ${windowLimit ? 'DESC' : 'ASC'}
     LIMIT ?
   `;
-  params.push(NEG_MAX_ITEMS + 1);
+  params.push((windowLimit ?? NEG_MAX_ITEMS) + 1);
 
   const result = await session.prepare(sql).bind(...params).all();
-  const rows = (result.results ?? []) as Array<{ id: string; created_at: number }>;
-  const truncated = rows.length > NEG_MAX_ITEMS;
-  return { items: rows.slice(0, NEG_MAX_ITEMS), truncated };
+  let rows = (result.results ?? []) as Array<{ id: string; created_at: number }>;
+  // Hitting a client-requested `limit` is by design, not a refusal condition.
+  const truncated = windowLimit ? false : rows.length > NEG_MAX_ITEMS;
+  rows = rows.slice(0, windowLimit ?? NEG_MAX_ITEMS);
+  if (windowLimit) {
+    // Restore protocol order after the recency window.
+    rows = rows.sort((a, b) => a.created_at - b.created_at || a.id.localeCompare(b.id));
+  }
+  return { items: rows, truncated };
 }
 
 // ---------------------------------------------------------------------------

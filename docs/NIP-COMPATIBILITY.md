@@ -12,8 +12,8 @@ conformance suite or by design review against the NIP text; advertised in
 | 11 | Relay information | ✅ | CORS-enabled; computed `supported_nips`; `limitation`; `fees`/`payments_url` when payment on; `uncaged_index` custom block |
 | 16/33 | (folded into NIP-01) | ✅ | Ephemeral kinds 20000–29999 broadcast-not-stored; addressable kinds 30000–39999 one-live-slot per (kind, pubkey, d) |
 | 42 | Authentication | ✅ | Challenge/AUTH round-trip, hibernation-safe, `auth-required:`/`restricted:` OK prefixes; optional (`AUTH_REQUIRED`) |
-| 45 | COUNT | ✅ | `["COUNT", id, {count, approximate:false}]`, complexity-guarded, `CLOSED` on refusal |
-| 50 | Search | ✅ | `search` field; SIP-01 operators for kind 39697 (ranked), content substring matching for other kinds; unknown extensions ignored |
+| 45 | COUNT | ✅ | `["COUNT", id, {count, approximate:false}]`; multiple filters OR'd with dedup (UNION); complexity-guarded; `search` refused with `CLOSED` |
+| 50 | Search | ✅ | `search` field; SIP-01 operators for kind 39697 (ranked) with relay-profile semantics (`before:`/`after:` → `published`; repeated ops OR; `language:` alias for `lang:`); content substring matching for other kinds; unknown extensions ignored |
 | 77 | Negentropy sync | ✅ | NEG-OPEN/NEG-MSG/NEG-CLOSE/NEG-ERR; Negentropy V1 (version byte 0x61), frame-size-limited splitting, per-session item cap |
 | 57 | Zaps | partial | kind 9735 receipts verified for the optional pay-to-relay policy (not a zap service) |
 
