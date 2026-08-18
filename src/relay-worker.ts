@@ -23,7 +23,7 @@ import { schnorr } from "@noble/curves/secp256k1.js";
 import { Env, NostrEvent, NostrFilter, QueryResult, Nip05Response } from './types';
 import * as config from './config';
 import { RelayWebSocket } from './durable-object';
-import { SIP01_KIND, validateSip01Event, extractSip01Fields } from '../shared/sip01.js';
+import { SIP01_KIND, validateSip01Event } from '../shared/sip01.js';
 import { SUPPORTED_NIP50_OPERATORS } from '../shared/search-query.js';
 import { SIP01_SCHEMA_STATEMENTS, SCHEMA_VERSION, migrationV7Statements, CACHED_TAG_NAMES } from './sip01/schema';
 import { ingestSip01Observation, removeSip01Observations, bumpMetric } from './sip01/ingest';
