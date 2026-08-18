@@ -11,11 +11,31 @@ Prerequisites:
   replication)
 - Node.js ≥ 20 and npm (for the wrangler CLI)
 
-There are four supported deployment paths. Path A is recommended.
+There are four supported deployment paths. Path A is recommended (zero
+tooling, ~5 minutes). The relay's own **`/deploy`** page is a guided portal
+through all four, including a configuration generator and post-deploy
+verification.
 
 ---
 
-## A. wrangler CLI (recommended)
+## A. Deploy to Cloudflare (one click)
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/NostrDanish/SIP-Booster-Relay)
+
+What happens when you click:
+
+1. Cloudflare clones this repository into **your** GitHub/GitLab account.
+2. It reads `wrangler.toml`, **auto-provisions** the D1 database and the
+   Durable Object, and writes the real database id into your copy.
+3. Workers Builds builds and deploys the Worker; every later push to your
+   repo redeploys automatically.
+
+After it finishes: edit `src/config.ts` in your cloned repo (relay name,
+payment, policies — the `/deploy` page generates the block for you), push,
+and the relay redeploys. The database schema self-initializes on first
+request — no migration step.
+
+## B. wrangler CLI (recommended for developers)
 
 ```bash
 # 1. Get the code
@@ -26,16 +46,20 @@ npm install
 # 2. Configure — edit src/config.ts (see docs/CONFIGURATION.md)
 $EDITOR src/config.ts
 
-# 3. Authenticate and create the database
+# 3. Authenticate and deploy — wrangler ≥ 4.45 auto-provisions the D1
+#    database and Durable Object on first deploy
 npx wrangler login
-npx wrangler d1 create sip01-relay
-# → copy the printed database_id
-
-# 4. Paste the database_id into wrangler.toml ([[d1_databases]])
-
-# 5. Deploy (wrangler bundles src/index.ts + assets automatically)
 npx wrangler deploy
 ```
+
+<details><summary>Older wrangler (< 4.45): create the database manually</summary>
+
+```bash
+npx wrangler d1 create sip01-relay
+# → paste the printed database_id into wrangler.toml ([[d1_databases]])
+npx wrangler deploy
+```
+</details>
 
 Verify:
 
@@ -54,7 +78,7 @@ Optional but recommended:
 - **CPU time limit**: Settings → CPU time limit → 30000 ms minimum for busy
   relays (the shipped wrangler.toml requests this).
 
-## B. Shakespeare (cloud IDE one-click)
+## C. Shakespeare (cloud IDE)
 
 1. Open the repo in Shakespeare:
    [![Edit with Shakespeare](https://shakespeare.diy/badge.svg)](https://shakespeare.diy/clone?url=https%3A%2F%2Fgithub.com%2FNostrDanish%2FSIP-Booster-Relay.git)
@@ -64,7 +88,7 @@ Optional but recommended:
 4. Deploy from Shakespeare's deploy dialog (Cloudflare provider). The root
    `worker.ts` + static assets are bundled for you.
 
-## C. Cloudflare dashboard (no CLI)
+## D. Cloudflare dashboard (no CLI)
 
 1. Create a D1 database: Storage & Databases → D1 → Create (note the UUID;
    enable read replication).
@@ -81,7 +105,7 @@ Optional but recommended:
 5. Paste `worker.js` into the Worker's code editor → Deploy.
 6. For the full dashboard UI, prefer paths A/B/D (assets binding).
 
-## D. Git-connected deploy (auto-updates)
+## E. Git-connected deploy (auto-updates)
 
 1. Fork the repository on GitHub.
 2. Cloudflare dashboard → Workers → Create → *Import a repository* → pick

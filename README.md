@@ -37,22 +37,18 @@ This is a **fork of [Nosflare](https://github.com/Spl0itable/nosflare) (MIT)** t
 
 ## Quickstart (operator)
 
-Prerequisites: a [Cloudflare](https://www.cloudflare.com/) account, Node.js ≥ 20.
+**One click** — Cloudflare clones the repo into your GitHub account, auto-provisions the D1 database + Durable Objects, builds, and deploys:
+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/NostrDanish/SIP-Booster-Relay)
+
+Or with the wrangler CLI (Node.js ≥ 20, wrangler ≥ 4.45 auto-provisions D1 on first deploy):
 
 ```bash
-# 1. get the code
 git clone https://github.com/NostrDanish/SIP-Booster-Relay.git
 cd SIP-Booster-Relay
 npm install
-
-# 2. configure (relay name, mode, payment, indexer policy…)
-$EDITOR src/config.ts
-
-# 3. create the database and paste its id into wrangler.toml
+$EDITOR src/config.ts     # relay name, mode, payment, indexer policy…
 npx wrangler login
-npx wrangler d1 create sip01-relay
-
-# 4. deploy
 npx wrangler deploy
 ```
 

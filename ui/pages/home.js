@@ -29,6 +29,10 @@ export async function renderHome(root, ctx) {
         <span>${escapeHtml(wsUrl)}</span>
         <span class="copy">click to copy</span>
       </div>
+      <div class="flex mt" style="justify-content:center">
+        <a class="btn" href="#/deploy">Deploy your own node</a>
+        <a class="btn ghost" href="#/search">Search the index</a>
+      </div>
     </section>
 
     ${payment ? renderPayment(info) : ''}
