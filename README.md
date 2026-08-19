@@ -32,6 +32,7 @@ This is a **fork of [Nosflare](https://github.com/Spl0itable/nosflare) (MIT)** t
 - **NIP-45 counts** — cheap observation counts for dashboards and engines.
 - **NIP-11 capability advertisement** — including the `uncaged_index` SIP-01 block (SIP-01 §15).
 - **Optional pay-to-relay** — Bitcoin Lightning via Nostr zaps with **cryptographically verified** kind 9735 receipts. Payment is relay policy, never protocol.
+- **Optional hosted deploy service** — sell relay deployments: customers sign in with Nostr, pay in sats (Lightning) or PRE (Presearch token on Base), and a stock relay is provisioned into their own Cloudflare account. Prices + receiving wallets are editable live from the owner's `/admin` dashboard.
 - **Operator UI** — landing page, live dashboard, search console, observation explorer with a client-side validator, indexer/document browsers, NIP-11 viewer, in-browser conformance tests, and a deployment wizard.
 - **Three modes** — `sip01` (dedicated index), `hybrid` (general relay + SIP-01), `general` (plain relay).
 

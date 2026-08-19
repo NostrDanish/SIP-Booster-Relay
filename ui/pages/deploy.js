@@ -15,8 +15,11 @@
  */
 
 import { pageHeader } from '../app.js';
-import { escapeHtml, toast, getRelayHttpBase } from '../api.js';
+import { escapeHtml, toast, getRelayHttpBase, apiGet, shortHex } from '../api.js';
 import { reqEvents, nip45Count } from '../ws.js';
+import { hasNostrSigner, nostrGetPubkey, serviceFetch } from '../nip98.js';
+import { findZapReceipt } from '../zap-pay.js';
+import { npubToHex } from '../../shared/bech32.js';
 
 const REPO = 'https://github.com/NostrDanish/SIP-Booster-Relay';
 const CF_DEPLOY_URL = `https://deploy.workers.cloudflare.com/?url=${encodeURIComponent(REPO)}`;
@@ -42,9 +45,14 @@ export async function renderDeploy(root, ctx) {
       </div>
     </section>
 
+    <section class="panel" id="hosted-track" style="border-color: var(--amber-dim)">
+      <h2>// track A+ · hosted deploy <span class="pill amber">paid</span></h2>
+      <div id="hosted-body"><p class="muted small">checking for a hosted deploy service…</p></div>
+    </section>
+
     <div class="grid cols-2">
-      <section class="panel" style="border-color: var(--amber-dim)">
-        <h2>// track A · one click (recommended)</h2>
+      <section class="panel">
+        <h2>// track A · one click (free, recommended)</h2>
         <p class="small muted">
           Cloudflare clones the repository into <em>your</em> GitHub/GitLab account, automatically
           provisions the D1 database and Durable Objects, builds, and deploys. Any later push to
@@ -192,6 +200,204 @@ npm run build   # → worker.js (self-contained)</pre>
   bindGenerate(root);
   bindVerify(root);
   bindAnnounce(root);
+  initHostedTrack(root);
+}
+
+/* ---------------- hosted (paid) deploy track ---------------- */
+
+async function initHostedTrack(root) {
+  const body = root.querySelector('#hosted-body');
+  const base = getRelayHttpBase();
+
+  let cfg;
+  try {
+    cfg = await apiGet('/api/service/config');
+  } catch {
+    body.innerHTML = `<p class="small faint">No hosted deploy service on this origin. Self-hosting below is free and takes about the same time.</p>`;
+    return;
+  }
+  if (!cfg.enabled) {
+    body.innerHTML = `<p class="small faint">The hosted deploy service is disabled on this relay.</p>`;
+    return;
+  }
+
+  const recipientHex = npubToHex(cfg.zap_npub) || '';
+
+  body.innerHTML = `
+    <p class="small muted">Pay once, sign in with Nostr, and this service provisions a stock-config SIP relay
+      into <em>your</em> Cloudflare account. Your Cloudflare token is used once, in memory, and never stored.</p>
+
+    <div class="deploy-step active">
+      <div class="step-num">STEP 1</div>
+      <h3>Sign in with Nostr</h3>
+      <button class="btn small" id="hs-login">Sign in</button>
+      <span class="small faint" id="hs-who" style="margin-left:.6rem"></span>
+    </div>
+
+    <div class="deploy-step" id="hs-pay-step">
+      <div class="step-num">STEP 2</div>
+      <h3>Pay ${escapeHtml(String(cfg.deploy_price_sats))} sats <span class="faint">or</span> ${escapeHtml(String(cfg.deploy_price_pre))} PRE</h3>
+      <div class="grid cols-2">
+        <div>
+          <h3>⚡ Lightning (Nostr zap)</h3>
+          <p class="small muted">Zap <strong>${escapeHtml(String(cfg.deploy_price_sats))} sats</strong> to the service
+            (<code>${escapeHtml(cfg.zap_npub.slice(0, 16))}…</code>), then claim:</p>
+          <button class="btn small" id="hs-zap"
+                  data-npub="${escapeHtml(cfg.zap_npub)}"
+                  data-relays="wss://relay.damus.io,wss://relay.primal.net,wss://sendit.nosflare.com"
+                  data-sats-amount="${escapeHtml(String(cfg.deploy_price_sats))}">⚡ Zap now</button>
+          <button class="btn small ghost" id="hs-claim-ln">I paid — verify</button>
+        </div>
+        <div>
+          <h3>◈ PRE on Base</h3>
+          <p class="small muted">Send <strong>${escapeHtml(String(cfg.deploy_price_pre))} PRE</strong> on Base to:</p>
+          <div class="codeblock">${escapeHtml(cfg.pre.address)}</div>
+          <p class="small faint">contract <code>${escapeHtml(cfg.pre.token_contract.slice(0, 12))}…</code> · chain ${cfg.pre.chain_id}</p>
+          <input type="text" id="hs-txhash" placeholder="0x… transaction hash">
+          <button class="btn small ghost mt" id="hs-claim-pre">Verify PRE payment</button>
+        </div>
+      </div>
+      <p class="small" id="hs-pay-status"></p>
+    </div>
+
+    <div class="deploy-step" id="hs-cf-step">
+      <div class="step-num">STEP 3</div>
+      <h3>Your Cloudflare account</h3>
+      <p class="small muted">Create a token at Cloudflare → My Profile → API Tokens with exactly these permissions:
+        <em>Account → Workers Scripts: Edit</em> and <em>Account → D1: Edit</em>, scoped to your account.
+        The token is used once for provisioning and never stored. Delete it afterwards if you like.</p>
+      <div class="field-row">
+        <div><label>Account ID</label><input type="text" id="hs-account" placeholder="32 hex chars"></div>
+        <div><label>API token</label><input type="password" id="hs-token" placeholder="cfut_…" autocomplete="off"></div>
+        <div><label>Relay worker name</label><input type="text" id="hs-name" value="my-sip-relay"></div>
+      </div>
+    </div>
+
+    <div class="deploy-step" id="hs-go-step">
+      <div class="step-num">STEP 4</div>
+      <h3>Deploy</h3>
+      <button class="btn" id="hs-deploy">Deploy my relay</button>
+      <div id="hs-result" class="mt"></div>
+    </div>
+  `;
+
+  // Zap button library
+  if (!window.nostrZap) {
+    const s = document.createElement('script');
+    s.src = './nostr-zap.js';
+    s.onload = () => window.nostrZap && window.nostrZap.initTargets('#hs-zap');
+    s.onerror = () => {
+      const cdn = document.createElement('script');
+      cdn.src = 'https://cdn.jsdelivr.net/gh/NostrDanish/SIP-Booster-Relay@main/nostr-zap.js';
+      cdn.onload = () => window.nostrZap && window.nostrZap.initTargets('#hs-zap');
+      document.head.appendChild(cdn);
+    };
+    document.head.appendChild(s);
+  } else {
+    window.nostrZap.initTargets('#hs-zap');
+  }
+
+  let pubkey = null;
+  const who = body.querySelector('#hs-who');
+  const payStatus = body.querySelector('#hs-pay-status');
+
+  const setPaid = (msg) => {
+    payStatus.innerHTML = `<span class="badge-ok">✓ ${escapeHtml(msg)}</span>`;
+    body.querySelector('#hs-pay-step').style.borderLeftColor = 'var(--green)';
+  };
+
+  body.querySelector('#hs-login').addEventListener('click', async () => {
+    try {
+      pubkey = await nostrGetPubkey();
+      who.innerHTML = `<span class="badge-ok">${escapeHtml(shortHex(pubkey, 10, 8))}</span>`;
+      const status = await apiGet(`/api/service/payment-status?pubkey=${pubkey}`).catch(() => null);
+      if (status?.paid) setPaid('payment credit found — you can deploy');
+    } catch (error) {
+      who.textContent = error.message;
+    }
+  });
+
+  const requireLogin = async () => {
+    if (!pubkey) pubkey = await nostrGetPubkey();
+    return pubkey;
+  };
+
+  body.querySelector('#hs-claim-ln').addEventListener('click', async () => {
+    try {
+      const pk = await requireLogin();
+      payStatus.textContent = 'looking for your zap receipt on public relays…';
+      const since = Math.floor(Date.now() / 1000) - 3600;
+      const receipt = await findZapReceipt(pk, recipientHex, since, (m) => { payStatus.textContent = m; });
+      if (!receipt) {
+        payStatus.textContent = 'no receipt found yet — wait ~20 s after paying and try again';
+        return;
+      }
+      const res = await serviceFetch(base, '/api/service/pay/lightning', { method: 'POST', body: { event: receipt } });
+      if (res.ok && res.data?.ok) setPaid('Lightning payment verified');
+      else payStatus.textContent = res.data?.error || `HTTP ${res.status}`;
+    } catch (error) {
+      payStatus.textContent = error.message;
+    }
+  });
+
+  body.querySelector('#hs-claim-pre').addEventListener('click', async () => {
+    try {
+      const pk = await requireLogin();
+      const txHash = /** @type {HTMLInputElement} */ (body.querySelector('#hs-txhash')).value.trim();
+      payStatus.textContent = 'verifying on Base…';
+      const res = await serviceFetch(base, '/api/service/pay/pre', { method: 'POST', body: { txHash } });
+      if (res.ok && res.data?.ok) setPaid('PRE payment verified on Base');
+      else payStatus.textContent = res.data?.error || `HTTP ${res.status}`;
+    } catch (error) {
+      payStatus.textContent = error.message;
+    }
+  });
+
+  body.querySelector('#hs-deploy').addEventListener('click', async () => {
+    const out = body.querySelector('#hs-result');
+    try {
+      const pk = await requireLogin();
+      const payload = {
+        cfToken: /** @type {HTMLInputElement} */ (body.querySelector('#hs-token')).value.trim(),
+        cfAccountId: /** @type {HTMLInputElement} */ (body.querySelector('#hs-account')).value.trim(),
+        workerName: /** @type {HTMLInputElement} */ (body.querySelector('#hs-name')).value.trim(),
+      };
+      if (!payload.cfToken || !payload.cfAccountId || !payload.workerName) {
+        out.innerHTML = `<div class="notice"><strong>Missing Cloudflare details.</strong></div>`;
+        return;
+      }
+      out.innerHTML = '<p class="muted small">deploying — this takes about 20–40 seconds…</p>';
+      const res = await serviceFetch(base, '/api/service/deploy', { method: 'POST', body: payload });
+      const data = res.data || {};
+      const steps = (data.steps || []).map((s) => `
+        <div class="test-row">
+          <span class="${s.ok ? 'badge-ok' : 'badge-fail'}">${s.ok ? '✓' : '✗'}</span>
+          <span class="name">${escapeHtml(s.step)}</span>
+          ${s.detail ? `<span class="muted small mono">${escapeHtml(s.detail)}</span>` : ''}
+        </div>`).join('');
+
+      if (res.ok && data.ok) {
+        // Clear the token field immediately.
+        /** @type {HTMLInputElement} */ (body.querySelector('#hs-token')).value = '';
+        out.innerHTML = `
+          ${steps}
+          <div class="notice mt" style="border-color:#2c5a42;background:rgba(90,212,143,.06)">
+            <strong style="color:var(--green)">Your relay is live.</strong>
+            <div class="codeblock mt">${escapeHtml(data.relay_wss_url || '(subdomain pending — see note)')}
+${escapeHtml(data.relay_https_url || '')}</div>
+            <p class="small mt">Verify it below (step 2 · verify), then add it to your crawler publish pools.</p>
+          </div>`;
+        if (data.relay_https_url) {
+          const verifyInput = /** @type {HTMLInputElement} */ (root.querySelector('#verify-url'));
+          if (verifyInput) verifyInput.value = data.relay_https_url;
+        }
+      } else {
+        out.innerHTML = `${steps}<div class="notice"><strong>Deploy failed.</strong> ${escapeHtml(data.error || 'HTTP ' + res.status)}${res.status === 402 ? ' — pay first (step 2)' : ''}</div>`;
+      }
+    } catch (error) {
+      out.innerHTML = `<div class="notice"><strong>Error.</strong> ${escapeHtml(error.message)}</div>`;
+    }
+  });
 }
 
 /* ---------------- configuration generation ---------------- */

@@ -20,6 +20,7 @@ import { renderRelay } from './pages/relay.js';
 import { renderDeploy } from './pages/deploy.js';
 import { renderTests } from './pages/tests.js';
 import { renderDocs } from './pages/docs.js';
+import { renderAdmin } from './pages/admin.js';
 
 const routes = {
   '/': renderHome,
@@ -32,6 +33,7 @@ const routes = {
   '/deploy': renderDeploy,
   '/tests': renderTests,
   '/docs': renderDocs,
+  '/admin': renderAdmin,
 };
 
 /** Shared context passed to every page renderer. */

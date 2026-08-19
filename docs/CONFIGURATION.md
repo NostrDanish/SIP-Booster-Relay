@@ -51,6 +51,28 @@ keys must never be committed.
 Payments are verified from kind 9735 zap receipts — see docs/SECURITY.md for
 the trust model.
 
+## Hosted deploy service
+
+Optional paid deploy service (this instance deploys stock-config relays into
+customers' own Cloudflare accounts after payment):
+
+| Option | Default | Meaning |
+|---|---|---|
+| `DEPLOY_SERVICE_ENABLED` | `true` | Master switch for `/api/service/*` + the portal's hosted track. |
+| `SERVICE_OWNER_PUBKEY` | (hex) | Only this key can use `/admin` (NIP-98). |
+| `DEPLOY_PRICE_SATS` | `21420` | Default Lightning price (editable live in /admin). |
+| `DEPLOY_PRICE_PRE` | `500` | Default PRE price (editable live in /admin). |
+| `DEPLOY_ZAP_NPUB` | `relayNpub` | Default Lightning recipient npub (editable live). |
+| `DEPLOY_PRE_ADDRESS` | `0x000…` | **Set your Base receiving wallet** (editable live). |
+| `PRE_TOKEN_CONTRACT` | `0x3816dd4b…de7a` | PRE token on Base. |
+| `PRE_TOKEN_DECIMALS` | `18` | ERC-20 decimals for price math. |
+| `BASE_RPC_URL` | `https://mainnet.base.org` | Base JSON-RPC endpoint used for payment verification. |
+| `DEPLOY_BUNDLE_URL` | repo `main/worker.js` | The CI-built bundle deployed for customers. |
+| `DEPLOY_MAX_PER_IP_PER_DAY` | `10` | Deploy endpoint abuse guard. |
+
+Runtime values live in D1 (`service_settings`) and win over these defaults;
+the /admin dashboard edits them.
+
 ## NIP-42 auth
 
 | Option | Default | Meaning |

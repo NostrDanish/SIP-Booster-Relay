@@ -128,11 +128,52 @@ export const PAYMENT_MODE: 'free' | 'donation' | 'pay-to-relay' = 'free';
 // Derived for upstream-compatible checks.
 export const PAY_TO_RELAY_ENABLED = PAYMENT_MODE === 'pay-to-relay';
 
-export const relayNpub = "npub16jdfqgazrkapk0yrqm9rdxlnys7ck39c7zmdzxtxqlmmpxg04r0sd733sv"; // Use your own npub
+export const relayNpub = "npub1udrjdn9kyn6tk6ht400anfqltctqe2tm5t4p87kclrljnflcf09qvl3tay"; // Use your own npub
 export const RELAY_ACCESS_PRICE_SATS = 212121; // Price in SATS for relay access
 
 /** Hex pubkey of the relay operator (payment recipient). Derived from
  *  relayNpub at startup in relay-worker.ts. */
+
+// ---------------------------------------------------------------------------
+// Hosted deploy service (optional product surface — "deploy a relay for sats")
+// ---------------------------------------------------------------------------
+
+/**
+ * HOSTED DEPLOY SERVICE. When enabled, this instance can deploy stock-config
+ * SIP relays into a customer's own Cloudflare account after payment.
+ *
+ * All values below are DEFAULTS. The live values are editable at runtime from
+ * the /admin dashboard (stored in D1 `service_settings`), so the owner can
+ * change prices and receiving wallets without redeploying.
+ */
+export const DEPLOY_SERVICE_ENABLED = true;
+
+/** The service owner's pubkey (hex) — only this key can sign into /admin. */
+export const SERVICE_OWNER_PUBKEY = "e34726ccb624f4bb6aebabdfd9a41f5e160ca97ba2ea13fad8f8ff29a7f84bca";
+
+/** Default deployment price in sats (Lightning, paid as a Nostr zap). */
+export const DEPLOY_PRICE_SATS = 21420;
+
+/** Default deployment price in PRE (Presearch token on Base). */
+export const DEPLOY_PRICE_PRE = 500;
+
+/** Default Lightning recipient: zaps to this npub (its profile's lud16 is used). */
+export const DEPLOY_ZAP_NPUB = relayNpub;
+
+/** Default Base (EVM) receiving address for PRE payments — CHANGE THIS to your wallet. */
+export const DEPLOY_PRE_ADDRESS = "0x0000000000000000000000000000000000000000";
+
+/** PRE token contract on Base (chain id 8453). */
+export const PRE_TOKEN_CONTRACT = "0x3816dd4bd44c8830c2fa020a5605bac72fa3de7a";
+export const PRE_TOKEN_DECIMALS = 18;
+export const BASE_RPC_URL = "https://mainnet.base.org";
+export const BASE_CHAIN_ID = 8453;
+
+/** Repository the deploy bundle is fetched from (CI-built worker.js). */
+export const DEPLOY_BUNDLE_URL = "https://raw.githubusercontent.com/NostrDanish/SIP-Booster-Relay/main/worker.js";
+
+/** Deploy API abuse guard: max deployments per IP per day. */
+export const DEPLOY_MAX_PER_IP_PER_DAY = 10;
 
 // NIP-42 Authentication
 export const AUTH_REQUIRED = false; // Set to true to require NIP-42 auth for reads+writes
@@ -145,8 +186,8 @@ export const AUTH_TIMEOUT_MS = 600000; // 10 minutes - how long the challenge is
 export const relayInfo: RelayInfo = {
   name: "UNCAGED SIP Relay",
   description: "A serverless SIP-01 search index relay — decentralized web-index observations (Nostr kind 39697) on Cloudflare Workers + D1. One shared decentralized index. Many independent indexers. No single owner.",
-  pubkey: "d49a9023a21dba1b3c8306ca369bf3243d8b44b8f0b6d1196607f7b0990fa8df",
-  contact: "lux@fed.wtf",
+  pubkey: "e34726ccb624f4bb6aebabdfd9a41f5e160ca97ba2ea13fad8f8ff29a7f84bca",
+  contact: "npub1udrjdn9kyn6tk6ht400anfqltctqe2tm5t4p87kclrljnflcf09qvl3tay",
   supported_nips: [1, 5, 9, 11, 16, 33, 42, 45, 50, 77],
   software: "https://github.com/NostrDanish/SIP-Booster-Relay",
   version: "1.0.0",

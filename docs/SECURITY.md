@@ -82,6 +82,31 @@ relay only stores their signed observations.
 - The relay needs **no private key** at all — it serves and validates; it
   does not sign.
 
+## Hosted deploy service (`/api/service/*`)
+
+Optional product surface (disable with `DEPLOY_SERVICE_ENABLED = false`):
+
+- **Customer Cloudflare tokens** arrive over TLS at `POST /api/service/deploy`,
+  are used in memory for provisioning calls against `api.cloudflare.com`,
+  and are never logged, stored, cached, or returned. The UI tells customers
+  exactly which scoped permissions to grant (Workers Scripts Edit + D1 Edit)
+  and to delete the token afterwards. The endpoint is rate-limited per IP
+  per day and gated behind a verified payment credit.
+- **Admin auth** is NIP-98: every admin call is a fresh kind 27235 signed
+  event bound to the exact URL, method, and payload hash, with a 5-minute
+  freshness window, owner-pubkey-gated. No sessions or cookies to steal.
+- **Lightning payments** are verified from kind 9735 zap receipts (same
+  trust model as pay-to-relay) and are single-use per receipt id.
+- **PRE payments** are verified on-chain via the public Base RPC
+  (`https://mainnet.base.org`): confirmed receipt + a Transfer log on the PRE
+  contract (`0x3816dd4b…de7a`) to the service wallet with value ≥ price. Tx
+  hashes are single-use. Trust note: the RPC response is trusted as Base
+  consensus — an RPC lie could fake a payment; for mainnet-value use, pin a
+  reputable RPC (or two and cross-check) via `BASE_RPC_URL`.
+- The service deploys a **stock-config** relay (current `worker.js` from the
+  repository) into the customer's account. Customers can reconfigure after
+  deploy with wrangler.
+
 ## Reporting
 
 Open a GitHub issue (or contact the operator address in the NIP-11

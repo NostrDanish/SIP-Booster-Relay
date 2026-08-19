@@ -132,4 +132,49 @@ export function migrationV7Statements(): string[] {
 
 /** Column list for the main events table insert (kept in one place). */
 export const EVENT_INSERT_COLUMNS =
-  'id, pubkey, created_at, kind, tags, content, sig, tag_p, tag_e, tag_a, tag_t, tag_d, tag_r, tag_L, tag_s, tag_u, tag_l, tag_x, reply_to_event_id, root_event_id, content_preview';
+  'id, pubkey, created_at, kind, tags, content, sig, tag_p, tag_e, tag_a, tag_t, tag_d, tag_r, tag_L, tag_s, tag_u, tag_x, reply_to_event_id, root_event_id, content_preview';
+
+/**
+ * Hosted deploy service tables (see docs/DEPLOYMENT.md "Hosted deploy
+ * service"). Runtime-editable settings live in D1 so the owner can change
+ * prices/wallets from /admin without redeploying.
+ */
+export const SERVICE_SCHEMA_STATEMENTS: string[] = [
+  `CREATE TABLE IF NOT EXISTS service_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+  )`,
+
+  // One row per verified payment. `proof` is unique (zap receipt id or PRE
+  // tx hash) — replay protection. `used_at` marks the credit consumed by a
+  // deployment.
+  `CREATE TABLE IF NOT EXISTS deploy_payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pubkey TEXT NOT NULL,
+    method TEXT NOT NULL CHECK(method IN ('lightning', 'pre')),
+    amount TEXT NOT NULL,
+    proof TEXT NOT NULL UNIQUE,
+    payer_detail TEXT,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    used_at INTEGER
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_deploy_payments_pubkey ON deploy_payments(pubkey, used_at)`,
+
+  `CREATE TABLE IF NOT EXISTS deploy_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pubkey TEXT NOT NULL,
+    worker_name TEXT NOT NULL,
+    relay_url TEXT NOT NULL,
+    payment_id INTEGER,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    FOREIGN KEY (payment_id) REFERENCES deploy_payments(id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_deploy_jobs_pubkey ON deploy_jobs(pubkey, created_at DESC)`,
+
+  // Per-IP daily deploy counter (abuse guard)
+  `CREATE TABLE IF NOT EXISTS deploy_rate (
+    ip_day TEXT PRIMARY KEY,
+    count INTEGER NOT NULL DEFAULT 0
+  )`,
+];

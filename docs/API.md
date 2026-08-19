@@ -112,6 +112,24 @@ All endpoints return JSON with CORS enabled.
 | `GET /api/check-payment?pubkey=<hex>` | Payment status (pay-to-relay mode) |
 | `POST /?notify-zap` | Submit the kind 9735 zap receipt as JSON `{ "event": {…} }` → verified, then grants access (see docs/SECURITY.md) |
 
+### Hosted deploy service (`/api/service/*`)
+
+Authenticated calls carry `Authorization: Nostr <base64url(kind-27235 event)>`
+(NIP-98: `u` + `method` + `payload` tags, 5-minute freshness). Admin calls
+are additionally gated to `SERVICE_OWNER_PUBKEY`.
+
+| Endpoint | Auth | Description |
+|---|---|---|
+| `GET /api/service/config` | — | Public service config (prices, wallets, chain) |
+| `POST /api/service/pay/lightning` | customer | `{ event }` kind-9735 zap receipt → verified, credit granted |
+| `POST /api/service/pay/pre` | customer | `{ txHash }` → verified on Base, credit granted |
+| `GET /api/service/payment-status?pubkey=` | — | Whether a pubkey holds an unused deploy credit |
+| `POST /api/service/deploy` | customer + credit | `{ cfToken, cfAccountId, workerName }` → provisions D1 + worker + subdomain in the customer's account |
+| `GET /api/service/admin/settings` | owner | Current live settings |
+| `POST /api/service/admin/settings` | owner | `{ key, value }` — update price/wallet |
+| `GET /api/service/admin/payments` | owner | Payment ledger |
+| `GET /api/service/admin/jobs` | owner | Deployment history |
+
 ## Client examples
 
 ### JavaScript / TypeScript

@@ -22,7 +22,6 @@
  */
 
 import type { Env, NostrEvent } from './types';
-import { RELAY_ACCESS_PRICE_SATS } from './config';
 import { npubToHex } from './bech32';
 
 type Session = D1DatabaseSession;
@@ -37,6 +36,8 @@ export interface VerifiedPayment {
   amountSats: number;
   /** Zap receipt event id (audit trail). */
   receiptId: string;
+  /** The paid invoice (audit trail). */
+  bolt11?: string;
 }
 
 /**
@@ -46,6 +47,7 @@ export interface VerifiedPayment {
 export async function verifyZapReceipt(
   event: NostrEvent,
   relayNpub: string,
+  priceSats: number,
   verifySig: (event: NostrEvent) => Promise<boolean>,
 ): Promise<VerifiedPayment | null> {
   try {
@@ -68,7 +70,7 @@ export async function verifyZapReceipt(
     // Amount (msats) must cover the configured price.
     const amountTag = tag('amount');
     const amountMsats = amountTag ? Number.parseInt(amountTag, 10) : NaN;
-    if (!Number.isFinite(amountMsats) || amountMsats < RELAY_ACCESS_PRICE_SATS * 1000) {
+    if (!Number.isFinite(amountMsats) || amountMsats < priceSats * 1000) {
       return null;
     }
 
@@ -88,6 +90,7 @@ export async function verifyZapReceipt(
       payer,
       amountSats: Math.floor(amountMsats / 1000),
       receiptId: event.id,
+      bolt11: bolt11!,
     };
   } catch (error) {
     console.error('pay: zap receipt verification failed:', error);
@@ -120,7 +123,7 @@ export async function savePaidPubkey(pubkey: string, env: Env, amountSats?: numb
            paid_at = excluded.paid_at,
            amount_sats = excluded.amount_sats`,
       )
-      .bind(pubkey, Math.floor(Date.now() / 1000), amountSats ?? RELAY_ACCESS_PRICE_SATS)
+      .bind(pubkey, Math.floor(Date.now() / 1000), amountSats ?? 0)
       .run();
     if (receiptId) {
       console.log(`pay: recorded payment for ${pubkey} (receipt ${receiptId}, ${amountSats} sats)`);

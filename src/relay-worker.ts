@@ -25,12 +25,13 @@ import * as config from './config';
 import { RelayWebSocket } from './durable-object';
 import { SIP01_KIND, validateSip01Event } from '../shared/sip01.js';
 import { SUPPORTED_NIP50_OPERATORS } from '../shared/search-query.js';
-import { SIP01_SCHEMA_STATEMENTS, SCHEMA_VERSION, migrationV7Statements, CACHED_TAG_NAMES } from './sip01/schema';
+import { SIP01_SCHEMA_STATEMENTS, SERVICE_SCHEMA_STATEMENTS, SCHEMA_VERSION, migrationV7Statements, CACHED_TAG_NAMES } from './sip01/schema';
 import { ingestSip01Observation, removeSip01Observations, bumpMetric } from './sip01/ingest';
 import * as sipApi from './sip01/api';
 import { executeSearch } from './sip01/search';
 import { verifyZapReceipt, hasPaidForRelay, savePaidPubkey } from './pay';
 import { serveMiniLanding } from './mini-landing';
+import { handleServiceApi } from './service/routes';
 
 // Import config values
 const {
@@ -232,6 +233,10 @@ async function initializeDatabase(db: D1Database): Promise<void> {
 
       // SIP-01 tables (documents / observations / indexers / metrics)
       ...SIP01_SCHEMA_STATEMENTS,
+
+      // Hosted deploy service tables (service_settings / deploy_payments /
+      // deploy_jobs / deploy_rate)
+      ...SERVICE_SCHEMA_STATEMENTS,
     ];
 
     for (const statement of statements) {
@@ -1914,7 +1919,7 @@ async function handlePaymentNotification(request: Request, env: Env): Promise<Re
       });
     }
 
-    const verified = await verifyZapReceipt(receipt, relayNpub, verifyEventSignature);
+    const verified = await verifyZapReceipt(receipt, relayNpub, RELAY_ACCESS_PRICE_SATS, verifyEventSignature);
     if (!verified) {
       return new Response(JSON.stringify({ error: 'Invalid zap receipt' }), {
         status: 400,
@@ -2308,6 +2313,20 @@ export default {
     try {
       const url = new URL(request.url);
 
+      // CORS preflight for the JSON APIs (the deploy portal can run
+      // cross-origin from a static preview).
+      if (request.method === 'OPTIONS' && url.pathname.startsWith('/api/')) {
+        return new Response(null, {
+          status: 204,
+          headers: {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+            'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+            'Access-Control-Max-Age': '86400',
+          },
+        });
+      }
+
       // Payment endpoints
       if (request.method === 'POST' && url.searchParams.has('notify-zap') && PAY_TO_RELAY_ENABLED) {
         return await handlePaymentNotification(request, env);
@@ -2315,6 +2334,12 @@ export default {
 
       if (url.pathname === "/api/check-payment" && PAY_TO_RELAY_ENABLED) {
         return await handleCheckPayment(request, env);
+      }
+
+      // Hosted deploy service API
+      if (url.pathname.startsWith('/api/service/')) {
+        await ensureDatabase(env.RELAY_DATABASE);
+        return await handleServiceApi(request, env, url);
       }
 
       // Operator JSON API

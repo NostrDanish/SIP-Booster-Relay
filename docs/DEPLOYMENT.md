@@ -117,6 +117,21 @@ Optional but recommended:
    them in `wrangler.toml`, which the git flow reads).
 4. Every push to `main` redeploys your relay.
 
+## Hosted deploy service (optional product)
+
+Any relay instance can also act as a **paid deployment service** for others:
+customers sign in with Nostr, pay with Lightning (zap) or PRE (Presearch
+token on Base), paste scoped Cloudflare credentials, and the service
+provisions a stock-config relay into *their* account (`/api/service/*`).
+
+- Prices and receiving wallets are editable live from the relay's **`/admin`**
+  page (owner NIP-98 sign-in; stored in D1 `service_settings`).
+- Payment verification: kind 9735 zap receipts (Lightning) and on-chain
+  Transfer logs via the public Base RPC (PRE). Single-use proofs.
+- The customer's CF token is used in memory only, never stored — see
+  docs/SECURITY.md for the full trust model.
+- Disable entirely with `DEPLOY_SERVICE_ENABLED = false`.
+
 ## After deployment
 
 1. Open `https://your-relay.workers.dev` — the landing page shows the relay
