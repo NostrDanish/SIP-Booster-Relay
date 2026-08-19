@@ -4,6 +4,8 @@ name: Build worker.js
 # commits it back. This powers the "dashboard paste" deployment track
 # (docs/DEPLOYMENT.md, Track D) — wrangler deploys do NOT need this artifact
 # (wrangler bundles src/index.ts itself).
+#
+# On failure, the build log is committed to build-status/ for debugging.
 
 on:
   push:
@@ -23,12 +25,18 @@ jobs:
         with:
           node-version: 22
 
-      - run: npm install
+      - name: Install + build (log captured)
+        run: |
+          set -o pipefail
+          {
+            echo "== npm install =="
+            npm install
+            echo "== build =="
+            node scripts/build.mjs
+          } 2>&1 | tee build-output.txt
 
-      - name: Build worker bundle
-        run: node scripts/build.mjs
-
-      - name: Commit worker.js
+      - name: Commit worker.js on success
+        if: success()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -36,6 +44,17 @@ jobs:
           if git diff --cached --quiet; then
             echo "worker.js unchanged"
           else
-            git commit -m "chore: rebuild worker.js bundle [skip ci]"
+            git commit -m "chore: rebuild worker.js bundle"
             git push
           fi
+
+      - name: Publish build log on failure
+        if: failure()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          mkdir -p build-status
+          cp build-output.txt "build-status/last-failure.txt"
+          git add build-status/last-failure.txt
+          git commit -m "ci: build failure log"
+          git push
