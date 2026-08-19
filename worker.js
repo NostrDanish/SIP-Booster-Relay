@@ -37,11 +37,20 @@ var config_exports = {};
 __export(config_exports, {
   AUTH_REQUIRED: () => AUTH_REQUIRED,
   AUTH_TIMEOUT_MS: () => AUTH_TIMEOUT_MS,
+  BASE_CHAIN_ID: () => BASE_CHAIN_ID,
+  BASE_RPC_URL: () => BASE_RPC_URL,
   COUNT_MAX_ESTIMATE: () => COUNT_MAX_ESTIMATE,
   DB_PRUNE_BATCH_SIZE: () => DB_PRUNE_BATCH_SIZE,
   DB_PRUNE_TARGET_GB: () => DB_PRUNE_TARGET_GB,
   DB_PRUNING_ENABLED: () => DB_PRUNING_ENABLED,
   DB_SIZE_THRESHOLD_GB: () => DB_SIZE_THRESHOLD_GB,
+  DEPLOY_BUNDLE_URL: () => DEPLOY_BUNDLE_URL,
+  DEPLOY_MAX_PER_IP_PER_DAY: () => DEPLOY_MAX_PER_IP_PER_DAY,
+  DEPLOY_PRE_ADDRESS: () => DEPLOY_PRE_ADDRESS,
+  DEPLOY_PRICE_PRE: () => DEPLOY_PRICE_PRE,
+  DEPLOY_PRICE_SATS: () => DEPLOY_PRICE_SATS,
+  DEPLOY_SERVICE_ENABLED: () => DEPLOY_SERVICE_ENABLED,
+  DEPLOY_ZAP_NPUB: () => DEPLOY_ZAP_NPUB,
   NEG_FRAME_SIZE_LIMIT: () => NEG_FRAME_SIZE_LIMIT,
   NEG_MAX_ITEMS: () => NEG_MAX_ITEMS,
   NEG_SESSION_TIMEOUT_MS: () => NEG_SESSION_TIMEOUT_MS,
@@ -50,12 +59,15 @@ __export(config_exports, {
   NIP77_ENABLED: () => NIP77_ENABLED,
   PAYMENT_MODE: () => PAYMENT_MODE,
   PAY_TO_RELAY_ENABLED: () => PAY_TO_RELAY_ENABLED,
+  PRE_TOKEN_CONTRACT: () => PRE_TOKEN_CONTRACT,
+  PRE_TOKEN_DECIMALS: () => PRE_TOKEN_DECIMALS,
   PUBKEY_RATE_LIMIT: () => PUBKEY_RATE_LIMIT,
   RELAY_ACCESS_PRICE_SATS: () => RELAY_ACCESS_PRICE_SATS,
   RELAY_MODE: () => RELAY_MODE,
   REQ_RATE_LIMIT: () => REQ_RATE_LIMIT,
   SEARCH_MAX_QUERY_LENGTH: () => SEARCH_MAX_QUERY_LENGTH,
   SEARCH_MAX_RESULTS: () => SEARCH_MAX_RESULTS,
+  SERVICE_OWNER_PUBKEY: () => SERVICE_OWNER_PUBKEY,
   SIP01_ENABLED: () => SIP01_ENABLED,
   SIP01_INDEXER_POLICY: () => SIP01_INDEXER_POLICY,
   SIP01_INDEXER_RATE_LIMIT: () => SIP01_INDEXER_RATE_LIMIT,
@@ -119,15 +131,27 @@ var NIP45_ENABLED = true;
 var COUNT_MAX_ESTIMATE = 5e4;
 var PAYMENT_MODE = "free";
 var PAY_TO_RELAY_ENABLED = PAYMENT_MODE === "pay-to-relay";
-var relayNpub = "npub16jdfqgazrkapk0yrqm9rdxlnys7ck39c7zmdzxtxqlmmpxg04r0sd733sv";
+var relayNpub = "npub1udrjdn9kyn6tk6ht400anfqltctqe2tm5t4p87kclrljnflcf09qvl3tay";
 var RELAY_ACCESS_PRICE_SATS = 212121;
+var DEPLOY_SERVICE_ENABLED = true;
+var SERVICE_OWNER_PUBKEY = "e34726ccb624f4bb6aebabdfd9a41f5e160ca97ba2ea13fad8f8ff29a7f84bca";
+var DEPLOY_PRICE_SATS = 21420;
+var DEPLOY_PRICE_PRE = 500;
+var DEPLOY_ZAP_NPUB = relayNpub;
+var DEPLOY_PRE_ADDRESS = "0x0000000000000000000000000000000000000000";
+var PRE_TOKEN_CONTRACT = "0x3816dd4bd44c8830c2fa020a5605bac72fa3de7a";
+var PRE_TOKEN_DECIMALS = 18;
+var BASE_RPC_URL = "https://mainnet.base.org";
+var BASE_CHAIN_ID = 8453;
+var DEPLOY_BUNDLE_URL = "https://raw.githubusercontent.com/NostrDanish/SIP-Booster-Relay/main/worker.js";
+var DEPLOY_MAX_PER_IP_PER_DAY = 10;
 var AUTH_REQUIRED = false;
 var AUTH_TIMEOUT_MS = 6e5;
 var relayInfo = {
   name: "UNCAGED SIP Relay",
   description: "A serverless SIP-01 search index relay \u2014 decentralized web-index observations (Nostr kind 39697) on Cloudflare Workers + D1. One shared decentralized index. Many independent indexers. No single owner.",
-  pubkey: "d49a9023a21dba1b3c8306ca369bf3243d8b44b8f0b6d1196607f7b0990fa8df",
-  contact: "lux@fed.wtf",
+  pubkey: "e34726ccb624f4bb6aebabdfd9a41f5e160ca97ba2ea13fad8f8ff29a7f84bca",
+  contact: "npub1udrjdn9kyn6tk6ht400anfqltctqe2tm5t4p87kclrljnflcf09qvl3tay",
   supported_nips: [1, 5, 9, 11, 16, 33, 42, 45, 50, 77],
   software: "https://github.com/NostrDanish/SIP-Booster-Relay",
   version: "1.0.0",
@@ -4079,6 +4103,42 @@ function migrationV7Statements() {
   ];
 }
 __name(migrationV7Statements, "migrationV7Statements");
+var SERVICE_SCHEMA_STATEMENTS = [
+  `CREATE TABLE IF NOT EXISTS service_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+  )`,
+  // One row per verified payment. `proof` is unique (zap receipt id or PRE
+  // tx hash) — replay protection. `used_at` marks the credit consumed by a
+  // deployment.
+  `CREATE TABLE IF NOT EXISTS deploy_payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pubkey TEXT NOT NULL,
+    method TEXT NOT NULL CHECK(method IN ('lightning', 'pre')),
+    amount TEXT NOT NULL,
+    proof TEXT NOT NULL UNIQUE,
+    payer_detail TEXT,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    used_at INTEGER
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_deploy_payments_pubkey ON deploy_payments(pubkey, used_at)`,
+  `CREATE TABLE IF NOT EXISTS deploy_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    pubkey TEXT NOT NULL,
+    worker_name TEXT NOT NULL,
+    relay_url TEXT NOT NULL,
+    payment_id INTEGER,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+    FOREIGN KEY (payment_id) REFERENCES deploy_payments(id)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_deploy_jobs_pubkey ON deploy_jobs(pubkey, created_at DESC)`,
+  // Per-IP daily deploy counter (abuse guard)
+  `CREATE TABLE IF NOT EXISTS deploy_rate (
+    ip_day TEXT PRIMARY KEY,
+    count INTEGER NOT NULL DEFAULT 0
+  )`
+];
 
 // src/sip01/ingest.ts
 async function bumpMetric(session, key, delta = 1) {
@@ -4654,7 +4714,7 @@ __name(npubToHex, "npubToHex");
 
 // src/pay.ts
 var MAX_RECEIPT_AGE_SECONDS = 30 * 24 * 3600;
-async function verifyZapReceipt(event, relayNpub3, verifySig) {
+async function verifyZapReceipt(event, relayNpub3, priceSats, verifySig) {
   try {
     if (!event || event.kind !== 9735)
       return null;
@@ -4672,7 +4732,7 @@ async function verifyZapReceipt(event, relayNpub3, verifySig) {
       return null;
     const amountTag = tag("amount");
     const amountMsats = amountTag ? Number.parseInt(amountTag, 10) : NaN;
-    if (!Number.isFinite(amountMsats) || amountMsats < RELAY_ACCESS_PRICE_SATS * 1e3) {
+    if (!Number.isFinite(amountMsats) || amountMsats < priceSats * 1e3) {
       return null;
     }
     const bolt11 = tag("bolt11");
@@ -4687,7 +4747,8 @@ async function verifyZapReceipt(event, relayNpub3, verifySig) {
     return {
       payer,
       amountSats: Math.floor(amountMsats / 1e3),
-      receiptId: event.id
+      receiptId: event.id,
+      bolt11
     };
   } catch (error) {
     console.error("pay: zap receipt verification failed:", error);
@@ -4715,7 +4776,7 @@ async function savePaidPubkey(pubkey, env, amountSats, receiptId) {
          ON CONFLICT(pubkey) DO UPDATE SET
            paid_at = excluded.paid_at,
            amount_sats = excluded.amount_sats`
-    ).bind(pubkey, Math.floor(Date.now() / 1e3), amountSats ?? RELAY_ACCESS_PRICE_SATS).run();
+    ).bind(pubkey, Math.floor(Date.now() / 1e3), amountSats ?? 0).run();
     if (receiptId) {
       console.log(`pay: recorded payment for ${pubkey} (receipt ${receiptId}, ${amountSats} sats)`);
     }
@@ -4779,6 +4840,605 @@ function escapeHtml(s) {
   })[c]);
 }
 __name(escapeHtml, "escapeHtml");
+
+// src/service/settings.ts
+var DEFAULTS = {
+  deploy_price_sats: String(DEPLOY_PRICE_SATS),
+  deploy_price_pre: String(DEPLOY_PRICE_PRE),
+  zap_npub: DEPLOY_ZAP_NPUB,
+  pre_address: DEPLOY_PRE_ADDRESS
+};
+var SERVICE_SETTING_KEYS = Object.keys(DEFAULTS);
+async function getServiceSettings(session) {
+  const out = { ...DEFAULTS };
+  try {
+    const rows = await session.prepare(`SELECT key, value FROM service_settings WHERE key IN (${SERVICE_SETTING_KEYS.map(() => "?").join(",")})`).bind(...SERVICE_SETTING_KEYS).all();
+    for (const row of rows.results ?? []) {
+      const key = row.key;
+      if (key in out)
+        out[key] = row.value;
+    }
+  } catch (error) {
+    console.error("service_settings read failed (using defaults):", error);
+  }
+  return out;
+}
+__name(getServiceSettings, "getServiceSettings");
+async function setServiceSetting(session, key, value) {
+  if (!SERVICE_SETTING_KEYS.includes(key)) {
+    throw new Error(`unknown setting: ${key}`);
+  }
+  await session.prepare(
+    `INSERT INTO service_settings (key, value, updated_at) VALUES (?, ?, strftime('%s', 'now'))
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`
+  ).bind(key, value).run();
+}
+__name(setServiceSetting, "setServiceSetting");
+
+// src/service/pay.ts
+async function recordPayment(session, pubkey, method, amount, proof, payerDetail) {
+  try {
+    await session.prepare(
+      `INSERT INTO deploy_payments (pubkey, method, amount, proof, payer_detail)
+         VALUES (?, ?, ?, ?, ?)`
+    ).bind(pubkey, method, amount, proof, payerDetail ?? null).run();
+    return { ok: true };
+  } catch (error) {
+    if (String(error?.message ?? "").includes("UNIQUE")) {
+      return { ok: false, error: "this payment proof was already used" };
+    }
+    console.error("recordPayment failed:", error);
+    return { ok: false, error: "could not record payment" };
+  }
+}
+__name(recordPayment, "recordPayment");
+async function hasDeployCredit(session, pubkey) {
+  const row = await session.prepare("SELECT id FROM deploy_payments WHERE pubkey = ? AND used_at IS NULL LIMIT 1").bind(pubkey).first();
+  return row !== null;
+}
+__name(hasDeployCredit, "hasDeployCredit");
+async function consumeDeployCredit(session, pubkey) {
+  const row = await session.prepare("SELECT id FROM deploy_payments WHERE pubkey = ? AND used_at IS NULL ORDER BY id ASC LIMIT 1").bind(pubkey).first();
+  if (!row)
+    return null;
+  await session.prepare("UPDATE deploy_payments SET used_at = strftime('%s', 'now') WHERE id = ?").bind(row.id).run();
+  return row.id;
+}
+__name(consumeDeployCredit, "consumeDeployCredit");
+async function payWithLightning(session, event, claimedPubkey, verifySig) {
+  const settings = await getServiceSettings(session);
+  const priceSats = parseInt(settings.deploy_price_sats, 10);
+  const verified = await verifyZapReceipt(event, settings.zap_npub, priceSats, verifySig);
+  if (!verified) {
+    return { ok: false, error: "invalid zap receipt (recipient, amount, or signature)" };
+  }
+  if (verified.payer !== claimedPubkey) {
+    return { ok: false, error: "zap sender (P tag) does not match the logged-in pubkey" };
+  }
+  return recordPayment(
+    session,
+    claimedPubkey,
+    "lightning",
+    String(verified.amountSats),
+    verified.receiptId,
+    verified.bolt11?.slice(0, 64)
+  );
+}
+__name(payWithLightning, "payWithLightning");
+var TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+async function baseRpc(method, params) {
+  const res = await fetch(BASE_RPC_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })
+  });
+  if (!res.ok)
+    throw new Error(`Base RPC HTTP ${res.status}`);
+  const data = await res.json();
+  if (data.error)
+    throw new Error(`Base RPC ${data.error.message || "error"}`);
+  return data.result;
+}
+__name(baseRpc, "baseRpc");
+function toAddress(topicOrAddress) {
+  return "0x" + topicOrAddress.slice(-40).toLowerCase();
+}
+__name(toAddress, "toAddress");
+async function payWithPre(session, txHash, claimedPubkey) {
+  if (!/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
+    return { ok: false, error: "not a valid transaction hash" };
+  }
+  const settings = await getServiceSettings(session);
+  const serviceAddress = settings.pre_address.toLowerCase();
+  if (!/^0x[0-9a-f]{40}$/.test(serviceAddress)) {
+    return { ok: false, error: "service PRE wallet is not configured" };
+  }
+  let receipt;
+  try {
+    receipt = await baseRpc("eth_getTransactionReceipt", [txHash]);
+  } catch (error) {
+    return { ok: false, error: `could not reach Base RPC: ${error.message}` };
+  }
+  if (!receipt || !receipt.status) {
+    return { ok: false, error: "transaction not found on Base yet \u2014 try again in a few seconds" };
+  }
+  if (receipt.status !== "0x1") {
+    return { ok: false, error: "transaction failed on-chain" };
+  }
+  const pricePre = BigInt(settings.deploy_price_pre || "0");
+  const minValue = pricePre * 10n ** BigInt(PRE_TOKEN_DECIMALS);
+  const contract = PRE_TOKEN_CONTRACT.toLowerCase();
+  const matching = (receipt.logs ?? []).filter((log) => {
+    if (log.address.toLowerCase() !== contract)
+      return false;
+    if (log.topics?.[0]?.toLowerCase() !== TRANSFER_TOPIC)
+      return false;
+    if (toAddress(log.topics[2] || "") !== serviceAddress)
+      return false;
+    let value = 0n;
+    try {
+      value = BigInt(log.data);
+    } catch {
+      return false;
+    }
+    return value >= minValue;
+  });
+  if (matching.length === 0) {
+    return { ok: false, error: "no qualifying PRE transfer to the service wallet in this transaction" };
+  }
+  return recordPayment(
+    session,
+    claimedPubkey,
+    "pre",
+    settings.deploy_price_pre,
+    txHash.toLowerCase(),
+    receipt.from?.toLowerCase()
+  );
+}
+__name(payWithPre, "payWithPre");
+
+// src/service/deploy.ts
+var CF_API = "https://api.cloudflare.com/client/v4";
+function slugifyWorkerName(name) {
+  return name.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 48);
+}
+__name(slugifyWorkerName, "slugifyWorkerName");
+async function cfApi(token, path, options = {}) {
+  try {
+    const headers = { Authorization: `Bearer ${token}` };
+    let body;
+    if (options.form) {
+      body = options.form;
+    } else if (options.body !== void 0) {
+      headers["Content-Type"] = "application/json";
+      body = JSON.stringify(options.body);
+    }
+    const res = await fetch(`${CF_API}${path}`, { method: options.method ?? (body ? "POST" : "GET"), headers, body });
+    const data = await res.json().catch(() => null);
+    if (!res.ok || !data?.success) {
+      const msg = data?.errors?.[0]?.message ?? `HTTP ${res.status}`;
+      return { ok: false, error: String(msg) };
+    }
+    return { ok: true, data: data.result };
+  } catch (error) {
+    return { ok: false, error: `network: ${error?.message ?? error}` };
+  }
+}
+__name(cfApi, "cfApi");
+async function orchestrateDeploy(req) {
+  const steps = [];
+  const workerName = slugifyWorkerName(req.workerName);
+  if (!workerName || workerName.length < 3) {
+    return { ok: false, error: "worker name must be 3+ chars of a-z, 0-9, -", steps };
+  }
+  if (!/^[0-9a-f]{64}$/.test(req.pubkey)) {
+    return { ok: false, error: "invalid pubkey", steps };
+  }
+  if (!/^[0-9a-f]{32}$/i.test(req.cfAccountId)) {
+    return { ok: false, error: "invalid Cloudflare account id (32 hex chars)", steps };
+  }
+  const verify = await cfApi(req.cfToken, "/user/tokens/verify");
+  if (!verify.ok) {
+    steps.push({ step: "verify-token", ok: false, detail: verify.error });
+    return { ok: false, error: `Cloudflare token check failed: ${verify.error}`, steps };
+  }
+  steps.push({ step: "verify-token", ok: true });
+  const dbName = `${workerName}-db`;
+  let databaseId;
+  const created = await cfApi(req.cfToken, `/accounts/${req.cfAccountId}/d1/database`, {
+    body: { name: dbName }
+  });
+  if (created.ok && created.data?.uuid) {
+    databaseId = created.data.uuid;
+    steps.push({ step: "create-d1", ok: true, detail: dbName });
+  } else {
+    const list = await cfApi(req.cfToken, `/accounts/${req.cfAccountId}/d1/database`);
+    const existing = list.data?.find((d) => d?.name === dbName);
+    if (existing?.uuid) {
+      databaseId = existing.uuid;
+      steps.push({ step: "create-d1", ok: true, detail: `${dbName} (existing)` });
+    } else {
+      steps.push({ step: "create-d1", ok: false, detail: created.error });
+      return { ok: false, error: `D1 create failed: ${created.error}`, steps };
+    }
+  }
+  let bundle;
+  try {
+    const res = await fetch(DEPLOY_BUNDLE_URL);
+    if (!res.ok)
+      throw new Error(`HTTP ${res.status}`);
+    bundle = await res.text();
+    if (bundle.length < 1e4 || !bundle.includes("RelayWebSocket")) {
+      throw new Error("bundle looks wrong");
+    }
+    steps.push({ step: "fetch-bundle", ok: true, detail: `${bundle.length} bytes` });
+  } catch (error) {
+    steps.push({ step: "fetch-bundle", ok: false, detail: error?.message });
+    return { ok: false, error: `could not fetch the relay bundle: ${error?.message ?? error}`, steps };
+  }
+  const metadata = {
+    main_module: "worker.js",
+    compatibility_date: "2025-06-01",
+    bindings: [
+      { name: "RELAY_DATABASE", type: "d1", id: databaseId },
+      { name: "RELAY_WEBSOCKET", type: "durable_object_namespace", class_name: "RelayWebSocket" }
+    ],
+    migrations: { new_tag: "v4", new_sqlite_classes: ["RelayWebSocket"] }
+  };
+  const form = new FormData();
+  form.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+  form.append("worker.js", new Blob([bundle], { type: "application/javascript+module" }), "worker.js");
+  const upload = await cfApi(req.cfToken, `/accounts/${req.cfAccountId}/workers/scripts/${workerName}`, {
+    method: "PUT",
+    form
+  });
+  if (!upload.ok) {
+    if (upload.error?.includes("migration tag precondition")) {
+      delete metadata.migrations;
+      const retryForm = new FormData();
+      retryForm.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
+      retryForm.append("worker.js", new Blob([bundle], { type: "application/javascript+module" }), "worker.js");
+      const retry = await cfApi(req.cfToken, `/accounts/${req.cfAccountId}/workers/scripts/${workerName}`, {
+        method: "PUT",
+        form: retryForm
+      });
+      if (!retry.ok) {
+        steps.push({ step: "upload-worker", ok: false, detail: retry.error });
+        return { ok: false, error: `worker upload failed: ${retry.error}`, steps };
+      }
+    } else {
+      steps.push({ step: "upload-worker", ok: false, detail: upload.error });
+      return { ok: false, error: `worker upload failed: ${upload.error}`, steps };
+    }
+  }
+  steps.push({ step: "upload-worker", ok: true, detail: workerName });
+  let accountSubdomain;
+  const sub = await cfApi(req.cfToken, `/accounts/${req.cfAccountId}/workers/subdomain`);
+  accountSubdomain = sub.data?.subdomain;
+  if (!accountSubdomain) {
+    const suggested = slugifyWorkerName(`${workerName}-relay`).replace(/-+/g, "-");
+    const claim = await cfApi(req.cfToken, `/accounts/${req.cfAccountId}/workers/subdomain`, {
+      method: "PUT",
+      body: { subdomain: suggested }
+    });
+    if (claim.ok && claim.data?.subdomain) {
+      accountSubdomain = claim.data.subdomain;
+      steps.push({ step: "account-subdomain", ok: true, detail: `claimed ${accountSubdomain}.workers.dev` });
+    } else {
+      steps.push({
+        step: "account-subdomain",
+        ok: false,
+        detail: "no workers.dev subdomain on this account \u2014 set one in the Cloudflare dashboard (Workers \u2192 your subdomain), then enable the route"
+      });
+    }
+  }
+  if (accountSubdomain) {
+    const enable = await cfApi(req.cfToken, `/accounts/${req.cfAccountId}/workers/scripts/${workerName}/subdomain`, {
+      body: { enabled: true }
+    });
+    steps.push({ step: "enable-subdomain", ok: enable.ok, detail: enable.error });
+  }
+  const httpsUrl = accountSubdomain ? `https://${workerName}.${accountSubdomain}.workers.dev` : void 0;
+  const wssUrl = accountSubdomain ? `wss://${workerName}.${accountSubdomain}.workers.dev` : void 0;
+  return {
+    ok: true,
+    steps,
+    relay_https_url: httpsUrl,
+    relay_wss_url: wssUrl
+  };
+}
+__name(orchestrateDeploy, "orchestrateDeploy");
+
+// src/service/auth.ts
+var KIND_HTTP_AUTH = 27235;
+var FRESHNESS_SECONDS = 300;
+function hexToBytes3(hex) {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < bytes.length; i++)
+    bytes[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return bytes;
+}
+__name(hexToBytes3, "hexToBytes");
+function bytesToHex3(bytes) {
+  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+__name(bytesToHex3, "bytesToHex");
+function base64UrlDecode(s) {
+  const b64 = s.replace(/-/g, "+").replace(/_/g, "/");
+  const padded = b64 + "=".repeat((4 - b64.length % 4) % 4);
+  const bin = atob(padded);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++)
+    bytes[i] = bin.charCodeAt(i);
+  return new TextDecoder().decode(bytes);
+}
+__name(base64UrlDecode, "base64UrlDecode");
+async function sha256Hex2(text) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+  return bytesToHex3(new Uint8Array(digest));
+}
+__name(sha256Hex2, "sha256Hex");
+async function verifySignedEvent(event) {
+  try {
+    const serialized = JSON.stringify([0, event.pubkey, event.created_at, event.kind, event.tags, event.content]);
+    const hash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(serialized)));
+    if (bytesToHex3(hash) !== event.id)
+      return false;
+    return schnorr.verify(hexToBytes3(event.sig), hash, hexToBytes3(event.pubkey));
+  } catch {
+    return false;
+  }
+}
+__name(verifySignedEvent, "verifySignedEvent");
+async function verifyAdminAuth(request, rawBody) {
+  const header = request.headers.get("Authorization") || "";
+  const match = /^Nostr\s+(.+)$/.exec(header);
+  if (!match)
+    return { ok: false, error: "missing Nostr auth event" };
+  let event;
+  try {
+    event = JSON.parse(base64UrlDecode(match[1]));
+  } catch {
+    return { ok: false, error: "malformed auth event" };
+  }
+  if (!event || event.kind !== KIND_HTTP_AUTH) {
+    return { ok: false, error: `auth event must be kind ${KIND_HTTP_AUTH}` };
+  }
+  if (event.pubkey !== SERVICE_OWNER_PUBKEY) {
+    return { ok: false, error: "not the service owner" };
+  }
+  const now = Math.floor(Date.now() / 1e3);
+  if (Math.abs(now - event.created_at) > FRESHNESS_SECONDS) {
+    return { ok: false, error: "auth event expired" };
+  }
+  const tag = /* @__PURE__ */ __name((name) => event.tags.find((t) => t[0] === name)?.[1], "tag");
+  if (tag("u") !== request.url) {
+    return { ok: false, error: "u tag mismatch" };
+  }
+  if ((tag("method") || "").toUpperCase() !== request.method.toUpperCase()) {
+    return { ok: false, error: "method tag mismatch" };
+  }
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    const payloadHash = await sha256Hex2(rawBody || "");
+    if (tag("payload") !== payloadHash) {
+      return { ok: false, error: "payload hash mismatch" };
+    }
+  }
+  if (!await verifySignedEvent(event)) {
+    return { ok: false, error: "invalid signature" };
+  }
+  return { ok: true };
+}
+__name(verifyAdminAuth, "verifyAdminAuth");
+
+// src/service/routes.ts
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+      "Cache-Control": "no-store"
+    }
+  });
+}
+__name(json, "json");
+function dayKey(ip) {
+  return `${ip}:${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10)}`;
+}
+__name(dayKey, "dayKey");
+async function checkIpRate(session, ip) {
+  if (!ip)
+    return true;
+  const key = dayKey(ip);
+  const row = await session.prepare(
+    `INSERT INTO deploy_rate (ip_day, count) VALUES (?, 1)
+       ON CONFLICT(ip_day) DO UPDATE SET count = count + 1
+       RETURNING count`
+  ).bind(key).first();
+  return (row?.count ?? 1) <= DEPLOY_MAX_PER_IP_PER_DAY;
+}
+__name(checkIpRate, "checkIpRate");
+async function authedPubkey(request, rawBody) {
+  const header = request.headers.get("Authorization") || "";
+  const match = /^Nostr\s+(.+)$/.exec(header);
+  if (!match)
+    return null;
+  let event;
+  try {
+    const b64 = match[1].replace(/-/g, "+").replace(/_/g, "/");
+    const bin = atob(b64 + "=".repeat((4 - b64.length % 4) % 4));
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++)
+      bytes[i] = bin.charCodeAt(i);
+    event = JSON.parse(new TextDecoder().decode(bytes));
+  } catch {
+    return null;
+  }
+  if (!event || event.kind !== 27242 && event.kind !== 27235)
+    return null;
+  const now = Math.floor(Date.now() / 1e3);
+  if (Math.abs(now - event.created_at) > 300)
+    return null;
+  const tag = /* @__PURE__ */ __name((name) => event.tags.find((t) => t[0] === name)?.[1], "tag");
+  if (tag("u") !== request.url)
+    return null;
+  if ((tag("method") || "").toUpperCase() !== request.method.toUpperCase())
+    return null;
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(rawBody || ""));
+    const payloadHash = Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+    if (tag("payload") !== payloadHash)
+      return null;
+  }
+  if (!await verifyEventSignature(event))
+    return null;
+  return event.pubkey;
+}
+__name(authedPubkey, "authedPubkey");
+async function handleServiceApi(request, env, url) {
+  if (!DEPLOY_SERVICE_ENABLED) {
+    return json({ error: "deploy service is disabled on this relay" }, 404);
+  }
+  const path = url.pathname.replace(/^\/api\/service\/?/, "");
+  const session = env.RELAY_DATABASE.withSession("first-primary");
+  const rawBody = request.method === "GET" || request.method === "HEAD" ? "" : await request.text();
+  if (path === "config" && request.method === "GET") {
+    const s = await getServiceSettings(session);
+    return json({
+      enabled: true,
+      owner_npub: DEPLOY_ZAP_NPUB,
+      owner_pubkey: SERVICE_OWNER_PUBKEY,
+      deploy_price_sats: Number(s.deploy_price_sats),
+      deploy_price_pre: Number(s.deploy_price_pre),
+      zap_npub: s.zap_npub,
+      pre: {
+        address: s.pre_address,
+        token_contract: PRE_TOKEN_CONTRACT,
+        chain_id: BASE_CHAIN_ID,
+        network: "Base",
+        decimals: PRE_TOKEN_DECIMALS
+      },
+      relay_repo: "https://github.com/NostrDanish/SIP-Booster-Relay"
+    });
+  }
+  if (path === "pay/lightning" && request.method === "POST") {
+    const pubkey = await authedPubkey(request, rawBody);
+    if (!pubkey)
+      return json({ error: "sign in with Nostr first (signed auth required)" }, 401);
+    let body;
+    try {
+      body = JSON.parse(rawBody);
+    } catch {
+      return json({ error: "invalid JSON" }, 400);
+    }
+    if (!body?.event)
+      return json({ error: "missing zap receipt event" }, 400);
+    const result = await payWithLightning(session, body.event, pubkey, verifyEventSignature);
+    return result.ok ? json({ ok: true }) : json({ error: result.error }, 400);
+  }
+  if (path === "pay/pre" && request.method === "POST") {
+    const pubkey = await authedPubkey(request, rawBody);
+    if (!pubkey)
+      return json({ error: "sign in with Nostr first (signed auth required)" }, 401);
+    let body;
+    try {
+      body = JSON.parse(rawBody);
+    } catch {
+      return json({ error: "invalid JSON" }, 400);
+    }
+    if (!body?.txHash)
+      return json({ error: "missing txHash" }, 400);
+    const result = await payWithPre(session, String(body.txHash), pubkey);
+    return result.ok ? json({ ok: true }) : json({ error: result.error }, 400);
+  }
+  if (path === "payment-status" && request.method === "GET") {
+    const pubkey = url.searchParams.get("pubkey") || "";
+    if (!/^[0-9a-f]{64}$/.test(pubkey))
+      return json({ error: "invalid pubkey" }, 400);
+    return json({ paid: await hasDeployCredit(session, pubkey) });
+  }
+  if (path === "deploy" && request.method === "POST") {
+    const pubkey = await authedPubkey(request, rawBody);
+    if (!pubkey)
+      return json({ error: "sign in with Nostr first (signed auth required)" }, 401);
+    let body;
+    try {
+      body = JSON.parse(rawBody);
+    } catch {
+      return json({ error: "invalid JSON" }, 400);
+    }
+    if (!await hasDeployCredit(session, pubkey)) {
+      return json({ error: "payment required \u2014 pay first (Lightning or PRE)", paid: false }, 402);
+    }
+    const ip = request.headers.get("CF-Connecting-IP") || "";
+    if (!await checkIpRate(session, ip)) {
+      return json({ error: "too many deployments from this IP today" }, 429);
+    }
+    const creditId = await consumeDeployCredit(session, pubkey);
+    let result;
+    try {
+      result = await orchestrateDeploy({
+        pubkey,
+        cfToken: String(body.cfToken || ""),
+        cfAccountId: String(body.cfAccountId || ""),
+        workerName: String(body.workerName || "")
+      });
+    } catch (error) {
+      result = { ok: false, error: error?.message ?? "deploy failed", steps: [] };
+    }
+    if (result.ok && creditId !== null) {
+      await session.prepare("INSERT INTO deploy_jobs (pubkey, worker_name, relay_url, payment_id) VALUES (?, ?, ?, ?)").bind(pubkey, String(body.workerName || ""), result.relay_wss_url ?? "", creditId).run().catch((e) => console.error("deploy_jobs insert failed:", e));
+    } else if (!result.ok && creditId !== null) {
+      await session.prepare("UPDATE deploy_payments SET used_at = NULL WHERE id = ?").bind(creditId).run().catch(() => void 0);
+    }
+    return json(result, result.ok ? 200 : 502);
+  }
+  if (path.startsWith("admin/")) {
+    const auth = await verifyAdminAuth(request, rawBody);
+    if (!auth.ok)
+      return json({ error: `unauthorized: ${auth.error}` }, 401);
+    if (path === "admin/settings" && request.method === "GET") {
+      return json({ settings: await getServiceSettings(session), keys: SERVICE_SETTING_KEYS });
+    }
+    if (path === "admin/settings" && request.method === "POST") {
+      let body;
+      try {
+        body = JSON.parse(rawBody);
+      } catch {
+        return json({ error: "invalid JSON" }, 400);
+      }
+      const key = String(body?.key ?? "");
+      const value = String(body?.value ?? "").trim();
+      if (!SERVICE_SETTING_KEYS.includes(key))
+        return json({ error: "unknown setting" }, 400);
+      if ((key === "deploy_price_sats" || key === "deploy_price_pre") && !/^\d{1,12}$/.test(value)) {
+        return json({ error: "price must be a positive integer" }, 400);
+      }
+      if (key === "zap_npub" && !/^npub1[02-9ac-hj-np-z]{20,}$/.test(value)) {
+        return json({ error: "zap_npub must be a valid npub" }, 400);
+      }
+      if (key === "pre_address" && !/^0x[0-9a-fA-F]{40}$/.test(value)) {
+        return json({ error: "pre_address must be a 0x EVM address" }, 400);
+      }
+      await setServiceSetting(session, key, value);
+      return json({ ok: true, settings: await getServiceSettings(session) });
+    }
+    if (path === "admin/payments" && request.method === "GET") {
+      const rows = await session.prepare("SELECT id, pubkey, method, amount, proof, payer_detail, created_at, used_at FROM deploy_payments ORDER BY id DESC LIMIT 200").all();
+      return json({ payments: rows.results ?? [] });
+    }
+    if (path === "admin/jobs" && request.method === "GET") {
+      const rows = await session.prepare("SELECT id, pubkey, worker_name, relay_url, payment_id, created_at FROM deploy_jobs ORDER BY id DESC LIMIT 200").all();
+      return json({ jobs: rows.results ?? [] });
+    }
+    return json({ error: "unknown admin endpoint" }, 404);
+  }
+  return json({ error: "unknown service endpoint" }, 404);
+}
+__name(handleServiceApi, "handleServiceApi");
 
 // src/relay-worker.ts
 var {
@@ -4951,7 +5611,10 @@ async function initializeDatabase(db) {
       `CREATE INDEX IF NOT EXISTS idx_content_hashes_created_at ON content_hashes(created_at DESC)`,
       `CREATE INDEX IF NOT EXISTS idx_content_hashes_pubkey_created ON content_hashes(pubkey, created_at DESC)`,
       // SIP-01 tables (documents / observations / indexers / metrics)
-      ...SIP01_SCHEMA_STATEMENTS
+      ...SIP01_SCHEMA_STATEMENTS,
+      // Hosted deploy service tables (service_settings / deploy_payments /
+      // deploy_jobs / deploy_rate)
+      ...SERVICE_SCHEMA_STATEMENTS
     ];
     for (const statement of statements) {
       await session.prepare(statement).run();
@@ -5001,14 +5664,14 @@ async function initializeDatabase(db) {
 __name(initializeDatabase, "initializeDatabase");
 async function verifyEventSignature(event) {
   try {
-    const signatureBytes = hexToBytes3(event.sig);
+    const signatureBytes = hexToBytes4(event.sig);
     const serializedEventData = serializeEventForSigning(event);
     const messageHashBuffer = await crypto.subtle.digest(
       "SHA-256",
       new TextEncoder().encode(serializedEventData)
     );
     const messageHash = new Uint8Array(messageHashBuffer);
-    const publicKeyBytes = hexToBytes3(event.pubkey);
+    const publicKeyBytes = hexToBytes4(event.pubkey);
     return schnorr.verify(signatureBytes, messageHash, publicKeyBytes);
   } catch (error) {
     console.error("Error verifying event signature:", error);
@@ -5023,7 +5686,7 @@ async function verifyEventId(event) {
       "SHA-256",
       new TextEncoder().encode(serializedEventData)
     );
-    return bytesToHex3(new Uint8Array(messageHashBuffer)) === event.id;
+    return bytesToHex4(new Uint8Array(messageHashBuffer)) === event.id;
   } catch {
     return false;
   }
@@ -5040,7 +5703,7 @@ function serializeEventForSigning(event) {
   ]);
 }
 __name(serializeEventForSigning, "serializeEventForSigning");
-function hexToBytes3(hexString) {
+function hexToBytes4(hexString) {
   if (hexString.length % 2 !== 0)
     throw new Error("Invalid hex string");
   const bytes = new Uint8Array(hexString.length / 2);
@@ -5049,16 +5712,16 @@ function hexToBytes3(hexString) {
   }
   return bytes;
 }
-__name(hexToBytes3, "hexToBytes");
-function bytesToHex3(bytes) {
+__name(hexToBytes4, "hexToBytes");
+function bytesToHex4(bytes) {
   return Array.from(bytes).map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
-__name(bytesToHex3, "bytesToHex");
+__name(bytesToHex4, "bytesToHex");
 async function hashContent(event) {
   const contentToHash = enableGlobalDuplicateCheck2 ? JSON.stringify({ kind: event.kind, tags: event.tags, content: event.content }) : JSON.stringify({ pubkey: event.pubkey, kind: event.kind, tags: event.tags, content: event.content });
   const buffer = new TextEncoder().encode(contentToHash);
   const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
-  return bytesToHex3(new Uint8Array(hashBuffer));
+  return bytesToHex4(new Uint8Array(hashBuffer));
 }
 __name(hashContent, "hashContent");
 function shouldCheckForDuplicates(kind) {
@@ -6265,7 +6928,7 @@ async function handlePaymentNotification(request, env) {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
       });
     }
-    const verified = await verifyZapReceipt(receipt, relayNpub2, verifyEventSignature);
+    const verified = await verifyZapReceipt(receipt, relayNpub2, RELAY_ACCESS_PRICE_SATS2, verifyEventSignature);
     if (!verified) {
       return new Response(JSON.stringify({ error: "Invalid zap receipt" }), {
         status: 400,
@@ -6792,11 +7455,26 @@ var relay_worker_default = {
   async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
+      if (request.method === "OPTIONS" && url.pathname.startsWith("/api/")) {
+        return new Response(null, {
+          status: 204,
+          headers: {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "Content-Type, Authorization",
+            "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+            "Access-Control-Max-Age": "86400"
+          }
+        });
+      }
       if (request.method === "POST" && url.searchParams.has("notify-zap") && PAY_TO_RELAY_ENABLED2) {
         return await handlePaymentNotification(request, env);
       }
       if (url.pathname === "/api/check-payment" && PAY_TO_RELAY_ENABLED2) {
         return await handleCheckPayment(request, env);
+      }
+      if (url.pathname.startsWith("/api/service/")) {
+        await ensureDatabase(env.RELAY_DATABASE);
+        return await handleServiceApi(request, env, url);
       }
       if (url.pathname.startsWith("/api/")) {
         await ensureDatabase(env.RELAY_DATABASE);
