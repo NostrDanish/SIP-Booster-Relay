@@ -45,6 +45,8 @@ export async function getSip01Stats(session: Session) {
   const dayAgo = now - 86400;
   const weekAgo = now - 7 * 86400;
 
+  // One round trip: D1 sessions do not support overlapping queries on a
+  // single session object, so all statements go through a single batch.
   const [
     totals,
     last24h,
@@ -55,47 +57,39 @@ export async function getSip01Stats(session: Session) {
     topTypes,
     topIndexers,
     topSoftware,
-    metrics,
-    sizeBytes,
-  ] = await Promise.all([
-    session
-      .prepare(
-        `SELECT
-           (SELECT COUNT(*) FROM sip01_documents) AS documents,
-           (SELECT COUNT(*) FROM sip01_observations) AS observations,
-           (SELECT COUNT(*) FROM sip01_indexers) AS indexers`,
-      )
-      .first(),
-    session.prepare('SELECT COUNT(*) AS n FROM sip01_observations WHERE created_at >= ?').bind(dayAgo).first(),
-    session.prepare('SELECT COUNT(*) AS n FROM sip01_observations WHERE created_at >= ?').bind(weekAgo).first(),
-    session
-      .prepare('SELECT url_host, COUNT(*) AS n FROM sip01_documents GROUP BY url_host ORDER BY n DESC LIMIT 10')
-      .all(),
-    session
-      .prepare("SELECT language, COUNT(*) AS n FROM sip01_documents WHERE language IS NOT NULL GROUP BY language ORDER BY n DESC LIMIT 10")
-      .all(),
-    session
-      .prepare("SELECT content_type, COUNT(*) AS n FROM sip01_documents WHERE content_type IS NOT NULL GROUP BY content_type ORDER BY n DESC LIMIT 10")
-      .all(),
-    session
-      .prepare("SELECT doc_type, COUNT(*) AS n FROM sip01_documents WHERE doc_type IS NOT NULL GROUP BY doc_type ORDER BY n DESC LIMIT 10")
-      .all(),
-    session
-      .prepare('SELECT pubkey, software, software_version, observation_count, document_count, last_seen FROM sip01_indexers ORDER BY observation_count DESC LIMIT 10')
-      .all(),
-    session
-      .prepare("SELECT software, COUNT(*) AS n, SUM(observation_count) AS observations FROM sip01_indexers WHERE software IS NOT NULL GROUP BY software ORDER BY observations DESC LIMIT 10")
-      .all(),
-    getMetrics(session),
-    getDatabaseSizeBytes(session),
+    metricsRows,
+  ] = await session.batch([
+    session.prepare(
+      `SELECT
+         (SELECT COUNT(*) FROM sip01_documents) AS documents,
+         (SELECT COUNT(*) FROM sip01_observations) AS observations,
+         (SELECT COUNT(*) FROM sip01_indexers) AS indexers`,
+    ),
+    session.prepare('SELECT COUNT(*) AS n FROM sip01_observations WHERE created_at >= ?').bind(dayAgo),
+    session.prepare('SELECT COUNT(*) AS n FROM sip01_observations WHERE created_at >= ?').bind(weekAgo),
+    session.prepare('SELECT url_host, COUNT(*) AS n FROM sip01_documents GROUP BY url_host ORDER BY n DESC LIMIT 10'),
+    session.prepare("SELECT language, COUNT(*) AS n FROM sip01_documents WHERE language IS NOT NULL GROUP BY language ORDER BY n DESC LIMIT 10"),
+    session.prepare("SELECT content_type, COUNT(*) AS n FROM sip01_documents WHERE content_type IS NOT NULL GROUP BY content_type ORDER BY n DESC LIMIT 10"),
+    session.prepare("SELECT doc_type, COUNT(*) AS n FROM sip01_documents WHERE doc_type IS NOT NULL GROUP BY doc_type ORDER BY n DESC LIMIT 10"),
+    session.prepare('SELECT pubkey, software, software_version, observation_count, document_count, last_seen FROM sip01_indexers ORDER BY observation_count DESC LIMIT 10'),
+    session.prepare("SELECT software, COUNT(*) AS n, SUM(observation_count) AS observations FROM sip01_indexers WHERE software IS NOT NULL GROUP BY software ORDER BY observations DESC LIMIT 10"),
+    session.prepare('SELECT key, value FROM relay_metrics'),
   ]);
 
+  const metrics: Record<string, number> = {};
+  for (const row of metricsRows.results ?? []) {
+    metrics[row.key as string] = row.value as number;
+  }
+
+  const sizeBytes = await getDatabaseSizeBytes(session);
+
+  const totalsRow = (totals.results?.[0] ?? {}) as Record<string, number>;
   return {
-    documents: (totals?.documents as number) ?? 0,
-    observations: (totals?.observations as number) ?? 0,
-    indexers: (totals?.indexers as number) ?? 0,
-    observations_24h: (last24h?.n as number) ?? 0,
-    observations_7d: (last7d?.n as number) ?? 0,
+    documents: totalsRow.documents ?? 0,
+    observations: totalsRow.observations ?? 0,
+    indexers: totalsRow.indexers ?? 0,
+    observations_24h: ((last24h.results?.[0]?.n as number) ?? 0),
+    observations_7d: ((last7d.results?.[0]?.n as number) ?? 0),
     top_hosts: topHosts.results ?? [],
     top_languages: topLanguages.results ?? [],
     top_mime_types: topMimes.results ?? [],
