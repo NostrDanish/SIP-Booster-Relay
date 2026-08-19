@@ -30,7 +30,7 @@ jobs:
           set -o pipefail
           {
             echo "== npm install =="
-            npm install
+            npm install --legacy-peer-deps
             echo "== build =="
             node scripts/build.mjs
           } 2>&1 | tee build-output.txt
