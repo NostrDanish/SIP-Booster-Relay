@@ -4068,12 +4068,14 @@ function migrationV7Statements() {
     `CREATE INDEX IF NOT EXISTS idx_cache_multi_type_value_event ON event_tags_cache_multi(tag_type, tag_value, event_id)`,
     `CREATE INDEX IF NOT EXISTS idx_cache_multi_kind_type_value ON event_tags_cache_multi(kind, tag_type, tag_value, created_at DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_cache_multi_event_id ON event_tags_cache_multi(event_id)`,
-    `ALTER TABLE events ADD COLUMN tag_l TEXT`,
+    // NOTE: no tag_l column — SQLite identifiers are case-insensitive, so
+    // `tag_l` collides with the existing `tag_L` (the 'L' tag). The 'l' tag
+    // is fully indexed via event_tags_cache_multi (values are case-sensitive)
+    // and needs no first-value column.
     `ALTER TABLE events ADD COLUMN tag_x TEXT`,
     `UPDATE events SET
-      tag_l = (SELECT tag_value FROM tags WHERE event_id = events.id AND tag_name = 'l' LIMIT 1),
       tag_x = (SELECT tag_value FROM tags WHERE event_id = events.id AND tag_name = 'x' LIMIT 1)
-      WHERE EXISTS (SELECT 1 FROM tags t WHERE t.event_id = events.id AND t.tag_name IN ('l', 'x'))`
+      WHERE EXISTS (SELECT 1 FROM tags t WHERE t.event_id = events.id AND t.tag_name = 'x')`
   ];
 }
 __name(migrationV7Statements, "migrationV7Statements");
@@ -4901,7 +4903,6 @@ async function initializeDatabase(db) {
         tag_L TEXT,
         tag_s TEXT,
         tag_u TEXT,
-        tag_l TEXT,
         tag_x TEXT,
         reply_to_event_id TEXT,
         root_event_id TEXT,
@@ -5276,8 +5277,8 @@ async function saveEventToDatabase(event, env) {
     const rootEventId = eTags.length > 1 ? eTags[eTags.length - 1] : null;
     const contentPreview = event.content.substring(0, 100);
     const insertResult = await session.prepare(`
-      INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, tag_p, tag_e, tag_a, tag_t, tag_d, tag_r, tag_L, tag_s, tag_u, tag_l, tag_x, reply_to_event_id, root_event_id, content_preview)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, tag_p, tag_e, tag_a, tag_t, tag_d, tag_r, tag_L, tag_s, tag_u, tag_x, reply_to_event_id, root_event_id, content_preview)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO NOTHING
     `).bind(
       event.id,
@@ -5296,7 +5297,6 @@ async function saveEventToDatabase(event, env) {
       firstValues["L"],
       firstValues["s"],
       firstValues["u"],
-      firstValues["l"],
       firstValues["x"],
       replyToEventId,
       rootEventId,
@@ -6333,12 +6333,24 @@ async function handleApiRequest(url, request, env) {
   if (path === "/api/health") {
     const session2 = env.RELAY_DATABASE.withSession("first-unconstrained");
     let events = 0;
+    let schemaOk = false;
     try {
       const row = await session2.prepare("SELECT COUNT(*) AS n FROM events").first();
       events = row?.n ?? 0;
+      const tables = await session2.prepare(
+        "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name IN ('events', 'sip01_documents', 'sip01_observations', 'sip01_indexers')"
+      ).first();
+      schemaOk = (tables?.n ?? 0) === 4;
     } catch {
     }
-    return jsonResponse({ status: "ok", events, mode: RELAY_MODE2, version: relayInfo2.version, time: Math.floor(Date.now() / 1e3) });
+    return jsonResponse({
+      status: schemaOk ? "ok" : "initializing-or-degraded",
+      events,
+      schema_ok: schemaOk,
+      mode: RELAY_MODE2,
+      version: relayInfo2.version,
+      time: Math.floor(Date.now() / 1e3)
+    });
   }
   if (!SIP01_INDEXING2) {
     return jsonResponse({ error: "SIP-01 indexing is disabled on this relay" }, 404);
