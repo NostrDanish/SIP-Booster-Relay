@@ -119,12 +119,14 @@ export function migrationV7Statements(): string[] {
     `CREATE INDEX IF NOT EXISTS idx_cache_multi_type_value_event ON event_tags_cache_multi(tag_type, tag_value, event_id)`,
     `CREATE INDEX IF NOT EXISTS idx_cache_multi_kind_type_value ON event_tags_cache_multi(kind, tag_type, tag_value, created_at DESC)`,
     `CREATE INDEX IF NOT EXISTS idx_cache_multi_event_id ON event_tags_cache_multi(event_id)`,
-    `ALTER TABLE events ADD COLUMN tag_l TEXT`,
+    // NOTE: no tag_l column — SQLite identifiers are case-insensitive, so
+    // `tag_l` collides with the existing `tag_L` (the 'L' tag). The 'l' tag
+    // is fully indexed via event_tags_cache_multi (values are case-sensitive)
+    // and needs no first-value column.
     `ALTER TABLE events ADD COLUMN tag_x TEXT`,
     `UPDATE events SET
-      tag_l = (SELECT tag_value FROM tags WHERE event_id = events.id AND tag_name = 'l' LIMIT 1),
       tag_x = (SELECT tag_value FROM tags WHERE event_id = events.id AND tag_name = 'x' LIMIT 1)
-      WHERE EXISTS (SELECT 1 FROM tags t WHERE t.event_id = events.id AND t.tag_name IN ('l', 'x'))`,
+      WHERE EXISTS (SELECT 1 FROM tags t WHERE t.event_id = events.id AND t.tag_name = 'x')`,
   ];
 }
 

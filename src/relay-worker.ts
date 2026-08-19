@@ -177,7 +177,6 @@ async function initializeDatabase(db: D1Database): Promise<void> {
         tag_L TEXT,
         tag_s TEXT,
         tag_u TEXT,
-        tag_l TEXT,
         tag_x TEXT,
         reply_to_event_id TEXT,
         root_event_id TEXT,
@@ -654,10 +653,12 @@ async function saveEventToDatabase(event: NostrEvent, env: Env): Promise<{ succe
     const rootEventId = eTags.length > 1 ? eTags[eTags.length - 1] : null;
     const contentPreview = event.content.substring(0, 100);
 
-    // Insert the main event
+    // Insert the main event (note: no tag_l column — SQLite identifiers are
+    // case-insensitive, so tag_l would collide with tag_L. The 'l' tag lives
+    // in the multi-value cache where values are case-sensitive.)
     const insertResult = await session.prepare(`
-      INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, tag_p, tag_e, tag_a, tag_t, tag_d, tag_r, tag_L, tag_s, tag_u, tag_l, tag_x, reply_to_event_id, root_event_id, content_preview)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO events (id, pubkey, created_at, kind, tags, content, sig, tag_p, tag_e, tag_a, tag_t, tag_d, tag_r, tag_L, tag_s, tag_u, tag_x, reply_to_event_id, root_event_id, content_preview)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(id) DO NOTHING
     `).bind(
       event.id,
@@ -676,7 +677,6 @@ async function saveEventToDatabase(event: NostrEvent, env: Env): Promise<{ succe
       firstValues['L'],
       firstValues['s'],
       firstValues['u'],
-      firstValues['l'],
       firstValues['x'],
       replyToEventId,
       rootEventId,
@@ -1992,11 +1992,23 @@ async function handleApiRequest(url: URL, request: Request, env: Env): Promise<R
   if (path === '/api/health') {
     const session = env.RELAY_DATABASE.withSession('first-unconstrained');
     let events = 0;
+    let schemaOk = false;
     try {
       const row = await session.prepare('SELECT COUNT(*) AS n FROM events').first();
       events = (row?.n as number) ?? 0;
+      const tables = await session.prepare(
+        "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'table' AND name IN ('events', 'sip01_documents', 'sip01_observations', 'sip01_indexers')"
+      ).first();
+      schemaOk = ((tables?.n as number) ?? 0) === 4;
     } catch { /* initializing */ }
-    return jsonResponse({ status: 'ok', events, mode: RELAY_MODE, version: relayInfo.version, time: Math.floor(Date.now() / 1000) });
+    return jsonResponse({
+      status: schemaOk ? 'ok' : 'initializing-or-degraded',
+      events,
+      schema_ok: schemaOk,
+      mode: RELAY_MODE,
+      version: relayInfo.version,
+      time: Math.floor(Date.now() / 1000),
+    });
   }
 
   // Everything below requires SIP-01 indexing.
