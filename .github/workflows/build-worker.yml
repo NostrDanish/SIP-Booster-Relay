@@ -1,0 +1,41 @@
+name: Build worker.js
+
+# Builds the self-contained worker.js bundle on every push to main and
+# commits it back. This powers the "dashboard paste" deployment track
+# (docs/DEPLOYMENT.md, Track D) — wrangler deploys do NOT need this artifact
+# (wrangler bundles src/index.ts itself).
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - run: npm install
+
+      - name: Build worker bundle
+        run: node scripts/build.mjs
+
+      - name: Commit worker.js
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f worker.js
+          if git diff --cached --quiet; then
+            echo "worker.js unchanged"
+          else
+            git commit -m "chore: rebuild worker.js bundle [skip ci]"
+            git push
+          fi
