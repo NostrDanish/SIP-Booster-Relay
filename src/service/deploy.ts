@@ -111,16 +111,30 @@ export async function orchestrateDeploy(req: DeployRequest): Promise<DeployResul
     }
   }
 
-  // 3. Fetch the current relay bundle (CI-built worker.js from the repo).
+  // 3. Fetch the current relay bundle (CI-built worker.js from the repo),
+  //    cached at the edge for an hour — deploys beyond the first per colo
+  //    skip the GitHub round trip entirely.
   let bundle: string;
   try {
-    const res = await fetch(config.DEPLOY_BUNDLE_URL);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const cacheReq = new Request(config.DEPLOY_BUNDLE_URL);
+    let res = await caches.default.match(cacheReq);
+    let fromCache = !!res;
+    if (!res || !res.ok) {
+      const fresh = await fetch(config.DEPLOY_BUNDLE_URL);
+      if (!fresh.ok) throw new Error(`HTTP ${fresh.status}`);
+      res = fresh;
+      fromCache = false;
+    }
     bundle = await res.text();
     if (bundle.length < 10000 || !bundle.includes('RelayWebSocket')) {
       throw new Error('bundle looks wrong');
     }
-    steps.push({ step: 'fetch-bundle', ok: true, detail: `${bundle.length} bytes` });
+    if (!fromCache) {
+      await caches.default.put(cacheReq, new Response(bundle, {
+        headers: { 'Cache-Control': 'public, max-age=3600' },
+      }));
+    }
+    steps.push({ step: 'fetch-bundle', ok: true, detail: `${bundle.length} bytes${fromCache ? ' (edge cache)' : ''}` });
   } catch (error: any) {
     steps.push({ step: 'fetch-bundle', ok: false, detail: error?.message });
     return { ok: false, error: `could not fetch the relay bundle: ${error?.message ?? error}`, steps };
