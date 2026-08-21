@@ -84,8 +84,9 @@ export async function payWithLightning(
   event: NostrEvent,
   claimedPubkey: string,
   verifySig: (event: NostrEvent) => Promise<boolean>,
+  env?: import('../types').Env,
 ): Promise<{ ok: boolean; error?: string }> {
-  const settings = await getServiceSettings(session);
+  const settings = await getServiceSettings(session, env);
   const priceSats = parseInt(settings.deploy_price_sats, 10);
 
   const verified = await verifyZapReceipt(event, settings.zap_npub, priceSats, verifySig);
@@ -141,11 +142,12 @@ export async function payWithPre(
   session: Session,
   txHash: string,
   claimedPubkey: string,
+  env?: import('../types').Env,
 ): Promise<{ ok: boolean; error?: string }> {
   if (!/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
     return { ok: false, error: 'not a valid transaction hash' };
   }
-  const settings = await getServiceSettings(session);
+  const settings = await getServiceSettings(session, env);
   const serviceAddress = settings.pre_address.toLowerCase();
   if (!/^0x[0-9a-f]{40}$/.test(serviceAddress)) {
     return { ok: false, error: 'service PRE wallet is not configured' };

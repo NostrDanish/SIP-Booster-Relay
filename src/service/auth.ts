@@ -18,8 +18,8 @@
  */
 
 import { schnorr } from '@noble/curves/secp256k1.js';
-import { SERVICE_OWNER_PUBKEY } from '../config';
-import type { NostrEvent } from '../types';
+import { runtimeOwnerPubkey } from '../runtime-config';
+import type { Env, NostrEvent } from '../types';
 
 const KIND_HTTP_AUTH = 27235;
 const FRESHNESS_SECONDS = 300;
@@ -68,7 +68,7 @@ export interface AdminAuthResult {
  * Verify the admin credentials of a request. `rawBody` must be the exact
  * request body text (empty string for GET).
  */
-export async function verifyAdminAuth(request: Request, rawBody: string): Promise<AdminAuthResult> {
+export async function verifyAdminAuth(request: Request, rawBody: string, env: Env): Promise<AdminAuthResult> {
   const header = request.headers.get('Authorization') || '';
   const match = /^Nostr\s+(.+)$/.exec(header);
   if (!match) return { ok: false, error: 'missing Nostr auth event' };
@@ -83,7 +83,7 @@ export async function verifyAdminAuth(request: Request, rawBody: string): Promis
   if (!event || event.kind !== KIND_HTTP_AUTH) {
     return { ok: false, error: `auth event must be kind ${KIND_HTTP_AUTH}` };
   }
-  if (event.pubkey !== SERVICE_OWNER_PUBKEY) {
+  if (event.pubkey !== runtimeOwnerPubkey(env)) {
     return { ok: false, error: 'not the service owner' };
   }
 

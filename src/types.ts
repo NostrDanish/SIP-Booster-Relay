@@ -87,6 +87,13 @@ export interface Env {
   /** Static assets binding (wrangler [assets]); optional — a minimal inline
    *  landing page is served when absent (single-script paste deploys). */
   ASSETS?: { fetch(request: Request): Promise<Response> };
+  /** Optional plain-text runtime overrides (see src/runtime-config.ts). */
+  RELAY_NAME?: string;
+  RELAY_NPUB?: string;
+  RELAY_PUBKEY?: string;
+  RELAY_CONTACT?: string;
+  SERVICE_OWNER_PUBKEY?: string;
+  DEPLOY_SERVICE_ENABLED?: string;
 }
 
 // Durable Object types

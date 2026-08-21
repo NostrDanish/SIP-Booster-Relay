@@ -55,6 +55,29 @@ function convertBits(data, fromBits, toBits, pad) {
 }
 
 /**
+ * Encode a hex pubkey as a NIP-19 npub. Returns null for malformed input.
+ *
+ * @param {string} hex 64-char hex pubkey
+ * @returns {string | null}
+ */
+export function hexToNpub(hex) {
+  try {
+    if (!/^[0-9a-fA-F]{64}$/.test(hex)) return null;
+    const bytes = new Uint8Array(32);
+    for (let i = 0; i < 32; i++) bytes[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    const words = convertBits([...bytes], 8, 5, true);
+    if (!words) return null;
+    const combined = hrpExpand('npub').concat(words).concat([0, 0, 0, 0, 0, 0]);
+    const mod = polymod(combined) ^ 1;
+    const checksum = [];
+    for (let i = 0; i < 6; i++) checksum.push((mod >> (5 * (5 - i))) & 31);
+    return 'npub1' + [...words, ...checksum].map((d) => CHARSET[d]).join('');
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Decode a NIP-19 npub to a lowercase hex pubkey. Returns null for anything
  * malformed or not an npub.
  *

@@ -19,7 +19,7 @@ import { escapeHtml, toast, getRelayHttpBase, apiGet, shortHex } from '../api.js
 import { reqEvents, nip45Count } from '../ws.js';
 import { hasNostrSigner, nostrGetPubkey, serviceFetch } from '../nip98.js';
 import { findZapReceipt } from '../zap-pay.js';
-import { npubToHex } from '../../shared/bech32.js';
+import { npubToHex, hexToNpub } from '../../shared/bech32.js';
 
 const REPO = 'https://github.com/NostrDanish/SIP-Booster-Relay';
 const CF_DEPLOY_URL = `https://deploy.workers.cloudflare.com/?url=${encodeURIComponent(REPO)}`;
@@ -268,8 +268,12 @@ async function initHostedTrack(root) {
         The token is used once for provisioning and never stored. Delete it afterwards if you like.</p>
       <div class="field-row">
         <div><label>Account ID</label><input type="text" id="hs-account" placeholder="32 hex chars"></div>
-        <div><label>API token</label><input type="password" id="hs-token" placeholder="cfut_…" autocomplete="off"></div>
+        <div><label>API token</label><input type="password" id="hs-token" placeholder="cfut_… or cfat_…" autocomplete="off"></div>
         <div><label>Relay worker name</label><input type="text" id="hs-name" value="my-sip-relay"></div>
+      </div>
+      <div class="field-row">
+        <div><label>Relay display name</label><input type="text" id="hs-relay-name" placeholder="My SIP Relay"></div>
+        <div><label>Relay owner npub (admin + payment recipient)</label><input type="text" id="hs-owner-npub" placeholder="npub1… (defaults to your signed-in key)"></div>
       </div>
     </div>
 
@@ -357,10 +361,14 @@ async function initHostedTrack(root) {
     const out = body.querySelector('#hs-result');
     try {
       const pk = await requireLogin();
+      const ownerNpubInput = /** @type {HTMLInputElement} */ (body.querySelector('#hs-owner-npub')).value.trim();
       const payload = {
         cfToken: /** @type {HTMLInputElement} */ (body.querySelector('#hs-token')).value.trim(),
         cfAccountId: /** @type {HTMLInputElement} */ (body.querySelector('#hs-account')).value.trim(),
         workerName: /** @type {HTMLInputElement} */ (body.querySelector('#hs-name')).value.trim(),
+        relayName: /** @type {HTMLInputElement} */ (body.querySelector('#hs-relay-name')).value.trim() || undefined,
+        relayNpub: ownerNpubInput || hexToNpub(pk) || undefined,
+        ownerPubkey: npubToHex(ownerNpubInput) || pk,
       };
       if (!payload.cfToken || !payload.cfAccountId || !payload.workerName) {
         out.innerHTML = `<div class="notice"><strong>Missing Cloudflare details.</strong></div>`;

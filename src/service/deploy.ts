@@ -19,6 +19,10 @@ export interface DeployRequest {
   cfToken: string;
   cfAccountId: string;
   workerName: string;
+  /** Per-deployment identity overrides (plain-text bindings — no rebuild). */
+  relayName?: string;
+  relayNpub?: string;
+  ownerPubkey?: string;
 }
 
 export interface DeployResult {
@@ -72,8 +76,13 @@ export async function orchestrateDeploy(req: DeployRequest): Promise<DeployResul
     return { ok: false, error: 'invalid Cloudflare account id (32 hex chars)', steps };
   }
 
-  // 1. Verify the customer's API token.
-  const verify = await cfApi(req.cfToken, '/user/tokens/verify');
+  // 1. Verify the customer's API token. User tokens verify via
+  //    /user/tokens/verify; account-scoped tokens via
+  //    /accounts/{id}/tokens/verify — accept either.
+  let verify = await cfApi(req.cfToken, '/user/tokens/verify');
+  if (!verify.ok) {
+    verify = await cfApi(req.cfToken, `/accounts/${req.cfAccountId}/tokens/verify`);
+  }
   if (!verify.ok) {
     steps.push({ step: 'verify-token', ok: false, detail: verify.error });
     return { ok: false, error: `Cloudflare token check failed: ${verify.error}`, steps };
@@ -117,14 +126,27 @@ export async function orchestrateDeploy(req: DeployRequest): Promise<DeployResul
     return { ok: false, error: `could not fetch the relay bundle: ${error?.message ?? error}`, steps };
   }
 
-  // 4. Upload the worker with bindings + DO migration.
+  // 4. Upload the worker with bindings + DO migration (+ optional
+  //    per-deployment identity overrides as plain-text bindings).
+  const bindings: any[] = [
+    { name: 'RELAY_DATABASE', type: 'd1', id: databaseId },
+    { name: 'RELAY_WEBSOCKET', type: 'durable_object_namespace', class_name: 'RelayWebSocket' },
+  ];
+  if (req.relayName && /^[\w\s().#-]{1,40}$/.test(req.relayName)) {
+    bindings.push({ name: 'RELAY_NAME', type: 'plain_text', text: req.relayName.slice(0, 40) });
+  }
+  if (req.relayNpub && /^npub1[02-9ac-hj-np-z]{20,}$/.test(req.relayNpub)) {
+    bindings.push({ name: 'RELAY_NPUB', type: 'plain_text', text: req.relayNpub });
+  }
+  if (req.ownerPubkey && /^[0-9a-f]{64}$/.test(req.ownerPubkey)) {
+    bindings.push({ name: 'SERVICE_OWNER_PUBKEY', type: 'plain_text', text: req.ownerPubkey });
+    bindings.push({ name: 'RELAY_PUBKEY', type: 'plain_text', text: req.ownerPubkey });
+  }
+
   const metadata = {
     main_module: 'worker.js',
     compatibility_date: '2025-06-01',
-    bindings: [
-      { name: 'RELAY_DATABASE', type: 'd1', id: databaseId },
-      { name: 'RELAY_WEBSOCKET', type: 'durable_object_namespace', class_name: 'RelayWebSocket' },
-    ],
+    bindings,
     migrations: { new_tag: 'v4', new_sqlite_classes: ['RelayWebSocket'] },
   };
   const form = new FormData();

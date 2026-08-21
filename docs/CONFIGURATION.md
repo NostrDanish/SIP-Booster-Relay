@@ -124,3 +124,22 @@ entries pass; block lists always apply.
 | `RELAY_DATABASE` | D1 database (create with `wrangler d1 create`). |
 | `RELAY_WEBSOCKET` | Durable Object class `RelayWebSocket`. |
 | `ASSETS` | Static operator UI (automatic via `[assets]`). |
+
+## Runtime identity overrides (plain-text bindings, no rebuild)
+
+For hosted/multi-tenant deployments, these optional environment bindings
+override the compile-time config at request time (see
+`src/runtime-config.ts`):
+
+| Variable | Overrides |
+|---|---|
+| `RELAY_NAME` | `relayInfo.name` (NIP-11) |
+| `RELAY_NPUB` | `relayNpub` (payment recipient; also the default `zap_npub` for the deploy service) |
+| `RELAY_PUBKEY` | `relayInfo.pubkey` (NIP-11) |
+| `RELAY_CONTACT` | `relayInfo.contact` (NIP-11) |
+| `SERVICE_OWNER_PUBKEY` | `SERVICE_OWNER_PUBKEY` (who may use `/admin`) |
+| `DEPLOY_SERVICE_ENABLED` | `"false"` disables `/api/service/*` on this instance |
+
+The hosted deploy service sets these per deployment (the customer is the
+owner of their relay by default). Via wrangler: `npx wrangler deploy --var
+RELAY_NAME:MyRelay --var RELAY_NPUB:npub1…`

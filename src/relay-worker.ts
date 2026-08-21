@@ -32,6 +32,7 @@ import { executeSearch } from './sip01/search';
 import { verifyZapReceipt, hasPaidForRelay, savePaidPubkey } from './pay';
 import { serveMiniLanding } from './mini-landing';
 import { handleServiceApi } from './service/routes';
+import { runtimeRelayName, runtimeRelayPubkey, runtimeRelayContact, runtimeRelayNpub } from './runtime-config';
 
 // Import config values
 const {
@@ -1781,8 +1782,13 @@ async function querySyncItems(filter: NostrFilter, env: Env): Promise<{ items: A
 // NIP-11 relay information document
 // ---------------------------------------------------------------------------
 
-function handleRelayInfoRequest(request: Request): Response {
-  const responseInfo = { ...relayInfo };
+function handleRelayInfoRequest(request: Request, env: Env): Response {
+  const responseInfo = {
+    ...relayInfo,
+    name: runtimeRelayName(env),
+    pubkey: runtimeRelayPubkey(env),
+    contact: runtimeRelayContact(env),
+  };
 
   // Advertise exactly what is enabled — never more.
   const nips = new Set<number>([1, 5, 9, 11, 16, 33, 42]);
@@ -1919,7 +1925,7 @@ async function handlePaymentNotification(request: Request, env: Env): Promise<Re
       });
     }
 
-    const verified = await verifyZapReceipt(receipt, relayNpub, RELAY_ACCESS_PRICE_SATS, verifyEventSignature);
+    const verified = await verifyZapReceipt(receipt, runtimeRelayNpub(env), RELAY_ACCESS_PRICE_SATS, verifyEventSignature);
     if (!verified) {
       return new Response(JSON.stringify({ error: 'Invalid zap receipt' }), {
         status: 400,
@@ -2363,7 +2369,7 @@ export default {
 
           return stub.fetch(new Request(newUrl, request));
         } else if ((request.headers.get("Accept") || "").includes("application/nostr+json")) {
-          return handleRelayInfoRequest(request);
+          return handleRelayInfoRequest(request, env);
         } else {
           ctx.waitUntil(ensureDatabase(env.RELAY_DATABASE));
           return serveUi(request, env, url);

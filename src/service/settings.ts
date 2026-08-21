@@ -7,6 +7,8 @@
  */
 
 import * as config from '../config';
+import { runtimeRelayNpub } from '../runtime-config';
+import type { Env } from '../types';
 
 type Session = D1DatabaseSession;
 
@@ -17,18 +19,25 @@ export interface ServiceSettings {
   pre_address: string;
 }
 
-const DEFAULTS: ServiceSettings = {
-  deploy_price_sats: String(config.DEPLOY_PRICE_SATS),
-  deploy_price_pre: String(config.DEPLOY_PRICE_PRE),
-  zap_npub: config.DEPLOY_ZAP_NPUB,
-  pre_address: config.DEPLOY_PRE_ADDRESS,
-};
+export const SERVICE_SETTING_KEYS: Array<keyof ServiceSettings> = [
+  'deploy_price_sats',
+  'deploy_price_pre',
+  'zap_npub',
+  'pre_address',
+];
 
-export const SERVICE_SETTING_KEYS = Object.keys(DEFAULTS) as Array<keyof ServiceSettings>;
+function defaults(env?: Env): ServiceSettings {
+  return {
+    deploy_price_sats: String(config.DEPLOY_PRICE_SATS),
+    deploy_price_pre: String(config.DEPLOY_PRICE_PRE),
+    zap_npub: env ? runtimeRelayNpub(env) : config.DEPLOY_ZAP_NPUB,
+    pre_address: config.DEPLOY_PRE_ADDRESS,
+  };
+}
 
-/** All settings: D1 overrides merged over config defaults. */
-export async function getServiceSettings(session: Session): Promise<ServiceSettings> {
-  const out: ServiceSettings = { ...DEFAULTS };
+/** All settings: D1 overrides merged over config/env defaults. */
+export async function getServiceSettings(session: Session, env?: Env): Promise<ServiceSettings> {
+  const out: ServiceSettings = defaults(env);
   try {
     const rows = await session
       .prepare(`SELECT key, value FROM service_settings WHERE key IN (${SERVICE_SETTING_KEYS.map(() => '?').join(',')})`)

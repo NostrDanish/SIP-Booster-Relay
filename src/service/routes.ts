@@ -24,6 +24,7 @@ import { getServiceSettings, setServiceSetting, SERVICE_SETTING_KEYS } from './s
 import { payWithLightning, payWithPre, hasDeployCredit, consumeDeployCredit } from './pay';
 import { orchestrateDeploy } from './deploy';
 import { verifyAdminAuth } from './auth';
+import { runtimeOwnerPubkey, runtimeDeployServiceEnabled } from '../runtime-config';
 import { verifyEventSignature } from '../relay-worker';
 
 type Session = D1DatabaseSession;
@@ -94,7 +95,7 @@ async function authedPubkey(request: Request, rawBody: string): Promise<string |
 }
 
 export async function handleServiceApi(request: Request, env: Env, url: URL): Promise<Response> {
-  if (!config.DEPLOY_SERVICE_ENABLED) {
+  if (!runtimeDeployServiceEnabled(env)) {
     return json({ error: 'deploy service is disabled on this relay' }, 404);
   }
 
@@ -104,11 +105,11 @@ export async function handleServiceApi(request: Request, env: Env, url: URL): Pr
 
   /* ---------------- public config ---------------- */
   if (path === 'config' && request.method === 'GET') {
-    const s = await getServiceSettings(session);
+    const s = await getServiceSettings(session, env);
     return json({
       enabled: true,
-      owner_npub: config.DEPLOY_ZAP_NPUB,
-      owner_pubkey: config.SERVICE_OWNER_PUBKEY,
+      owner_npub: s.zap_npub,
+      owner_pubkey: runtimeOwnerPubkey(env),
       deploy_price_sats: Number(s.deploy_price_sats),
       deploy_price_pre: Number(s.deploy_price_pre),
       zap_npub: s.zap_npub,
@@ -130,7 +131,7 @@ export async function handleServiceApi(request: Request, env: Env, url: URL): Pr
     let body: any;
     try { body = JSON.parse(rawBody); } catch { return json({ error: 'invalid JSON' }, 400); }
     if (!body?.event) return json({ error: 'missing zap receipt event' }, 400);
-    const result = await payWithLightning(session, body.event, pubkey, verifyEventSignature);
+    const result = await payWithLightning(session, body.event, pubkey, verifyEventSignature, env);
     return result.ok ? json({ ok: true }) : json({ error: result.error }, 400);
   }
 
@@ -140,7 +141,7 @@ export async function handleServiceApi(request: Request, env: Env, url: URL): Pr
     let body: any;
     try { body = JSON.parse(rawBody); } catch { return json({ error: 'invalid JSON' }, 400); }
     if (!body?.txHash) return json({ error: 'missing txHash' }, 400);
-    const result = await payWithPre(session, String(body.txHash), pubkey);
+    const result = await payWithPre(session, String(body.txHash), pubkey, env);
     return result.ok ? json({ ok: true }) : json({ error: result.error }, 400);
   }
 
@@ -176,6 +177,10 @@ export async function handleServiceApi(request: Request, env: Env, url: URL): Pr
         cfToken: String(body.cfToken || ''),
         cfAccountId: String(body.cfAccountId || ''),
         workerName: String(body.workerName || ''),
+        // The customer is the owner of their deployed relay by default.
+        relayName: body.relayName ? String(body.relayName) : undefined,
+        relayNpub: body.relayNpub ? String(body.relayNpub) : undefined,
+        ownerPubkey: body.ownerPubkey ? String(body.ownerPubkey) : pubkey,
       });
     } catch (error: any) {
       result = { ok: false, error: error?.message ?? 'deploy failed', steps: [] };
@@ -199,11 +204,11 @@ export async function handleServiceApi(request: Request, env: Env, url: URL): Pr
 
   /* ---------------- admin (owner, NIP-98) ---------------- */
   if (path.startsWith('admin/')) {
-    const auth = await verifyAdminAuth(request, rawBody);
+    const auth = await verifyAdminAuth(request, rawBody, env);
     if (!auth.ok) return json({ error: `unauthorized: ${auth.error}` }, 401);
 
     if (path === 'admin/settings' && request.method === 'GET') {
-      return json({ settings: await getServiceSettings(session), keys: SERVICE_SETTING_KEYS });
+      return json({ settings: await getServiceSettings(session, env), keys: SERVICE_SETTING_KEYS });
     }
 
     if (path === 'admin/settings' && request.method === 'POST') {
@@ -223,7 +228,7 @@ export async function handleServiceApi(request: Request, env: Env, url: URL): Pr
         return json({ error: 'pre_address must be a 0x EVM address' }, 400);
       }
       await setServiceSetting(session, key, value);
-      return json({ ok: true, settings: await getServiceSettings(session) });
+      return json({ ok: true, settings: await getServiceSettings(session, env) });
     }
 
     if (path === 'admin/payments' && request.method === 'GET') {
