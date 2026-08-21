@@ -4841,16 +4841,53 @@ function escapeHtml(s) {
 }
 __name(escapeHtml, "escapeHtml");
 
+// src/runtime-config.ts
+function runtimeRelayName(env) {
+  return env.RELAY_NAME?.trim() || relayInfo.name;
+}
+__name(runtimeRelayName, "runtimeRelayName");
+function runtimeRelayNpub(env) {
+  return env.RELAY_NPUB?.trim() || relayNpub;
+}
+__name(runtimeRelayNpub, "runtimeRelayNpub");
+function runtimeRelayPubkey(env) {
+  return env.RELAY_PUBKEY?.trim() || relayInfo.pubkey;
+}
+__name(runtimeRelayPubkey, "runtimeRelayPubkey");
+function runtimeRelayContact(env) {
+  return env.RELAY_CONTACT?.trim() || relayInfo.contact;
+}
+__name(runtimeRelayContact, "runtimeRelayContact");
+function runtimeOwnerPubkey(env) {
+  return env.SERVICE_OWNER_PUBKEY?.trim() || SERVICE_OWNER_PUBKEY;
+}
+__name(runtimeOwnerPubkey, "runtimeOwnerPubkey");
+function runtimeDeployServiceEnabled(env) {
+  const v = env.DEPLOY_SERVICE_ENABLED?.trim().toLowerCase();
+  if (v === "false" || v === "0" || v === "off")
+    return false;
+  return DEPLOY_SERVICE_ENABLED;
+}
+__name(runtimeDeployServiceEnabled, "runtimeDeployServiceEnabled");
+
 // src/service/settings.ts
-var DEFAULTS = {
-  deploy_price_sats: String(DEPLOY_PRICE_SATS),
-  deploy_price_pre: String(DEPLOY_PRICE_PRE),
-  zap_npub: DEPLOY_ZAP_NPUB,
-  pre_address: DEPLOY_PRE_ADDRESS
-};
-var SERVICE_SETTING_KEYS = Object.keys(DEFAULTS);
-async function getServiceSettings(session) {
-  const out = { ...DEFAULTS };
+var SERVICE_SETTING_KEYS = [
+  "deploy_price_sats",
+  "deploy_price_pre",
+  "zap_npub",
+  "pre_address"
+];
+function defaults(env) {
+  return {
+    deploy_price_sats: String(DEPLOY_PRICE_SATS),
+    deploy_price_pre: String(DEPLOY_PRICE_PRE),
+    zap_npub: env ? runtimeRelayNpub(env) : DEPLOY_ZAP_NPUB,
+    pre_address: DEPLOY_PRE_ADDRESS
+  };
+}
+__name(defaults, "defaults");
+async function getServiceSettings(session, env) {
+  const out = defaults(env);
   try {
     const rows = await session.prepare(`SELECT key, value FROM service_settings WHERE key IN (${SERVICE_SETTING_KEYS.map(() => "?").join(",")})`).bind(...SERVICE_SETTING_KEYS).all();
     for (const row of rows.results ?? []) {
@@ -4905,8 +4942,8 @@ async function consumeDeployCredit(session, pubkey) {
   return row.id;
 }
 __name(consumeDeployCredit, "consumeDeployCredit");
-async function payWithLightning(session, event, claimedPubkey, verifySig) {
-  const settings = await getServiceSettings(session);
+async function payWithLightning(session, event, claimedPubkey, verifySig, env) {
+  const settings = await getServiceSettings(session, env);
   const priceSats = parseInt(settings.deploy_price_sats, 10);
   const verified = await verifyZapReceipt(event, settings.zap_npub, priceSats, verifySig);
   if (!verified) {
@@ -4944,11 +4981,11 @@ function toAddress(topicOrAddress) {
   return "0x" + topicOrAddress.slice(-40).toLowerCase();
 }
 __name(toAddress, "toAddress");
-async function payWithPre(session, txHash, claimedPubkey) {
+async function payWithPre(session, txHash, claimedPubkey, env) {
   if (!/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
     return { ok: false, error: "not a valid transaction hash" };
   }
-  const settings = await getServiceSettings(session);
+  const settings = await getServiceSettings(session, env);
   const serviceAddress = settings.pre_address.toLowerCase();
   if (!/^0x[0-9a-f]{40}$/.test(serviceAddress)) {
     return { ok: false, error: "service PRE wallet is not configured" };
@@ -5037,7 +5074,10 @@ async function orchestrateDeploy(req) {
   if (!/^[0-9a-f]{32}$/i.test(req.cfAccountId)) {
     return { ok: false, error: "invalid Cloudflare account id (32 hex chars)", steps };
   }
-  const verify = await cfApi(req.cfToken, "/user/tokens/verify");
+  let verify = await cfApi(req.cfToken, "/user/tokens/verify");
+  if (!verify.ok) {
+    verify = await cfApi(req.cfToken, `/accounts/${req.cfAccountId}/tokens/verify`);
+  }
   if (!verify.ok) {
     steps.push({ step: "verify-token", ok: false, detail: verify.error });
     return { ok: false, error: `Cloudflare token check failed: ${verify.error}`, steps };
@@ -5064,25 +5104,48 @@ async function orchestrateDeploy(req) {
   }
   let bundle;
   try {
-    const res = await fetch(DEPLOY_BUNDLE_URL);
-    if (!res.ok)
-      throw new Error(`HTTP ${res.status}`);
+    const cacheReq = new Request(DEPLOY_BUNDLE_URL);
+    let res = await caches.default.match(cacheReq);
+    let fromCache = !!res;
+    if (!res || !res.ok) {
+      const fresh = await fetch(DEPLOY_BUNDLE_URL);
+      if (!fresh.ok)
+        throw new Error(`HTTP ${fresh.status}`);
+      res = fresh;
+      fromCache = false;
+    }
     bundle = await res.text();
     if (bundle.length < 1e4 || !bundle.includes("RelayWebSocket")) {
       throw new Error("bundle looks wrong");
     }
-    steps.push({ step: "fetch-bundle", ok: true, detail: `${bundle.length} bytes` });
+    if (!fromCache) {
+      await caches.default.put(cacheReq, new Response(bundle, {
+        headers: { "Cache-Control": "public, max-age=3600" }
+      }));
+    }
+    steps.push({ step: "fetch-bundle", ok: true, detail: `${bundle.length} bytes${fromCache ? " (edge cache)" : ""}` });
   } catch (error) {
     steps.push({ step: "fetch-bundle", ok: false, detail: error?.message });
     return { ok: false, error: `could not fetch the relay bundle: ${error?.message ?? error}`, steps };
   }
+  const bindings = [
+    { name: "RELAY_DATABASE", type: "d1", id: databaseId },
+    { name: "RELAY_WEBSOCKET", type: "durable_object_namespace", class_name: "RelayWebSocket" }
+  ];
+  if (req.relayName && /^[\w\s().#-]{1,40}$/.test(req.relayName)) {
+    bindings.push({ name: "RELAY_NAME", type: "plain_text", text: req.relayName.slice(0, 40) });
+  }
+  if (req.relayNpub && /^npub1[02-9ac-hj-np-z]{20,}$/.test(req.relayNpub)) {
+    bindings.push({ name: "RELAY_NPUB", type: "plain_text", text: req.relayNpub });
+  }
+  if (req.ownerPubkey && /^[0-9a-f]{64}$/.test(req.ownerPubkey)) {
+    bindings.push({ name: "SERVICE_OWNER_PUBKEY", type: "plain_text", text: req.ownerPubkey });
+    bindings.push({ name: "RELAY_PUBKEY", type: "plain_text", text: req.ownerPubkey });
+  }
   const metadata = {
     main_module: "worker.js",
     compatibility_date: "2025-06-01",
-    bindings: [
-      { name: "RELAY_DATABASE", type: "d1", id: databaseId },
-      { name: "RELAY_WEBSOCKET", type: "durable_object_namespace", class_name: "RelayWebSocket" }
-    ],
+    bindings,
     migrations: { new_tag: "v4", new_sqlite_classes: ["RelayWebSocket"] }
   };
   const form = new FormData();
@@ -5190,7 +5253,7 @@ async function verifySignedEvent(event) {
   }
 }
 __name(verifySignedEvent, "verifySignedEvent");
-async function verifyAdminAuth(request, rawBody) {
+async function verifyAdminAuth(request, rawBody, env) {
   const header = request.headers.get("Authorization") || "";
   const match = /^Nostr\s+(.+)$/.exec(header);
   if (!match)
@@ -5204,7 +5267,7 @@ async function verifyAdminAuth(request, rawBody) {
   if (!event || event.kind !== KIND_HTTP_AUTH) {
     return { ok: false, error: `auth event must be kind ${KIND_HTTP_AUTH}` };
   }
-  if (event.pubkey !== SERVICE_OWNER_PUBKEY) {
+  if (event.pubkey !== runtimeOwnerPubkey(env)) {
     return { ok: false, error: "not the service owner" };
   }
   const now = Math.floor(Date.now() / 1e3);
@@ -5299,18 +5362,18 @@ async function authedPubkey(request, rawBody) {
 }
 __name(authedPubkey, "authedPubkey");
 async function handleServiceApi(request, env, url) {
-  if (!DEPLOY_SERVICE_ENABLED) {
+  if (!runtimeDeployServiceEnabled(env)) {
     return json({ error: "deploy service is disabled on this relay" }, 404);
   }
   const path = url.pathname.replace(/^\/api\/service\/?/, "");
   const session = env.RELAY_DATABASE.withSession("first-primary");
   const rawBody = request.method === "GET" || request.method === "HEAD" ? "" : await request.text();
   if (path === "config" && request.method === "GET") {
-    const s = await getServiceSettings(session);
+    const s = await getServiceSettings(session, env);
     return json({
       enabled: true,
-      owner_npub: DEPLOY_ZAP_NPUB,
-      owner_pubkey: SERVICE_OWNER_PUBKEY,
+      owner_npub: s.zap_npub,
+      owner_pubkey: runtimeOwnerPubkey(env),
       deploy_price_sats: Number(s.deploy_price_sats),
       deploy_price_pre: Number(s.deploy_price_pre),
       zap_npub: s.zap_npub,
@@ -5336,7 +5399,7 @@ async function handleServiceApi(request, env, url) {
     }
     if (!body?.event)
       return json({ error: "missing zap receipt event" }, 400);
-    const result = await payWithLightning(session, body.event, pubkey, verifyEventSignature);
+    const result = await payWithLightning(session, body.event, pubkey, verifyEventSignature, env);
     return result.ok ? json({ ok: true }) : json({ error: result.error }, 400);
   }
   if (path === "pay/pre" && request.method === "POST") {
@@ -5351,7 +5414,7 @@ async function handleServiceApi(request, env, url) {
     }
     if (!body?.txHash)
       return json({ error: "missing txHash" }, 400);
-    const result = await payWithPre(session, String(body.txHash), pubkey);
+    const result = await payWithPre(session, String(body.txHash), pubkey, env);
     return result.ok ? json({ ok: true }) : json({ error: result.error }, 400);
   }
   if (path === "payment-status" && request.method === "GET") {
@@ -5384,7 +5447,11 @@ async function handleServiceApi(request, env, url) {
         pubkey,
         cfToken: String(body.cfToken || ""),
         cfAccountId: String(body.cfAccountId || ""),
-        workerName: String(body.workerName || "")
+        workerName: String(body.workerName || ""),
+        // The customer is the owner of their deployed relay by default.
+        relayName: body.relayName ? String(body.relayName) : void 0,
+        relayNpub: body.relayNpub ? String(body.relayNpub) : void 0,
+        ownerPubkey: body.ownerPubkey ? String(body.ownerPubkey) : pubkey
       });
     } catch (error) {
       result = { ok: false, error: error?.message ?? "deploy failed", steps: [] };
@@ -5397,11 +5464,11 @@ async function handleServiceApi(request, env, url) {
     return json(result, result.ok ? 200 : 502);
   }
   if (path.startsWith("admin/")) {
-    const auth = await verifyAdminAuth(request, rawBody);
+    const auth = await verifyAdminAuth(request, rawBody, env);
     if (!auth.ok)
       return json({ error: `unauthorized: ${auth.error}` }, 401);
     if (path === "admin/settings" && request.method === "GET") {
-      return json({ settings: await getServiceSettings(session), keys: SERVICE_SETTING_KEYS });
+      return json({ settings: await getServiceSettings(session, env), keys: SERVICE_SETTING_KEYS });
     }
     if (path === "admin/settings" && request.method === "POST") {
       let body;
@@ -5424,7 +5491,7 @@ async function handleServiceApi(request, env, url) {
         return json({ error: "pre_address must be a 0x EVM address" }, 400);
       }
       await setServiceSetting(session, key, value);
-      return json({ ok: true, settings: await getServiceSettings(session) });
+      return json({ ok: true, settings: await getServiceSettings(session, env) });
     }
     if (path === "admin/payments" && request.method === "GET") {
       const rows = await session.prepare("SELECT id, pubkey, method, amount, proof, payer_detail, created_at, used_at FROM deploy_payments ORDER BY id DESC LIMIT 200").all();
@@ -6816,8 +6883,13 @@ async function querySyncItems(filter, env) {
   return { items: rows, truncated };
 }
 __name(querySyncItems, "querySyncItems");
-function handleRelayInfoRequest(request) {
-  const responseInfo = { ...relayInfo2 };
+function handleRelayInfoRequest(request, env) {
+  const responseInfo = {
+    ...relayInfo2,
+    name: runtimeRelayName(env),
+    pubkey: runtimeRelayPubkey(env),
+    contact: runtimeRelayContact(env)
+  };
   const nips = /* @__PURE__ */ new Set([1, 5, 9, 11, 16, 33, 42]);
   if (NIP45_ENABLED2)
     nips.add(45);
@@ -6928,7 +7000,7 @@ async function handlePaymentNotification(request, env) {
         headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" }
       });
     }
-    const verified = await verifyZapReceipt(receipt, relayNpub2, RELAY_ACCESS_PRICE_SATS2, verifyEventSignature);
+    const verified = await verifyZapReceipt(receipt, runtimeRelayNpub(env), RELAY_ACCESS_PRICE_SATS2, verifyEventSignature);
     if (!verified) {
       return new Response(JSON.stringify({ error: "Invalid zap receipt" }), {
         status: 400,
@@ -7492,7 +7564,7 @@ var relay_worker_default = {
           newUrl.searchParams.set("doName", doName);
           return stub.fetch(new Request(newUrl, request));
         } else if ((request.headers.get("Accept") || "").includes("application/nostr+json")) {
-          return handleRelayInfoRequest(request);
+          return handleRelayInfoRequest(request, env);
         } else {
           ctx.waitUntil(ensureDatabase(env.RELAY_DATABASE));
           return serveUi(request, env, url);
