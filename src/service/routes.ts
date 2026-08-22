@@ -133,9 +133,6 @@ export async function handleServiceApi(request: Request, env: Env, url: URL): Pr
 
   /* ---------------- payments ---------------- */
   if (path === 'pay/lightning' && request.method === 'POST') {
-
-  /* ---------------- payments ---------------- */
-  if (path === 'pay/lightning' && request.method === 'POST') {
     if (!check.lightningEnabled) return json({ error: `Lightning payments not available: ${check.errors.join('; ')}` }, 503);
     const pubkey = await authedPubkey(request, rawBody);
     if (!pubkey) return json({ error: 'sign in with Nostr first (signed auth required)' }, 401);

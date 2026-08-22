@@ -1,42 +1,28 @@
 == npm install ==
-
-added 44 packages, and audited 45 packages in 7s
-
-9 packages are looking for funding
-  run `npm fund` for details
-
-1 moderate severity vulnerability
-
-To address all issues (including breaking changes), run:
-  npm audit fix --force
-
-Run `npm audit` for details.
-== build ==
-✘ [ERROR] Unexpected end of file
-
-    src/service/routes.ts:284:0:
-      284 │ 
-          ╵ ^
-
-1 error
-/home/runner/work/SIP-Booster-Relay/SIP-Booster-Relay/node_modules/esbuild/lib/main.js:1651
-  let error = new Error(text);
-              ^
-
-Error: Build failed with 1 error:
-src/service/routes.ts:284:0: ERROR: Unexpected end of file
-    at failureErrorWithLog (/home/runner/work/SIP-Booster-Relay/SIP-Booster-Relay/node_modules/esbuild/lib/main.js:1651:15)
-    at /home/runner/work/SIP-Booster-Relay/SIP-Booster-Relay/node_modules/esbuild/lib/main.js:1059:25
-    at /home/runner/work/SIP-Booster-Relay/SIP-Booster-Relay/node_modules/esbuild/lib/main.js:1004:52
-    at buildResponseToResult (/home/runner/work/SIP-Booster-Relay/SIP-Booster-Relay/node_modules/esbuild/lib/main.js:1057:7)
-    at /home/runner/work/SIP-Booster-Relay/SIP-Booster-Relay/node_modules/esbuild/lib/main.js:1086:16
-    at responseCallbacks.<computed> (/home/runner/work/SIP-Booster-Relay/SIP-Booster-Relay/node_modules/esbuild/lib/main.js:704:9)
-    at handleIncomingPacket (/home/runner/work/SIP-Booster-Relay/SIP-Booster-Relay/node_modules/esbuild/lib/main.js:764:9)
-    at Socket.readFromStdout (/home/runner/work/SIP-Booster-Relay/SIP-Booster-Relay/node_modules/esbuild/lib/main.js:680:7)
-    at Socket.emit (node:events:519:28)
-    at addChunk (node:internal/streams/readable:561:12) {
-  errors: [Getter/Setter],
-  warnings: [Getter/Setter]
-}
-
-Node.js v22.23.2
+npm error code ERESOLVE
+npm error ERESOLVE could not resolve
+npm error
+npm error While resolving: wrangler@4.124.0
+npm error Found: @cloudflare/workers-types@4.20260702.1
+npm error node_modules/@cloudflare/workers-types
+npm error   dev @cloudflare/workers-types@"^4.20260101.0" from the root project
+npm error
+npm error Could not resolve dependency:
+npm error peerOptional @cloudflare/workers-types@"^5.20260815.1" from wrangler@4.124.0
+npm error node_modules/wrangler
+npm error   dev wrangler@"^4.0.0" from the root project
+npm error
+npm error Conflicting peer dependency: @cloudflare/workers-types@5.20260819.1
+npm error node_modules/@cloudflare/workers-types
+npm error   peerOptional @cloudflare/workers-types@"^5.20260815.1" from wrangler@4.124.0
+npm error   node_modules/wrangler
+npm error     dev wrangler@"^4.0.0" from the root project
+npm error
+npm error Fix the upstream dependency conflict, or retry
+npm error this command with --force or --legacy-peer-deps
+npm error to accept an incorrect (and potentially broken) dependency resolution.
+npm error
+npm error
+npm error For a full report see:
+npm error /home/runner/.npm/_logs/2026-08-19T06_49_50_298Z-eresolve-report.txt
+npm error A complete log of this run can be found in: /home/runner/.npm/_logs/2026-08-19T06_49_50_298Z-debug-0.log
