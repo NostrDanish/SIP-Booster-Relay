@@ -94,6 +94,8 @@ export interface Env {
   RELAY_CONTACT?: string;
   SERVICE_OWNER_PUBKEY?: string;
   DEPLOY_SERVICE_ENABLED?: string;
+  /** Standalone deploy service's D1 (wrangler.service.toml). */
+  SERVICE_DATABASE?: D1Database;
 }
 
 // Durable Object types
@@ -117,6 +119,8 @@ export interface WebSocketSession {
   authenticatedPubkeys: Set<string>;
   // Pay-to-relay: cached per-session, checked at AUTH time
   hasPaid?: boolean;
+  /** Client IP (passed from the Worker for per-IP federation budgets). */
+  ip?: string;
 }
 
 /** NIP-77 negentropy session state (per NEG subscription id, in-memory). */
@@ -126,6 +130,8 @@ export interface NegSession {
   filter: NostrFilter;
   createdAt: number;
   itemCount: number;
+  /** Client IP for budget accounting. */
+  ip?: string;
 }
 
 export class RateLimiter {

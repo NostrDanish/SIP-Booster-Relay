@@ -12,3 +12,4 @@ package-lock.json
 Thumbs.db
 .vscode/
 .idea/
+service-worker.js

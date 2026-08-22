@@ -1,0 +1,21 @@
+# Standalone hosted deploy service (audit P0-1: isolated from the relay).
+# Deploy:  npx wrangler deploy --config wrangler.service.toml
+# Requires: a D1 database for the service ledger:
+#   npx wrangler d1 create sip01-deploy-service
+#   → paste the printed database_id below.
+
+name = "sip-relay-deploy"
+compatibility_date = "2025-06-01"
+main = "src/service-worker.ts"
+
+# The service is enabled on THIS worker via a plain-text binding (the relay
+# default in src/config.ts is deliberately `false`).
+[vars]
+DEPLOY_SERVICE_ENABLED = "true"
+
+[[d1_databases]]
+binding = "SERVICE_DATABASE"
+database_name = "sip01-deploy-service"
+database_id = "REPLACE_WITH_YOUR_SERVICE_D1_DATABASE_ID"
+
+# No Durable Objects, no WebSockets, no cron — the service is a plain Worker.

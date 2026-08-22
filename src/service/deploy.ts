@@ -129,12 +129,22 @@ export async function orchestrateDeploy(req: DeployRequest): Promise<DeployResul
     if (bundle.length < 10000 || !bundle.includes('RelayWebSocket')) {
       throw new Error('bundle looks wrong');
     }
+    // Supply-chain guard (audit P0-3): the bundle URL is pinned to an
+    // immutable commit (DEPLOY_BUNDLE_REF); when DEPLOY_BUNDLE_SHA256 is
+    // configured, verify the hash before deploying.
+    if (config.DEPLOY_BUNDLE_SHA256) {
+      const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(bundle));
+      const hex = Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, '0')).join('');
+      if (hex !== config.DEPLOY_BUNDLE_SHA256.toLowerCase()) {
+        throw new Error('bundle SHA-256 mismatch — refusing to deploy unverified software');
+      }
+    }
     if (!fromCache) {
       await caches.default.put(cacheReq, new Response(bundle, {
         headers: { 'Cache-Control': 'public, max-age=3600' },
       }));
     }
-    steps.push({ step: 'fetch-bundle', ok: true, detail: `${bundle.length} bytes${fromCache ? ' (edge cache)' : ''}` });
+    steps.push({ step: 'fetch-bundle', ok: true, detail: `${bundle.length} bytes @${config.DEPLOY_BUNDLE_REF.slice(0, 8)}${config.DEPLOY_BUNDLE_SHA256 ? ', sha256 verified' : ''}${fromCache ? ' (edge cache)' : ''}` });
   } catch (error: any) {
     steps.push({ step: 'fetch-bundle', ok: false, detail: error?.message });
     return { ok: false, error: `could not fetch the relay bundle: ${error?.message ?? error}`, steps };

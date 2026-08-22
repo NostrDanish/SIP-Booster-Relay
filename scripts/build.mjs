@@ -14,11 +14,26 @@ import { build } from 'esbuild';
 import { cp, mkdir, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 
-// 1. Bundle the worker (plain JS shared/ modules are imported as ESM).
+// 1. Bundle the relay worker (plain JS shared/ modules are imported as ESM).
 await build({
   entryPoints: ['src/index.ts'],
   bundle: true,
   outfile: 'worker.js',
+  platform: 'neutral',
+  target: 'es2020',
+  format: 'esm',
+  minify: false,
+  keepNames: true,
+  external: ['node:*', 'cloudflare:*'],
+  logLevel: 'info',
+});
+
+// 1b. Bundle the standalone hosted deploy service worker (isolated product
+// surface — see wrangler.service.toml).
+await build({
+  entryPoints: ['src/service-worker.ts'],
+  bundle: true,
+  outfile: 'service-worker.js',
   platform: 'neutral',
   target: 'es2020',
   format: 'esm',

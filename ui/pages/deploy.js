@@ -205,19 +205,55 @@ npm run build   # → worker.js (self-contained)</pre>
 
 /* ---------------- hosted (paid) deploy track ---------------- */
 
+/** The deploy service can live on a separate origin from the relay (audit
+ *  P0-1 isolation). Resolution: explicit override → same-origin probe. */
+const SERVICE_URL_KEY = 'sip-deploy-service-url';
+
+async function resolveServiceBase(root, body) {
+  const override = localStorage.getItem(SERVICE_URL_KEY);
+  const candidates = [];
+  if (override) candidates.push(override.replace(/\/+$/, ''));
+  candidates.push(getRelayHttpBase());
+
+  for (const candidate of candidates) {
+    try {
+      const res = await fetch(`${candidate}/api/service/config`, { headers: { Accept: 'application/json' } });
+      if (res.ok) {
+        const cfg = await res.json();
+        if (cfg && cfg.enabled !== undefined) return { base: candidate, cfg };
+      }
+    } catch { /* next */ }
+  }
+  return null;
+}
+
 async function initHostedTrack(root) {
   const body = root.querySelector('#hosted-body');
-  const base = getRelayHttpBase();
 
-  let cfg;
-  try {
-    cfg = await apiGet('/api/service/config');
-  } catch {
-    body.innerHTML = `<p class="small faint">No hosted deploy service on this origin. Self-hosting below is free and takes about the same time.</p>`;
+  const found = await resolveServiceBase(root, body);
+  if (!found) {
+    body.innerHTML = `
+      <p class="small faint">No hosted deploy service reachable. Point this portal at one:</p>
+      <div class="flex mt">
+        <input type="text" id="hs-service-url" placeholder="https://sip-relay-deploy.example.com" style="max-width:380px">
+        <button class="btn small" id="hs-service-save">Use service</button>
+      </div>
+      <p class="small faint mt">Self-hosting below is free and takes about the same time.</p>
+    `;
+    body.querySelector('#hs-service-save').addEventListener('click', () => {
+      const v = /** @type {HTMLInputElement} */ (body.querySelector('#hs-service-url')).value.trim();
+      if (v) {
+        localStorage.setItem(SERVICE_URL_KEY, v);
+        initHostedTrack(root);
+      }
+    });
     return;
   }
+
+  const base = found.base;
+  const cfg = found.cfg;
   if (!cfg.enabled) {
-    body.innerHTML = `<p class="small faint">The hosted deploy service is disabled on this relay.</p>`;
+    body.innerHTML = `<p class="small faint">The hosted deploy service is disabled on ${escapeHtml(base)}.</p>`;
     return;
   }
 
@@ -237,7 +273,11 @@ async function initHostedTrack(root) {
     <div class="deploy-step" id="hs-pay-step">
       <div class="step-num">STEP 2</div>
       <h3>Pay ${escapeHtml(String(cfg.deploy_price_sats))} sats <span class="faint">or</span> ${escapeHtml(String(cfg.deploy_price_pre))} PRE</h3>
+      ${Array.isArray(cfg.config_errors) && cfg.config_errors.length > 0 ? `
+        <p class="small" style="color:var(--amber)">⚠ service note: ${escapeHtml(cfg.config_errors.join('; '))}</p>
+      ` : ''}
       <div class="grid cols-2">
+        ${(cfg.methods ? cfg.methods.lightning : true) ? `
         <div>
           <h3>⚡ Lightning (Nostr zap)</h3>
           <p class="small muted">Zap <strong>${escapeHtml(String(cfg.deploy_price_sats))} sats</strong> to the service
@@ -247,7 +287,8 @@ async function initHostedTrack(root) {
                   data-relays="wss://relay.damus.io,wss://relay.primal.net,wss://sendit.nosflare.com"
                   data-sats-amount="${escapeHtml(String(cfg.deploy_price_sats))}">⚡ Zap now</button>
           <button class="btn small ghost" id="hs-claim-ln">I paid — verify</button>
-        </div>
+        </div>` : '<div><h3>⚡ Lightning</h3><p class="small faint">not available on this service right now</p></div>'}
+        ${(cfg.methods ? cfg.methods.pre : true) ? `
         <div>
           <h3>◈ PRE on Base</h3>
           <p class="small muted">Send <strong>${escapeHtml(String(cfg.deploy_price_pre))} PRE</strong> on Base to:</p>
@@ -255,7 +296,7 @@ async function initHostedTrack(root) {
           <p class="small faint">contract <code>${escapeHtml(cfg.pre.token_contract.slice(0, 12))}…</code> · chain ${cfg.pre.chain_id}</p>
           <input type="text" id="hs-txhash" placeholder="0x… transaction hash">
           <button class="btn small ghost mt" id="hs-claim-pre">Verify PRE payment</button>
-        </div>
+        </div>` : '<div><h3>◈ PRE on Base</h3><p class="small faint">not configured on this service yet</p></div>'}
       </div>
       <p class="small" id="hs-pay-status"></p>
     </div>
@@ -285,20 +326,23 @@ async function initHostedTrack(root) {
     </div>
   `;
 
-  // Zap button library
-  if (!window.nostrZap) {
-    const s = document.createElement('script');
-    s.src = './nostr-zap.js';
-    s.onload = () => window.nostrZap && window.nostrZap.initTargets('#hs-zap');
-    s.onerror = () => {
-      const cdn = document.createElement('script');
-      cdn.src = 'https://cdn.jsdelivr.net/gh/NostrDanish/SIP-Booster-Relay@main/nostr-zap.js';
-      cdn.onload = () => window.nostrZap && window.nostrZap.initTargets('#hs-zap');
-      document.head.appendChild(cdn);
-    };
-    document.head.appendChild(s);
-  } else {
-    window.nostrZap.initTargets('#hs-zap');
+  // Zap button library (only when the Lightning panel is rendered)
+  const zapBtn = body.querySelector('#hs-zap');
+  if (zapBtn) {
+    if (!window.nostrZap) {
+      const s = document.createElement('script');
+      s.src = './nostr-zap.js';
+      s.onload = () => window.nostrZap && window.nostrZap.initTargets('#hs-zap');
+      s.onerror = () => {
+        const cdn = document.createElement('script');
+        cdn.src = 'https://cdn.jsdelivr.net/gh/NostrDanish/SIP-Booster-Relay@main/nostr-zap.js';
+        cdn.onload = () => window.nostrZap && window.nostrZap.initTargets('#hs-zap');
+        document.head.appendChild(cdn);
+      };
+      document.head.appendChild(s);
+    } else {
+      window.nostrZap.initTargets('#hs-zap');
+    }
   }
 
   let pubkey = null;
@@ -326,7 +370,7 @@ async function initHostedTrack(root) {
     return pubkey;
   };
 
-  body.querySelector('#hs-claim-ln').addEventListener('click', async () => {
+  body.querySelector('#hs-claim-ln')?.addEventListener('click', async () => {
     try {
       const pk = await requireLogin();
       payStatus.textContent = 'looking for your zap receipt on public relays…';
@@ -344,7 +388,7 @@ async function initHostedTrack(root) {
     }
   });
 
-  body.querySelector('#hs-claim-pre').addEventListener('click', async () => {
+  body.querySelector('#hs-claim-pre')?.addEventListener('click', async () => {
     try {
       const pk = await requireLogin();
       const txHash = /** @type {HTMLInputElement} */ (body.querySelector('#hs-txhash')).value.trim();

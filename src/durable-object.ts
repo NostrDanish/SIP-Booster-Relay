@@ -29,6 +29,8 @@ import {
   NIP77_ENABLED,
   NEG_FRAME_SIZE_LIMIT,
   NEG_SESSION_TIMEOUT_MS,
+  NEG_OPEN_PER_IP_PER_MIN,
+  NEG_MAX_CONCURRENT_SESSIONS,
   SIP01_ENABLED,
   isPubkeyAllowed,
   isEventKindAllowed,
@@ -53,6 +55,8 @@ interface SessionAttachment {
   // NIP-42: Persist auth state across hibernation
   authenticatedPubkeys?: string[];
   challenge?: string;
+  /** Client IP (per-IP federation budgets survive hibernation). */
+  ip?: string;
 }
 
 // Cache entry interface with access tracking
@@ -96,6 +100,9 @@ export class RelayWebSocket implements DurableObject {
   // NIP-77 negentropy sessions: `${sessionId}:${subId}` → state (in-memory;
   // reclaimed on hibernation/timeout with NEG-ERR closed:)
   private negSessions: Map<string, NegSession> = new Map();
+
+  // Federation budget: NEG-OPEN count per client IP per minute
+  private negIpBuckets: Map<string, { count: number; resetAt: number }> = new Map();
 
   // Parsed NIP-50 queries cached per filter object (live delivery matching)
   private parsedSearchCache: WeakMap<NostrFilter, ReturnType<typeof parseSearchQuery>> = new WeakMap();
@@ -518,8 +525,9 @@ export class RelayWebSocket implements DurableObject {
 
     const sessionId = crypto.randomUUID();
     const host = request.headers.get('host') || url.host;
+    const ip = url.searchParams.get('ip') || '';
 
-    const session = this.createSession(sessionId, server, 'first-unconstrained', host, []);
+    const session = this.createSession(sessionId, server, 'first-unconstrained', host, [], undefined, undefined, undefined, ip);
     this.sessions.set(sessionId, session);
 
     const attachment: SessionAttachment = {
@@ -528,7 +536,8 @@ export class RelayWebSocket implements DurableObject {
       host,
       doName: this.doName,
       authenticatedPubkeys: [],
-      challenge: session.challenge
+      challenge: session.challenge,
+      ip,
     };
     server.serializeAttachment(attachment);
 
@@ -559,6 +568,7 @@ export class RelayWebSocket implements DurableObject {
     challenge?: string,
     hasPaid?: boolean,
     subscriptions?: Map<string, NostrFilter[]>,
+    ip?: string,
   ): WebSocketSession {
     return {
       id: sessionId,
@@ -572,7 +582,8 @@ export class RelayWebSocket implements DurableObject {
       host,
       challenge: challenge ?? (AUTH_REQUIRED ? this.generateAuthChallenge() : undefined),
       authenticatedPubkeys: new Set(authenticatedPubkeys),
-      hasPaid
+      hasPaid,
+      ip
     };
   }
 
@@ -605,6 +616,7 @@ export class RelayWebSocket implements DurableObject {
         attachment.challenge || (AUTH_REQUIRED ? this.generateAuthChallenge() : undefined),
         attachment.hasPaid,
         subscriptions,
+        attachment.ip,
       );
       this.sessions.set(attachment.sessionId, session);
 
@@ -642,7 +654,8 @@ export class RelayWebSocket implements DurableObject {
         doName: this.doName,
         hasPaid: session.hasPaid,
         authenticatedPubkeys: Array.from(session.authenticatedPubkeys),
-        challenge: session.challenge
+        challenge: session.challenge,
+        ip: session.ip,
       };
       ws.serializeAttachment(updatedAttachment);
 
@@ -1144,6 +1157,19 @@ export class RelayWebSocket implements DurableObject {
     return `${sessionId}:${subId}`;
   }
 
+  /** Per-IP NEG-OPEN budget: NEG_OPEN_PER_IP_PER_MIN per rolling minute. */
+  private takeNegOpenBudget(ip: string): boolean {
+    const now = Date.now();
+    const bucket = this.negIpBuckets.get(ip);
+    if (!bucket || now >= bucket.resetAt) {
+      this.negIpBuckets.set(ip, { count: 1, resetAt: now + 60000 });
+      return true;
+    }
+    if (bucket.count >= NEG_OPEN_PER_IP_PER_MIN) return false;
+    bucket.count++;
+    return true;
+  }
+
   private reclaimIdleNegSessions(): void {
     const now = Date.now();
     for (const [key, neg] of this.negSessions) {
@@ -1174,6 +1200,19 @@ export class RelayWebSocket implements DurableObject {
 
     if (!session.reqRateLimiter.removeToken()) {
       this.sendNegErr(session.webSocket, subId, 'rate-limited: slow down there chief');
+      return;
+    }
+
+    // Federation budgets (audit P1): NEG-OPEN materializes up to
+    // NEG_MAX_ITEMS records + CPU work per session, so it gets dedicated
+    // budgets beyond the generic REQ bucket — a per-IP open rate and a
+    // per-DO concurrent session cap.
+    if (this.negSessions.size >= NEG_MAX_CONCURRENT_SESSIONS) {
+      this.sendNegErr(session.webSocket, subId, 'blocked: too many active sync sessions on this relay node');
+      return;
+    }
+    if (session.ip && !this.takeNegOpenBudget(session.ip)) {
+      this.sendNegErr(session.webSocket, subId, 'rate-limited: too many sync sessions from your network');
       return;
     }
 
@@ -1222,6 +1261,7 @@ export class RelayWebSocket implements DurableObject {
 
       this.negSessions.set(this.negKey(session.id, subId), {
         neg,
+        ip: session.ip,
         filter,
         createdAt: Date.now(),
         itemCount: items.length,
@@ -1390,6 +1430,7 @@ export class RelayWebSocket implements DurableObject {
           attachment.challenge,
           attachment.hasPaid,
           subscriptions,
+          attachment.ip,
         );
         this.sessions.set(attachment.sessionId, session);
       }

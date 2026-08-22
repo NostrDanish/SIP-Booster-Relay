@@ -42,5 +42,6 @@ export function runtimeOwnerPubkey(env: Env): string {
 export function runtimeDeployServiceEnabled(env: Env): boolean {
   const v = env.DEPLOY_SERVICE_ENABLED?.trim().toLowerCase();
   if (v === 'false' || v === '0' || v === 'off') return false;
+  if (v === 'true' || v === '1' || v === 'on') return true; // standalone service worker
   return config.DEPLOY_SERVICE_ENABLED;
 }

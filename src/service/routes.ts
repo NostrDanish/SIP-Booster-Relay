@@ -24,6 +24,7 @@ import { getServiceSettings, setServiceSetting, SERVICE_SETTING_KEYS } from './s
 import { payWithLightning, payWithPre, hasDeployCredit, consumeDeployCredit } from './pay';
 import { orchestrateDeploy } from './deploy';
 import { verifyAdminAuth } from './auth';
+import { validateServiceConfig } from './config-check';
 import { runtimeOwnerPubkey, runtimeDeployServiceEnabled } from '../runtime-config';
 import { verifyEventSignature } from '../relay-worker';
 
@@ -103,29 +104,39 @@ export async function handleServiceApi(request: Request, env: Env, url: URL): Pr
   const session: Session = env.RELAY_DATABASE.withSession('first-primary');
   const rawBody = request.method === 'GET' || request.method === 'HEAD' ? '' : await request.text();
 
+  // Live settings (D1) → config validation (audit P0-2): a misconfigured
+  // service never accepts money.
+  const settings = await getServiceSettings(session, env);
+  const check = validateServiceConfig(settings.pre_address);
+
   /* ---------------- public config ---------------- */
   if (path === 'config' && request.method === 'GET') {
-    const s = await getServiceSettings(session, env);
     return json({
       enabled: true,
-      owner_npub: s.zap_npub,
+      owner_npub: settings.zap_npub,
       owner_pubkey: runtimeOwnerPubkey(env),
-      deploy_price_sats: Number(s.deploy_price_sats),
-      deploy_price_pre: Number(s.deploy_price_pre),
-      zap_npub: s.zap_npub,
+      deploy_price_sats: Number(settings.deploy_price_sats),
+      deploy_price_pre: Number(settings.deploy_price_pre),
+      zap_npub: settings.zap_npub,
       pre: {
-        address: s.pre_address,
+        address: settings.pre_address,
         token_contract: config.PRE_TOKEN_CONTRACT,
         chain_id: config.BASE_CHAIN_ID,
         network: 'Base',
         decimals: config.PRE_TOKEN_DECIMALS,
       },
+      methods: { lightning: check.lightningEnabled, pre: check.preEnabled },
+      config_errors: check.errors,
       relay_repo: 'https://github.com/NostrDanish/SIP-Booster-Relay',
     });
   }
 
   /* ---------------- payments ---------------- */
   if (path === 'pay/lightning' && request.method === 'POST') {
+
+  /* ---------------- payments ---------------- */
+  if (path === 'pay/lightning' && request.method === 'POST') {
+    if (!check.lightningEnabled) return json({ error: `Lightning payments not available: ${check.errors.join('; ')}` }, 503);
     const pubkey = await authedPubkey(request, rawBody);
     if (!pubkey) return json({ error: 'sign in with Nostr first (signed auth required)' }, 401);
     let body: any;
@@ -136,6 +147,7 @@ export async function handleServiceApi(request: Request, env: Env, url: URL): Pr
   }
 
   if (path === 'pay/pre' && request.method === 'POST') {
+    if (!check.preEnabled) return json({ error: `PRE payments not available: ${check.errors.join('; ')}` }, 503);
     const pubkey = await authedPubkey(request, rawBody);
     if (!pubkey) return json({ error: 'sign in with Nostr first (signed auth required)' }, 401);
     let body: any;
@@ -153,6 +165,9 @@ export async function handleServiceApi(request: Request, env: Env, url: URL): Pr
 
   /* ---------------- deploy ---------------- */
   if (path === 'deploy' && request.method === 'POST') {
+    if (!check.ok) {
+      return json({ error: `deploy service is misconfigured: ${check.errors.join('; ')}` }, 503);
+    }
     const pubkey = await authedPubkey(request, rawBody);
     if (!pubkey) return json({ error: 'sign in with Nostr first (signed auth required)' }, 401);
 
@@ -168,15 +183,29 @@ export async function handleServiceApi(request: Request, env: Env, url: URL): Pr
       return json({ error: 'too many deployments from this IP today' }, 429);
     }
 
-    // Consume the credit only after a successful deploy.
     const creditId = await consumeDeployCredit(session, pubkey);
+    const workerName = String(body.workerName || '');
+
+    // Idempotency (audit P1): the job row exists before provisioning starts,
+    // so a Cloudflare timeout after partial provisioning never becomes an
+    // accidental double deployment — the job is the record.
+    let jobId: number | null = null;
+    if (creditId !== null) {
+      const job = await session
+        .prepare("INSERT INTO deploy_jobs (pubkey, worker_name, relay_url, payment_id, status) VALUES (?, ?, '', ?, 'provisioning') RETURNING id")
+        .bind(pubkey, workerName, creditId)
+        .first()
+        .catch((e) => { console.error('deploy_jobs insert failed:', e); return null; });
+      jobId = (job?.id as number) ?? null;
+    }
+
     let result;
     try {
       result = await orchestrateDeploy({
         pubkey,
         cfToken: String(body.cfToken || ''),
         cfAccountId: String(body.cfAccountId || ''),
-        workerName: String(body.workerName || ''),
+        workerName,
         // The customer is the owner of their deployed relay by default.
         relayName: body.relayName ? String(body.relayName) : undefined,
         relayNpub: body.relayNpub ? String(body.relayNpub) : undefined,
@@ -186,13 +215,15 @@ export async function handleServiceApi(request: Request, env: Env, url: URL): Pr
       result = { ok: false, error: error?.message ?? 'deploy failed', steps: [] };
     }
 
-    if (result.ok && creditId !== null) {
+    if (jobId !== null) {
       await session
-        .prepare('INSERT INTO deploy_jobs (pubkey, worker_name, relay_url, payment_id) VALUES (?, ?, ?, ?)')
-        .bind(pubkey, String(body.workerName || ''), result.relay_wss_url ?? '', creditId)
+        .prepare("UPDATE deploy_jobs SET status = ?, relay_url = ?, steps = ? WHERE id = ?")
+        .bind(result.ok ? 'deployed' : 'failed', result.relay_wss_url ?? '', JSON.stringify(result.steps ?? []), jobId)
         .run()
-        .catch((e) => console.error('deploy_jobs insert failed:', e));
-    } else if (!result.ok && creditId !== null) {
+        .catch((e) => console.error('deploy_jobs update failed:', e));
+    }
+
+    if (!result.ok && creditId !== null) {
       // Refund the credit on failure.
       await session.prepare('UPDATE deploy_payments SET used_at = NULL WHERE id = ?').bind(creditId).run()
         .catch(() => undefined);
@@ -240,7 +271,7 @@ export async function handleServiceApi(request: Request, env: Env, url: URL): Pr
 
     if (path === 'admin/jobs' && request.method === 'GET') {
       const rows = await session
-        .prepare('SELECT id, pubkey, worker_name, relay_url, payment_id, created_at FROM deploy_jobs ORDER BY id DESC LIMIT 200')
+        .prepare('SELECT id, pubkey, worker_name, relay_url, payment_id, status, steps, created_at FROM deploy_jobs ORDER BY id DESC LIMIT 200')
         .all();
       return json({ jobs: rows.results ?? [] });
     }

@@ -35,16 +35,16 @@ jobs:
             node scripts/build.mjs
           } 2>&1 | tee build-output.txt
 
-      - name: Commit worker.js on success
+      - name: Commit worker.js + service-worker.js on success
         if: success()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -f worker.js
+          git add -f worker.js service-worker.js
           if git diff --cached --quiet; then
-            echo "worker.js unchanged"
+            echo "bundles unchanged"
           else
-            git commit -m "chore: rebuild worker.js bundle"
+            git commit -m "chore: rebuild worker bundles"
             git push
           fi
 

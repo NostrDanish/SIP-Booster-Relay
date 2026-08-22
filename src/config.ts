@@ -102,6 +102,12 @@ export const NEG_FRAME_SIZE_LIMIT = 256 * 1024; // 256 KB
 /** Idle timeout after which a NEG session is reclaimed (NEG-ERR closed:). */
 export const NEG_SESSION_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
 
+/** Federation abuse budgets (audit P1): NEG-OPEN rate per client IP and a
+ *  concurrent-session cap per Durable Object — reconciliation is CPU/D1
+ *  work, so it gets its own budgets beyond the generic REQ rate limit. */
+export const NEG_OPEN_PER_IP_PER_MIN = 10;
+export const NEG_MAX_CONCURRENT_SESSIONS = 25;
+
 // ---------------------------------------------------------------------------
 // Event counts (NIP-45)
 // ---------------------------------------------------------------------------
@@ -142,11 +148,17 @@ export const RELAY_ACCESS_PRICE_SATS = 212121; // Price in SATS for relay access
  * HOSTED DEPLOY SERVICE. When enabled, this instance can deploy stock-config
  * SIP relays into a customer's own Cloudflare account after payment.
  *
+ * ISOLATION (audit P0): the service handles customer Cloudflare credentials,
+ * so it should NOT run on your public relay — ship it as its own Worker via
+ * `wrangler.service.toml` (src/service-worker.ts) on a separate hostname.
+ * Default is therefore `false`; the standalone service worker enables it via
+ * the DEPLOY_SERVICE_ENABLED binding (see src/runtime-config.ts).
+ *
  * All values below are DEFAULTS. The live values are editable at runtime from
  * the /admin dashboard (stored in D1 `service_settings`), so the owner can
  * change prices and receiving wallets without redeploying.
  */
-export const DEPLOY_SERVICE_ENABLED = true;
+export const DEPLOY_SERVICE_ENABLED = false;
 
 /** The service owner's pubkey (hex) — only this key can sign into /admin. */
 export const SERVICE_OWNER_PUBKEY = "e34726ccb624f4bb6aebabdfd9a41f5e160ca97ba2ea13fad8f8ff29a7f84bca";
@@ -166,11 +178,30 @@ export const DEPLOY_PRE_ADDRESS = "0x0000000000000000000000000000000000000000";
 /** PRE token contract on Base (chain id 8453). */
 export const PRE_TOKEN_CONTRACT = "0x3816dd4bd44c8830c2fa020a5605bac72fa3de7a";
 export const PRE_TOKEN_DECIMALS = 18;
-export const BASE_RPC_URL = "https://mainnet.base.org";
 export const BASE_CHAIN_ID = 8453;
 
-/** Repository the deploy bundle is fetched from (CI-built worker.js). */
-export const DEPLOY_BUNDLE_URL = "https://raw.githubusercontent.com/NostrDanish/SIP-Booster-Relay/main/worker.js";
+/**
+ * Base RPC endpoints — PRE payment verification queries ALL of them and
+ * requires quorum agreement (a single compromised RPC cannot fake a payment).
+ */
+export const BASE_RPC_URLS = [
+  "https://mainnet.base.org",
+  "https://base-rpc.publicnode.com",
+];
+/** Minimum endpoints that must agree on a PRE payment. */
+export const BASE_RPC_QUORUM = 2;
+
+/**
+ * Deploy bundle provenance (audit P0-3): deployments are pinned to an
+ * immutable commit — never `main`. Bump DEPLOY_BUNDLE_REF and
+ * DEPLOY_BUNDLE_SHA256 together per release (`sha256sum worker.js` of the
+ * CI-built bundle at that commit). The hash check is enforced whenever
+ * DEPLOY_BUNDLE_SHA256 is non-empty.
+ */
+export const DEPLOY_BUNDLE_REF = "405dc089b8ec8c4fbd1a3b294a16b6bb4718467a";
+export const DEPLOY_BUNDLE_SHA256 = "";
+export const DEPLOY_BUNDLE_URL =
+  `https://raw.githubusercontent.com/NostrDanish/SIP-Booster-Relay/${DEPLOY_BUNDLE_REF}/worker.js`;
 
 /** Deploy API abuse guard: max deployments per IP per day. */
 export const DEPLOY_MAX_PER_IP_PER_DAY = 10;

@@ -87,12 +87,10 @@ export const SIP01_SCHEMA_STATEMENTS: string[] = [
 ];
 
 /**
- * Schema v7 migration: rebuild the multi-value tag cache so it also covers
- * the SIP-01 filterable single-letter tags `l` and `x`, add the companion
- * first-value columns on `events`, and backfill from the `tags` table.
- * Idempotent; safe to run on a fresh database.
+ * Schema version. v7: SIP-01 tag-cache rebuild (incl. `l`/`x`). v8:
+ * idempotent deployment tracking (deploy job status/steps; audit P1).
  */
-export const SCHEMA_VERSION = 7;
+export const SCHEMA_VERSION = 8;
 
 export function migrationV7Statements(): string[] {
   return [
@@ -127,6 +125,14 @@ export function migrationV7Statements(): string[] {
     `UPDATE events SET
       tag_x = (SELECT tag_value FROM tags WHERE event_id = events.id AND tag_name = 'x' LIMIT 1)
       WHERE EXISTS (SELECT 1 FROM tags t WHERE t.event_id = events.id AND t.tag_name = 'x')`,
+  ];
+}
+
+/** v8: idempotent deployment tracking (audit P1) — status + step log. */
+export function migrationV8Statements(): string[] {
+  return [
+    `ALTER TABLE deploy_jobs ADD COLUMN status TEXT NOT NULL DEFAULT 'deployed'`,
+    `ALTER TABLE deploy_jobs ADD COLUMN steps TEXT`,
   ];
 }
 

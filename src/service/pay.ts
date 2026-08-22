@@ -121,8 +121,8 @@ interface RpcReceipt {
   blockNumber?: string;
 }
 
-async function baseRpc(method: string, params: unknown[]): Promise<any> {
-  const res = await fetch(config.BASE_RPC_URL, {
+async function baseRpc(url: string, method: string, params: unknown[]): Promise<any> {
+  const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
@@ -131,6 +131,35 @@ async function baseRpc(method: string, params: unknown[]): Promise<any> {
   const data = (await res.json()) as { result?: any; error?: { message?: string } };
   if (data.error) throw new Error(`Base RPC ${data.error.message || 'error'}`);
   return data.result;
+}
+
+/**
+ * Query every configured Base RPC endpoint and count agreement (audit P1):
+ * a single compromised RPC must not be able to fake a payment. At least
+ * BASE_RPC_QUORUM endpoints must return byte-equal receipts (status + logs)
+ * for the transaction to be considered.
+ */
+async function baseRpcQuorumReceipt(txHash: string): Promise<{ receipt: RpcReceipt | null; agreed: number; total: number }> {
+  const receipts = await Promise.allSettled(
+    config.BASE_RPC_URLS.map((url) => baseRpc(url, 'eth_getTransactionReceipt', [txHash])),
+  );
+  const ok = receipts
+    .filter((r): r is PromiseFulfilledResult<RpcReceipt | null> => r.status === 'fulfilled')
+    .map((r) => r.value)
+    .filter((r): r is RpcReceipt => r !== null);
+
+  const groups = new Map<string, { receipt: RpcReceipt; count: number }>();
+  for (const receipt of ok) {
+    const key = JSON.stringify({
+      status: receipt.status,
+      logs: (receipt.logs ?? []).map((l) => [l.address.toLowerCase(), l.topics, l.data]),
+    });
+    const g = groups.get(key) || { receipt, count: 0 };
+    g.count++;
+    groups.set(key, g);
+  }
+  const best = [...groups.values()].sort((a, b) => b.count - a.count)[0];
+  return { receipt: best?.receipt ?? null, agreed: best?.count ?? 0, total: ok.length };
 }
 
 /** Normalize a 32-byte topic or address to a lowercase 0x address. */
@@ -154,13 +183,23 @@ export async function payWithPre(
   }
 
   let receipt: RpcReceipt | null;
+  let agreed = 0;
+  let total = 0;
   try {
-    receipt = await baseRpc('eth_getTransactionReceipt', [txHash]);
+    ({ receipt, agreed, total } = await baseRpcQuorumReceipt(txHash));
   } catch (error: any) {
     return { ok: false, error: `could not reach Base RPC: ${error.message}` };
   }
-  if (!receipt || !receipt.status) {
-    return { ok: false, error: 'transaction not found on Base yet — try again in a few seconds' };
+  if (!receipt) {
+    return {
+      ok: false,
+      error: total === 0
+        ? 'transaction not found on Base yet — try again in a few seconds'
+        : 'RPC endpoints disagree on this transaction — try again shortly',
+    };
+  }
+  if (agreed < config.BASE_RPC_QUORUM) {
+    return { ok: false, error: `only ${agreed}/${config.BASE_RPC_URLS.length} RPC endpoints confirm this transaction (need ${config.BASE_RPC_QUORUM})` };
   }
   if (receipt.status !== '0x1') {
     return { ok: false, error: 'transaction failed on-chain' };
