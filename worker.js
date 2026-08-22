@@ -38,12 +38,15 @@ __export(config_exports, {
   AUTH_REQUIRED: () => AUTH_REQUIRED,
   AUTH_TIMEOUT_MS: () => AUTH_TIMEOUT_MS,
   BASE_CHAIN_ID: () => BASE_CHAIN_ID,
-  BASE_RPC_URL: () => BASE_RPC_URL,
+  BASE_RPC_QUORUM: () => BASE_RPC_QUORUM,
+  BASE_RPC_URLS: () => BASE_RPC_URLS,
   COUNT_MAX_ESTIMATE: () => COUNT_MAX_ESTIMATE,
   DB_PRUNE_BATCH_SIZE: () => DB_PRUNE_BATCH_SIZE,
   DB_PRUNE_TARGET_GB: () => DB_PRUNE_TARGET_GB,
   DB_PRUNING_ENABLED: () => DB_PRUNING_ENABLED,
   DB_SIZE_THRESHOLD_GB: () => DB_SIZE_THRESHOLD_GB,
+  DEPLOY_BUNDLE_REF: () => DEPLOY_BUNDLE_REF,
+  DEPLOY_BUNDLE_SHA256: () => DEPLOY_BUNDLE_SHA256,
   DEPLOY_BUNDLE_URL: () => DEPLOY_BUNDLE_URL,
   DEPLOY_MAX_PER_IP_PER_DAY: () => DEPLOY_MAX_PER_IP_PER_DAY,
   DEPLOY_PRE_ADDRESS: () => DEPLOY_PRE_ADDRESS,
@@ -52,7 +55,9 @@ __export(config_exports, {
   DEPLOY_SERVICE_ENABLED: () => DEPLOY_SERVICE_ENABLED,
   DEPLOY_ZAP_NPUB: () => DEPLOY_ZAP_NPUB,
   NEG_FRAME_SIZE_LIMIT: () => NEG_FRAME_SIZE_LIMIT,
+  NEG_MAX_CONCURRENT_SESSIONS: () => NEG_MAX_CONCURRENT_SESSIONS,
   NEG_MAX_ITEMS: () => NEG_MAX_ITEMS,
+  NEG_OPEN_PER_IP_PER_MIN: () => NEG_OPEN_PER_IP_PER_MIN,
   NEG_SESSION_TIMEOUT_MS: () => NEG_SESSION_TIMEOUT_MS,
   NIP45_ENABLED: () => NIP45_ENABLED,
   NIP50_ENABLED: () => NIP50_ENABLED,
@@ -127,13 +132,15 @@ var NIP77_ENABLED = true;
 var NEG_MAX_ITEMS = 1e5;
 var NEG_FRAME_SIZE_LIMIT = 256 * 1024;
 var NEG_SESSION_TIMEOUT_MS = 10 * 60 * 1e3;
+var NEG_OPEN_PER_IP_PER_MIN = 10;
+var NEG_MAX_CONCURRENT_SESSIONS = 25;
 var NIP45_ENABLED = true;
 var COUNT_MAX_ESTIMATE = 5e4;
 var PAYMENT_MODE = "free";
 var PAY_TO_RELAY_ENABLED = PAYMENT_MODE === "pay-to-relay";
 var relayNpub = "npub1udrjdn9kyn6tk6ht400anfqltctqe2tm5t4p87kclrljnflcf09qvl3tay";
 var RELAY_ACCESS_PRICE_SATS = 212121;
-var DEPLOY_SERVICE_ENABLED = true;
+var DEPLOY_SERVICE_ENABLED = false;
 var SERVICE_OWNER_PUBKEY = "e34726ccb624f4bb6aebabdfd9a41f5e160ca97ba2ea13fad8f8ff29a7f84bca";
 var DEPLOY_PRICE_SATS = 21420;
 var DEPLOY_PRICE_PRE = 500;
@@ -141,9 +148,15 @@ var DEPLOY_ZAP_NPUB = relayNpub;
 var DEPLOY_PRE_ADDRESS = "0x0000000000000000000000000000000000000000";
 var PRE_TOKEN_CONTRACT = "0x3816dd4bd44c8830c2fa020a5605bac72fa3de7a";
 var PRE_TOKEN_DECIMALS = 18;
-var BASE_RPC_URL = "https://mainnet.base.org";
 var BASE_CHAIN_ID = 8453;
-var DEPLOY_BUNDLE_URL = "https://raw.githubusercontent.com/NostrDanish/SIP-Booster-Relay/main/worker.js";
+var BASE_RPC_URLS = [
+  "https://mainnet.base.org",
+  "https://base-rpc.publicnode.com"
+];
+var BASE_RPC_QUORUM = 2;
+var DEPLOY_BUNDLE_REF = "405dc089b8ec8c4fbd1a3b294a16b6bb4718467a";
+var DEPLOY_BUNDLE_SHA256 = "";
+var DEPLOY_BUNDLE_URL = `https://raw.githubusercontent.com/NostrDanish/SIP-Booster-Relay/${DEPLOY_BUNDLE_REF}/worker.js`;
 var DEPLOY_MAX_PER_IP_PER_DAY = 10;
 var AUTH_REQUIRED = false;
 var AUTH_TIMEOUT_MS = 6e5;
@@ -4066,7 +4079,7 @@ var SIP01_SCHEMA_STATEMENTS = [
     value INTEGER NOT NULL DEFAULT 0
   )`
 ];
-var SCHEMA_VERSION = 7;
+var SCHEMA_VERSION = 8;
 function migrationV7Statements() {
   return [
     // Rebuild event_tags_cache_multi without the restrictive CHECK list.
@@ -4103,6 +4116,13 @@ function migrationV7Statements() {
   ];
 }
 __name(migrationV7Statements, "migrationV7Statements");
+function migrationV8Statements() {
+  return [
+    `ALTER TABLE deploy_jobs ADD COLUMN status TEXT NOT NULL DEFAULT 'deployed'`,
+    `ALTER TABLE deploy_jobs ADD COLUMN steps TEXT`
+  ];
+}
+__name(migrationV8Statements, "migrationV8Statements");
 var SERVICE_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS service_settings (
     key TEXT PRIMARY KEY,
@@ -4866,6 +4886,8 @@ function runtimeDeployServiceEnabled(env) {
   const v = env.DEPLOY_SERVICE_ENABLED?.trim().toLowerCase();
   if (v === "false" || v === "0" || v === "off")
     return false;
+  if (v === "true" || v === "1" || v === "on")
+    return true;
   return DEPLOY_SERVICE_ENABLED;
 }
 __name(runtimeDeployServiceEnabled, "runtimeDeployServiceEnabled");
@@ -4963,8 +4985,8 @@ async function payWithLightning(session, event, claimedPubkey, verifySig, env) {
 }
 __name(payWithLightning, "payWithLightning");
 var TRANSFER_TOPIC = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-async function baseRpc(method, params) {
-  const res = await fetch(BASE_RPC_URL, {
+async function baseRpc(url, method, params) {
+  const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params })
@@ -4977,6 +4999,25 @@ async function baseRpc(method, params) {
   return data.result;
 }
 __name(baseRpc, "baseRpc");
+async function baseRpcQuorumReceipt(txHash) {
+  const receipts = await Promise.allSettled(
+    BASE_RPC_URLS.map((url) => baseRpc(url, "eth_getTransactionReceipt", [txHash]))
+  );
+  const ok = receipts.filter((r) => r.status === "fulfilled").map((r) => r.value).filter((r) => r !== null);
+  const groups = /* @__PURE__ */ new Map();
+  for (const receipt of ok) {
+    const key = JSON.stringify({
+      status: receipt.status,
+      logs: (receipt.logs ?? []).map((l) => [l.address.toLowerCase(), l.topics, l.data])
+    });
+    const g = groups.get(key) || { receipt, count: 0 };
+    g.count++;
+    groups.set(key, g);
+  }
+  const best = [...groups.values()].sort((a, b) => b.count - a.count)[0];
+  return { receipt: best?.receipt ?? null, agreed: best?.count ?? 0, total: ok.length };
+}
+__name(baseRpcQuorumReceipt, "baseRpcQuorumReceipt");
 function toAddress(topicOrAddress) {
   return "0x" + topicOrAddress.slice(-40).toLowerCase();
 }
@@ -4991,13 +5032,21 @@ async function payWithPre(session, txHash, claimedPubkey, env) {
     return { ok: false, error: "service PRE wallet is not configured" };
   }
   let receipt;
+  let agreed = 0;
+  let total = 0;
   try {
-    receipt = await baseRpc("eth_getTransactionReceipt", [txHash]);
+    ({ receipt, agreed, total } = await baseRpcQuorumReceipt(txHash));
   } catch (error) {
     return { ok: false, error: `could not reach Base RPC: ${error.message}` };
   }
-  if (!receipt || !receipt.status) {
-    return { ok: false, error: "transaction not found on Base yet \u2014 try again in a few seconds" };
+  if (!receipt) {
+    return {
+      ok: false,
+      error: total === 0 ? "transaction not found on Base yet \u2014 try again in a few seconds" : "RPC endpoints disagree on this transaction \u2014 try again shortly"
+    };
+  }
+  if (agreed < BASE_RPC_QUORUM) {
+    return { ok: false, error: `only ${agreed}/${BASE_RPC_URLS.length} RPC endpoints confirm this transaction (need ${BASE_RPC_QUORUM})` };
   }
   if (receipt.status !== "0x1") {
     return { ok: false, error: "transaction failed on-chain" };
@@ -5118,12 +5167,19 @@ async function orchestrateDeploy(req) {
     if (bundle.length < 1e4 || !bundle.includes("RelayWebSocket")) {
       throw new Error("bundle looks wrong");
     }
+    if (DEPLOY_BUNDLE_SHA256) {
+      const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(bundle));
+      const hex = Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+      if (hex !== DEPLOY_BUNDLE_SHA256.toLowerCase()) {
+        throw new Error("bundle SHA-256 mismatch \u2014 refusing to deploy unverified software");
+      }
+    }
     if (!fromCache) {
       await caches.default.put(cacheReq, new Response(bundle, {
         headers: { "Cache-Control": "public, max-age=3600" }
       }));
     }
-    steps.push({ step: "fetch-bundle", ok: true, detail: `${bundle.length} bytes${fromCache ? " (edge cache)" : ""}` });
+    steps.push({ step: "fetch-bundle", ok: true, detail: `${bundle.length} bytes @${DEPLOY_BUNDLE_REF.slice(0, 8)}${DEPLOY_BUNDLE_SHA256 ? ", sha256 verified" : ""}${fromCache ? " (edge cache)" : ""}` });
   } catch (error) {
     steps.push({ step: "fetch-bundle", ok: false, detail: error?.message });
     return { ok: false, error: `could not fetch the relay bundle: ${error?.message ?? error}`, steps };
@@ -5294,6 +5350,42 @@ async function verifyAdminAuth(request, rawBody, env) {
 }
 __name(verifyAdminAuth, "verifyAdminAuth");
 
+// src/service/config-check.ts
+var ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
+function validateServiceConfig(preAddressOverride) {
+  const errors = [];
+  const lightningEnabled = npubToHex(DEPLOY_ZAP_NPUB) !== null;
+  if (!lightningEnabled) {
+    errors.push("DEPLOY_ZAP_NPUB is not a valid npub \u2014 Lightning payments disabled");
+  }
+  const preAddress = (preAddressOverride ?? DEPLOY_PRE_ADDRESS).toLowerCase();
+  const rpcOk = BASE_RPC_URLS.length > 0 && BASE_RPC_URLS.every((u) => u.startsWith("https://"));
+  const preEnabled = /^0x[0-9a-f]{40}$/.test(preAddress) && preAddress !== ZERO_ADDRESS && rpcOk;
+  if (preAddress === ZERO_ADDRESS) {
+    errors.push("DEPLOY_PRE_ADDRESS is the zero address \u2014 PRE payments disabled until the owner sets a real Base wallet (/admin)");
+  } else if (!/^0x[0-9a-f]{40}$/.test(preAddress)) {
+    errors.push("DEPLOY_PRE_ADDRESS is not a valid 0x EVM address \u2014 PRE payments disabled");
+  }
+  if (!rpcOk) {
+    errors.push("BASE_RPC_URLS must all be https:// endpoints");
+  }
+  try {
+    const u = new URL(DEPLOY_BUNDLE_URL);
+    if (u.protocol !== "https:" || u.pathname.includes("/main/")) {
+      errors.push("DEPLOY_BUNDLE_URL must be https and pinned to an immutable commit (DEPLOY_BUNDLE_REF)");
+    }
+  } catch {
+    errors.push("DEPLOY_BUNDLE_URL is not a valid URL");
+  }
+  return {
+    ok: errors.length === 0 && (lightningEnabled || preEnabled),
+    errors,
+    lightningEnabled,
+    preEnabled
+  };
+}
+__name(validateServiceConfig, "validateServiceConfig");
+
 // src/service/routes.ts
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -5368,26 +5460,31 @@ async function handleServiceApi(request, env, url) {
   const path = url.pathname.replace(/^\/api\/service\/?/, "");
   const session = env.RELAY_DATABASE.withSession("first-primary");
   const rawBody = request.method === "GET" || request.method === "HEAD" ? "" : await request.text();
+  const settings = await getServiceSettings(session, env);
+  const check = validateServiceConfig(settings.pre_address);
   if (path === "config" && request.method === "GET") {
-    const s = await getServiceSettings(session, env);
     return json({
       enabled: true,
-      owner_npub: s.zap_npub,
+      owner_npub: settings.zap_npub,
       owner_pubkey: runtimeOwnerPubkey(env),
-      deploy_price_sats: Number(s.deploy_price_sats),
-      deploy_price_pre: Number(s.deploy_price_pre),
-      zap_npub: s.zap_npub,
+      deploy_price_sats: Number(settings.deploy_price_sats),
+      deploy_price_pre: Number(settings.deploy_price_pre),
+      zap_npub: settings.zap_npub,
       pre: {
-        address: s.pre_address,
+        address: settings.pre_address,
         token_contract: PRE_TOKEN_CONTRACT,
         chain_id: BASE_CHAIN_ID,
         network: "Base",
         decimals: PRE_TOKEN_DECIMALS
       },
+      methods: { lightning: check.lightningEnabled, pre: check.preEnabled },
+      config_errors: check.errors,
       relay_repo: "https://github.com/NostrDanish/SIP-Booster-Relay"
     });
   }
   if (path === "pay/lightning" && request.method === "POST") {
+    if (!check.lightningEnabled)
+      return json({ error: `Lightning payments not available: ${check.errors.join("; ")}` }, 503);
     const pubkey = await authedPubkey(request, rawBody);
     if (!pubkey)
       return json({ error: "sign in with Nostr first (signed auth required)" }, 401);
@@ -5403,6 +5500,8 @@ async function handleServiceApi(request, env, url) {
     return result.ok ? json({ ok: true }) : json({ error: result.error }, 400);
   }
   if (path === "pay/pre" && request.method === "POST") {
+    if (!check.preEnabled)
+      return json({ error: `PRE payments not available: ${check.errors.join("; ")}` }, 503);
     const pubkey = await authedPubkey(request, rawBody);
     if (!pubkey)
       return json({ error: "sign in with Nostr first (signed auth required)" }, 401);
@@ -5424,6 +5523,9 @@ async function handleServiceApi(request, env, url) {
     return json({ paid: await hasDeployCredit(session, pubkey) });
   }
   if (path === "deploy" && request.method === "POST") {
+    if (!check.ok) {
+      return json({ error: `deploy service is misconfigured: ${check.errors.join("; ")}` }, 503);
+    }
     const pubkey = await authedPubkey(request, rawBody);
     if (!pubkey)
       return json({ error: "sign in with Nostr first (signed auth required)" }, 401);
@@ -5441,13 +5543,22 @@ async function handleServiceApi(request, env, url) {
       return json({ error: "too many deployments from this IP today" }, 429);
     }
     const creditId = await consumeDeployCredit(session, pubkey);
+    const workerName = String(body.workerName || "");
+    let jobId = null;
+    if (creditId !== null) {
+      const job = await session.prepare("INSERT INTO deploy_jobs (pubkey, worker_name, relay_url, payment_id, status) VALUES (?, ?, '', ?, 'provisioning') RETURNING id").bind(pubkey, workerName, creditId).first().catch((e) => {
+        console.error("deploy_jobs insert failed:", e);
+        return null;
+      });
+      jobId = job?.id ?? null;
+    }
     let result;
     try {
       result = await orchestrateDeploy({
         pubkey,
         cfToken: String(body.cfToken || ""),
         cfAccountId: String(body.cfAccountId || ""),
-        workerName: String(body.workerName || ""),
+        workerName,
         // The customer is the owner of their deployed relay by default.
         relayName: body.relayName ? String(body.relayName) : void 0,
         relayNpub: body.relayNpub ? String(body.relayNpub) : void 0,
@@ -5456,9 +5567,10 @@ async function handleServiceApi(request, env, url) {
     } catch (error) {
       result = { ok: false, error: error?.message ?? "deploy failed", steps: [] };
     }
-    if (result.ok && creditId !== null) {
-      await session.prepare("INSERT INTO deploy_jobs (pubkey, worker_name, relay_url, payment_id) VALUES (?, ?, ?, ?)").bind(pubkey, String(body.workerName || ""), result.relay_wss_url ?? "", creditId).run().catch((e) => console.error("deploy_jobs insert failed:", e));
-    } else if (!result.ok && creditId !== null) {
+    if (jobId !== null) {
+      await session.prepare("UPDATE deploy_jobs SET status = ?, relay_url = ?, steps = ? WHERE id = ?").bind(result.ok ? "deployed" : "failed", result.relay_wss_url ?? "", JSON.stringify(result.steps ?? []), jobId).run().catch((e) => console.error("deploy_jobs update failed:", e));
+    }
+    if (!result.ok && creditId !== null) {
       await session.prepare("UPDATE deploy_payments SET used_at = NULL WHERE id = ?").bind(creditId).run().catch(() => void 0);
     }
     return json(result, result.ok ? 200 : 502);
@@ -5498,7 +5610,7 @@ async function handleServiceApi(request, env, url) {
       return json({ payments: rows.results ?? [] });
     }
     if (path === "admin/jobs" && request.method === "GET") {
-      const rows = await session.prepare("SELECT id, pubkey, worker_name, relay_url, payment_id, created_at FROM deploy_jobs ORDER BY id DESC LIMIT 200").all();
+      const rows = await session.prepare("SELECT id, pubkey, worker_name, relay_url, payment_id, status, steps, created_at FROM deploy_jobs ORDER BY id DESC LIMIT 200").all();
       return json({ jobs: rows.results ?? [] });
     }
     return json({ error: "unknown admin endpoint" }, 404);
@@ -5692,8 +5804,12 @@ async function initializeDatabase(db) {
     ).first();
     const currentVersion = versionResult ? parseInt(versionResult.value) : 0;
     if (currentVersion < SCHEMA_VERSION) {
-      console.log(`Migrating schema ${currentVersion} \u2192 ${SCHEMA_VERSION} (SIP-01 tag cache rebuild)...`);
-      for (const statement of migrationV7Statements()) {
+      console.log(`Migrating schema ${currentVersion} \u2192 ${SCHEMA_VERSION}...`);
+      const migrationStatements = [
+        ...currentVersion < 7 ? migrationV7Statements() : [],
+        ...currentVersion < 8 ? migrationV8Statements() : []
+      ];
+      for (const statement of migrationStatements) {
         try {
           await session.prepare(statement).run();
         } catch (error) {
@@ -7562,6 +7678,7 @@ var relay_worker_default = {
           newUrl.searchParams.set("continent", cf?.continent || "unknown");
           newUrl.searchParams.set("country", cf?.country || "unknown");
           newUrl.searchParams.set("doName", doName);
+          newUrl.searchParams.set("ip", request.headers.get("CF-Connecting-IP") || "");
           return stub.fetch(new Request(newUrl, request));
         } else if ((request.headers.get("Accept") || "").includes("application/nostr+json")) {
           return handleRelayInfoRequest(request, env);
@@ -8151,6 +8268,8 @@ var _RelayWebSocket = class _RelayWebSocket {
     // NIP-77 negentropy sessions: `${sessionId}:${subId}` → state (in-memory;
     // reclaimed on hibernation/timeout with NEG-ERR closed:)
     this.negSessions = /* @__PURE__ */ new Map();
+    // Federation budget: NEG-OPEN count per client IP per minute
+    this.negIpBuckets = /* @__PURE__ */ new Map();
     // Parsed NIP-50 queries cached per filter object (live delivery matching)
     this.parsedSearchCache = /* @__PURE__ */ new WeakMap();
     // Alarm and cleanup configuration
@@ -8476,7 +8595,8 @@ var _RelayWebSocket = class _RelayWebSocket {
     const [client, server] = Object.values(webSocketPair);
     const sessionId = crypto.randomUUID();
     const host = request.headers.get("host") || url.host;
-    const session = this.createSession(sessionId, server, "first-unconstrained", host, []);
+    const ip = url.searchParams.get("ip") || "";
+    const session = this.createSession(sessionId, server, "first-unconstrained", host, [], void 0, void 0, void 0, ip);
     this.sessions.set(sessionId, session);
     const attachment = {
       sessionId,
@@ -8484,7 +8604,8 @@ var _RelayWebSocket = class _RelayWebSocket {
       host,
       doName: this.doName,
       authenticatedPubkeys: [],
-      challenge: session.challenge
+      challenge: session.challenge,
+      ip
     };
     server.serializeAttachment(attachment);
     this.state.acceptWebSocket(server);
@@ -8500,7 +8621,7 @@ var _RelayWebSocket = class _RelayWebSocket {
     });
   }
   /** Construct a session object with fresh rate limiters and auth state. */
-  createSession(sessionId, ws, bookmark, host, authenticatedPubkeys, challenge2, hasPaid, subscriptions) {
+  createSession(sessionId, ws, bookmark, host, authenticatedPubkeys, challenge2, hasPaid, subscriptions, ip) {
     return {
       id: sessionId,
       webSocket: ws,
@@ -8513,7 +8634,8 @@ var _RelayWebSocket = class _RelayWebSocket {
       host,
       challenge: challenge2 ?? (AUTH_REQUIRED ? this.generateAuthChallenge() : void 0),
       authenticatedPubkeys: new Set(authenticatedPubkeys),
-      hasPaid
+      hasPaid,
+      ip
     };
   }
   // WebSocket Hibernation API handler methods
@@ -8540,7 +8662,8 @@ var _RelayWebSocket = class _RelayWebSocket {
         restoredPubkeys,
         attachment.challenge || (AUTH_REQUIRED ? this.generateAuthChallenge() : void 0),
         attachment.hasPaid,
-        subscriptions
+        subscriptions,
+        attachment.ip
       );
       this.sessions.set(attachment.sessionId, session);
       if (AUTH_REQUIRED && restoredPubkeys.length === 0 && session.challenge) {
@@ -8571,7 +8694,8 @@ var _RelayWebSocket = class _RelayWebSocket {
         doName: this.doName,
         hasPaid: session.hasPaid,
         authenticatedPubkeys: Array.from(session.authenticatedPubkeys),
-        challenge: session.challenge
+        challenge: session.challenge,
+        ip: session.ip
       };
       ws.serializeAttachment(updatedAttachment);
     } catch (error) {
@@ -8975,6 +9099,19 @@ var _RelayWebSocket = class _RelayWebSocket {
   negKey(sessionId, subId) {
     return `${sessionId}:${subId}`;
   }
+  /** Per-IP NEG-OPEN budget: NEG_OPEN_PER_IP_PER_MIN per rolling minute. */
+  takeNegOpenBudget(ip) {
+    const now = Date.now();
+    const bucket = this.negIpBuckets.get(ip);
+    if (!bucket || now >= bucket.resetAt) {
+      this.negIpBuckets.set(ip, { count: 1, resetAt: now + 6e4 });
+      return true;
+    }
+    if (bucket.count >= NEG_OPEN_PER_IP_PER_MIN)
+      return false;
+    bucket.count++;
+    return true;
+  }
   reclaimIdleNegSessions() {
     const now = Date.now();
     for (const [key, neg] of this.negSessions) {
@@ -9000,6 +9137,14 @@ var _RelayWebSocket = class _RelayWebSocket {
     }
     if (!session.reqRateLimiter.removeToken()) {
       this.sendNegErr(session.webSocket, subId, "rate-limited: slow down there chief");
+      return;
+    }
+    if (this.negSessions.size >= NEG_MAX_CONCURRENT_SESSIONS) {
+      this.sendNegErr(session.webSocket, subId, "blocked: too many active sync sessions on this relay node");
+      return;
+    }
+    if (session.ip && !this.takeNegOpenBudget(session.ip)) {
+      this.sendNegErr(session.webSocket, subId, "rate-limited: too many sync sessions from your network");
       return;
     }
     if (typeof filter !== "object" || filter === null) {
@@ -9036,6 +9181,7 @@ var _RelayWebSocket = class _RelayWebSocket {
       const result = neg.reconcile(hexToBytes2(initialMessage));
       this.negSessions.set(this.negKey(session.id, subId), {
         neg,
+        ip: session.ip,
         filter,
         createdAt: Date.now(),
         itemCount: items.length
@@ -9173,7 +9319,8 @@ var _RelayWebSocket = class _RelayWebSocket {
           attachment.authenticatedPubkeys || [],
           attachment.challenge,
           attachment.hasPaid,
-          subscriptions
+          subscriptions,
+          attachment.ip
         );
         this.sessions.set(attachment.sessionId, session);
       }
