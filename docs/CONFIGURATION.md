@@ -58,7 +58,7 @@ customers' own Cloudflare accounts after payment):
 
 | Option | Default | Meaning |
 |---|---|---|
-| `DEPLOY_SERVICE_ENABLED` | `true` | Master switch for `/api/service/*` + the portal's hosted track. |
+| `DEPLOY_SERVICE_ENABLED` | `false` | Master switch for `/api/service/*`. Run the service as its own Worker (`wrangler.service.toml`, binding `DEPLOY_SERVICE_ENABLED = "true"`). |
 | `SERVICE_OWNER_PUBKEY` | (hex) | Only this key can use `/admin` (NIP-98). |
 | `DEPLOY_PRICE_SATS` | `21420` | Default Lightning price (editable live in /admin). |
 | `DEPLOY_PRICE_PRE` | `500` | Default PRE price (editable live in /admin). |
@@ -66,9 +66,13 @@ customers' own Cloudflare accounts after payment):
 | `DEPLOY_PRE_ADDRESS` | `0x000…` | **Set your Base receiving wallet** (editable live). |
 | `PRE_TOKEN_CONTRACT` | `0x3816dd4b…de7a` | PRE token on Base. |
 | `PRE_TOKEN_DECIMALS` | `18` | ERC-20 decimals for price math. |
-| `BASE_RPC_URL` | `https://mainnet.base.org` | Base JSON-RPC endpoint used for payment verification. |
-| `DEPLOY_BUNDLE_URL` | repo `main/worker.js` | The CI-built bundle deployed for customers. |
+| `BASE_RPC_URLS` | mainnet.base.org + base-rpc.publicnode.com | Base JSON-RPC endpoints (all queried; quorum must agree). |
+| `BASE_RPC_QUORUM` | `2` | Minimum agreeing RPC endpoints for a PRE payment. |
+| `DEPLOY_BUNDLE_REF` | pinned commit sha | Immutable commit the deploy bundle is fetched from (never `main`). |
+| `DEPLOY_BUNDLE_SHA256` | `""` | When set, the bundle's SHA-256 must match before any deployment. |
 | `DEPLOY_MAX_PER_IP_PER_DAY` | `10` | Deploy endpoint abuse guard. |
+
+NEG budgets: `NEG_OPEN_PER_IP_PER_MIN` (10), `NEG_MAX_CONCURRENT_SESSIONS` (25) — see FEDERATION.md.
 
 Runtime values live in D1 (`service_settings`) and win over these defaults;
 the /admin dashboard edits them.

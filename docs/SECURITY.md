@@ -84,7 +84,34 @@ relay only stores their signed observations.
 
 ## Hosted deploy service (`/api/service/*`)
 
-Optional product surface (disable with `DEPLOY_SERVICE_ENABLED = false`):
+Optional product surface. **Isolation (default):** the relay ships with
+`DEPLOY_SERVICE_ENABLED = false` — a public relay should never handle
+customer Cloudflare credentials. Run the service as its own Worker:
+`wrangler deploy --config wrangler.service.toml` (entry
+`src/service-worker.ts`, its own D1 `SERVICE_DATABASE`, no WebSocket/relay
+surface at all). The shared modules make the two deploys one codebase, two
+security domains.
+
+- **Config validation (P0-2):** a zero-address PRE wallet or an undecodable
+  zap npub disables that payment method; if no method is usable, payment and
+  deployment calls fail with 503 naming the problem. Never silently accepts
+  money into a misconfiguration.
+- **Bundle pinning (P0-3):** customer deployments fetch the CI-built
+  `worker.js` at an immutable commit (`DEPLOY_BUNDLE_REF`), never a moving
+  branch. Set `DEPLOY_BUNDLE_SHA256` to also enforce the bundle's hash before
+  provisioning (recommended for production).
+- **Dual-RPC PRE verification (P1):** every Base RPC in `BASE_RPC_URLS` is
+  queried and at least `BASE_RPC_QUORUM` must return byte-identical receipts
+  (status + logs) before a PRE payment counts. A single lying RPC cannot
+  fake a payment.
+- **Deployment idempotency (P1):** each paid deploy is a `deploy_jobs` row
+  (`provisioning` → `deployed`/`failed` with the step log); failures refund
+  the payment credit, and Cloudflare calls are idempotent (D1 create-or-find,
+  worker PUT overwrite, subdomain enable).
+- **Federation budgets (P1):** NEG-OPEN has a per-IP rate
+  (`NEG_OPEN_PER_IP_PER_MIN`) and a per-DO concurrent session cap
+  (`NEG_MAX_CONCURRENT_SESSIONS`) on top of the global item/frame/session
+  limits — negentropy is CPU + D1 work, not just bandwidth.
 
 - **Customer Cloudflare tokens** arrive over TLS at `POST /api/service/deploy`,
   are used in memory for provisioning calls against `api.cloudflare.com`,

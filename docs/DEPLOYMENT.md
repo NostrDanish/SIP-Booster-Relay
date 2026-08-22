@@ -117,20 +117,35 @@ Optional but recommended:
    them in `wrangler.toml`, which the git flow reads).
 4. Every push to `main` redeploys your relay.
 
-## Hosted deploy service (optional product)
+## Hosted deploy service (optional product, ISOLATED)
 
-Any relay instance can also act as a **paid deployment service** for others:
-customers sign in with Nostr, pay with Lightning (zap) or PRE (Presearch
-token on Base), paste scoped Cloudflare credentials, and the service
-provisions a stock-config relay into *their* account (`/api/service/*`).
+The paid deployment service runs as its **own Worker**, never on the public
+relay (it handles customer Cloudflare credentials — a different trust
+domain):
 
-- Prices and receiving wallets are editable live from the relay's **`/admin`**
-  page (owner NIP-98 sign-in; stored in D1 `service_settings`).
-- Payment verification: kind 9735 zap receipts (Lightning) and on-chain
-  Transfer logs via the public Base RPC (PRE). Single-use proofs.
+```bash
+# service ledger database
+npx wrangler d1 create sip01-deploy-service
+# paste the id into wrangler.service.toml, then:
+npx wrangler deploy --config wrangler.service.toml
+```
+
+That gives you `https://sip-relay-deploy.workers.dev` serving
+`/api/service/*` only. Point the `/deploy` portal at it (the portal asks for
+the service URL when it isn't same-origin).
+
+- Customers sign in with Nostr, pay with Lightning (zap) or PRE (Presearch
+  token on Base), paste scoped Cloudflare credentials, and the service
+  provisions a stock-config relay into *their* account.
+- Prices and receiving wallets are editable live from `/admin` (owner NIP-98
+  sign-in; stored in the service's own D1 `service_settings`).
+- Payment verification: kind 9735 zap receipts (Lightning) and quorum-verified
+  on-chain Transfer logs across multiple Base RPCs (PRE). Single-use proofs.
+- Customer deployments fetch the relay bundle pinned to an immutable commit
+  (`DEPLOY_BUNDLE_REF`) with optional SHA-256 enforcement
+  (`DEPLOY_BUNDLE_SHA256`).
 - The customer's CF token is used in memory only, never stored — see
   docs/SECURITY.md for the full trust model.
-- Disable entirely with `DEPLOY_SERVICE_ENABLED = false`.
 
 ## After deployment
 

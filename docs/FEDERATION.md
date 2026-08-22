@@ -45,6 +45,10 @@ Notes:
   Narrow the filter (e.g. by `since`) and sync in windows.
 - Wire messages are capped at 256 KB; larger diffs split into more rounds
   automatically.
+- Abuse budgets: max `NEG_OPEN_PER_IP_PER_MIN` (10) sync opens per client IP
+  per minute and max `NEG_MAX_CONCURRENT_SESSIONS` (25) concurrent sessions
+  per Durable Object, on top of per-session idle reclamation (10 min).
+  Reconciliation is CPU + D1 work, not just bandwidth — budget accordingly.
 
 ### Minimal sync client (Node)
 
