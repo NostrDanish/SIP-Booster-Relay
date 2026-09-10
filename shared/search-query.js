@@ -695,8 +695,10 @@ export function buildSip01SearchSql(parsed, limit, extras = {}) {
   const { rankSql, params: rankParams } = buildSip01Rank(parsed);
 
   // FTS mode: join the FTS5 index and let bm25 drive text relevance.
+  // NOTE: with the table aliased (`sip01_fts f`), bm25 MUST use the alias —
+  // `bm25(sip01_fts, …)` errors "no such table" (SQLite alias scoping).
   const ftsJoin = useFts ? 'JOIN sip01_fts f ON f.rowid = doc.fts_id' : '';
-  const bm25Select = useFts ? ', bm25(sip01_fts, 10.0, 5.0, 2.0, 1.5) AS bm25rank' : '';
+  const bm25Select = useFts ? ', bm25(f, 10.0, 5.0, 2.0, 1.5) AS bm25rank' : '';
 
   const whereParts = [...(useFts ? ['f MATCH ?'] : []), ...docConditions];
   const where = whereParts.length > 0 ? `WHERE ${whereParts.join(' AND ')}` : '';
