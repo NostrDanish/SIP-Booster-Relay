@@ -58,6 +58,23 @@ Per-connection buckets: 10 writes/min (general) or 120/min for kind 39697,
 50 REQs/min. Crawlers publishing faster should batch/connect with backoff or
 ask the operator to raise `SIP01_INDEXER_RATE_LIMIT`.
 
+## Everything returns errors at once / `schema_ok: false`
+
+If `/api/health` reports `schema_ok: false` and previously-working endpoints
+500, check the Cloudflare dashboard for D1 quota messages: the **free tier
+has a daily row-read limit** — a busy index relay (duplicate checks on every
+write + dashboards + searches) can exhaust it in a day. Quotas reset at
+midnight UTC; the relay recovers on its own (no data is lost — writes fail
+cleanly with `error:` OKs while exhausted, so crawler bursts during the
+outage are dropped, not half-stored).
+
+Permanent fixes:
+
+- Upgrade to Workers Paid ($5/mo removes the daily D1 row limits), or
+- throttle ingestion (`SIP01_INDEXER_RATE_LIMIT`, indexer allowlist), or
+- run busy relays behind a second relay and federate (NIP-77) instead of
+  ingesting everywhere.
+
 ## D1 "database is locked" / slow queries under load
 
 Enable D1 read replication (D1 → Settings) — the relay uses the Session API
