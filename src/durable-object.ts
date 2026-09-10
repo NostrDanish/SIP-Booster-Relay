@@ -834,7 +834,7 @@ export class RelayWebSocket implements DurableObject {
       }
 
       // NIP-42: Check authentication
-      if (AUTH_REQUIRED) {
+      if (this.authRequired()) {
         if (session.authenticatedPubkeys.size === 0) {
           this.sendOK(session.webSocket, event.id, false, 'auth-required: authenticate to publish events');
           return;
