@@ -25,7 +25,7 @@ import * as config from './config';
 import { RelayWebSocket } from './durable-object';
 import { SIP01_KIND, validateSip01Event } from '../shared/sip01.js';
 import { SUPPORTED_NIP50_OPERATORS } from '../shared/search-query.js';
-import { SIP01_SCHEMA_STATEMENTS, SERVICE_SCHEMA_STATEMENTS, SCHEMA_VERSION, migrationV7Statements, migrationV8Statements, migrationV9Statements, CACHED_TAG_NAMES } from './sip01/schema';
+import { SIP01_SCHEMA_STATEMENTS, SERVICE_SCHEMA_STATEMENTS, SCHEMA_VERSION, migrationV7Statements, migrationV8Statements, migrationV9Statements, migrationV10Statements, CACHED_TAG_NAMES } from './sip01/schema';
 import { ingestSip01Observation, removeSip01Observations, bumpMetric } from './sip01/ingest';
 import * as sipApi from './sip01/api';
 import { executeSearch } from './sip01/search';
@@ -260,6 +260,7 @@ async function initializeDatabase(db: D1Database): Promise<void> {
         ...(currentVersion < 7 ? migrationV7Statements() : []),
         ...(currentVersion < 8 ? migrationV8Statements() : []),
         ...(currentVersion < 9 ? migrationV9Statements() : []),
+        ...(currentVersion < 10 ? migrationV10Statements() : []),
       ];
       for (const statement of migrationStatements) {
         try {
@@ -269,6 +270,17 @@ async function initializeDatabase(db: D1Database): Promise<void> {
           if (!error?.message?.includes('duplicate column')) throw error;
         }
       }
+
+      // Post-migration verification: only record the version when the
+      // expected objects actually exist (a broken/partial migration retries
+      // on the next request instead of being marked done forever).
+      const sentinel = await session.prepare(
+        "SELECT COUNT(*) AS n FROM sqlite_master WHERE name IN ('events', 'sip01_documents', 'sip01_observations', 'sip01_indexers', 'sip01_fts')"
+      ).first() as { n: number } | null;
+      if (((sentinel?.n as number) ?? 0) < 5) {
+        throw new Error('schema migration incomplete — sentinel objects missing (will retry on next request)');
+      }
+
       await session.prepare(
         "INSERT OR REPLACE INTO system_config (key, value) VALUES ('schema_version', ?)"
       ).bind(String(SCHEMA_VERSION)).run();

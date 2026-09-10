@@ -90,7 +90,7 @@ export const SIP01_SCHEMA_STATEMENTS: string[] = [
  * Schema version. v7: SIP-01 tag-cache rebuild (incl. `l`/`x`). v8:
  * idempotent deployment tracking (deploy job status/steps; audit P1).
  */
-export const SCHEMA_VERSION = 9;
+export const SCHEMA_VERSION = 10;
 
 export function migrationV7Statements(): string[] {
   return [
@@ -156,6 +156,15 @@ export function migrationV9Statements(): string[] {
        WHERE fts_id IS NOT NULL
          AND NOT EXISTS (SELECT 1 FROM sip01_fts f WHERE f.rowid = sip01_documents.fts_id)`,
   ];
+}
+
+/**
+ * v10: heal databases that recorded schema_version 9 without the v9 objects
+ * (a build with the version bump but without the migration function briefly
+ * existed). All v9 statements are idempotent, so v10 simply re-runs them.
+ */
+export function migrationV10Statements(): string[] {
+  return migrationV9Statements();
 }
 
 /** Column list for the main events table insert (kept in one place). */
