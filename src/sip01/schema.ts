@@ -136,6 +136,28 @@ export function migrationV8Statements(): string[] {
   ];
 }
 
+/**
+ * v9: FTS5 full-text index over document metadata (inspired by the Divine
+ * fork's NIP-50 work; D1 supports FTS5 — lowercase `fts5` required).
+ *
+ * Design: a plain FTS5 table (not external-content), with rowid =
+ * sip01_documents.fts_id, maintained manually at ingest time (delete-then-
+ * insert on update; delete on removal). `d` is stored UNINDEXED for repair.
+ */
+export function migrationV9Statements(): string[] {
+  return [
+    `ALTER TABLE sip01_documents ADD COLUMN fts_id INTEGER`,
+    `UPDATE sip01_documents SET fts_id = rowid WHERE fts_id IS NULL`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_sip01_documents_fts_id ON sip01_documents(fts_id)`,
+    `CREATE VIRTUAL TABLE IF NOT EXISTS sip01_fts USING fts5(d UNINDEXED, title, description, canonical_url, topics, tokenize='porter unicode61')`,
+    `INSERT INTO sip01_fts (rowid, d, title, description, canonical_url, topics)
+       SELECT fts_id, d, title, COALESCE(description, ''), canonical_url, COALESCE(topics, '[]')
+       FROM sip01_documents
+       WHERE fts_id IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM sip01_fts f WHERE f.rowid = sip01_documents.fts_id)`,
+  ];
+}
+
 /** Column list for the main events table insert (kept in one place). */
 export const EVENT_INSERT_COLUMNS =
   'id, pubkey, created_at, kind, tags, content, sig, tag_p, tag_e, tag_a, tag_t, tag_d, tag_r, tag_L, tag_s, tag_u, tag_x, reply_to_event_id, root_event_id, content_preview';
