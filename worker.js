@@ -139,10 +139,10 @@ var NIP45_ENABLED = true;
 var COUNT_MAX_ESTIMATE = 5e4;
 var PAYMENT_MODE = "free";
 var PAY_TO_RELAY_ENABLED = PAYMENT_MODE === "pay-to-relay";
-var relayNpub = "npub1udrjdn9kyn6tk6ht400anfqltctqe2tm5t4p87kclrljnflcf09qvl3tay";
+var relayNpub = "npub1jzha7heltdlq5tdc5uqw0a8d4e2zl9022f8phmjj9h8fhjem0v2qmtdeke";
 var RELAY_ACCESS_PRICE_SATS = 212121;
 var DEPLOY_SERVICE_ENABLED = false;
-var SERVICE_OWNER_PUBKEY = "e34726ccb624f4bb6aebabdfd9a41f5e160ca97ba2ea13fad8f8ff29a7f84bca";
+var SERVICE_OWNER_PUBKEY = "90afdf5f3f5b7e0a2db8a700e7f4edae542f95ea524e1bee522dce9bcb3b7b14";
 var DEPLOY_PRICE_SATS = 21420;
 var DEPLOY_PRICE_PRE = 500;
 var DEPLOY_ZAP_NPUB = relayNpub;
@@ -165,8 +165,8 @@ var DEBUG_LOGS = false;
 var relayInfo = {
   name: "UNCAGED SIP Relay",
   description: "A serverless SIP-01 search index relay \u2014 decentralized web-index observations (Nostr kind 39697) on Cloudflare Workers + D1. One shared decentralized index. Many independent indexers. No single owner.",
-  pubkey: "e34726ccb624f4bb6aebabdfd9a41f5e160ca97ba2ea13fad8f8ff29a7f84bca",
-  contact: "npub1udrjdn9kyn6tk6ht400anfqltctqe2tm5t4p87kclrljnflcf09qvl3tay",
+  pubkey: "90afdf5f3f5b7e0a2db8a700e7f4edae542f95ea524e1bee522dce9bcb3b7b14",
+  contact: "npub1jzha7heltdlq5tdc5uqw0a8d4e2zl9022f8phmjj9h8fhjem0v2qmtdeke",
   supported_nips: [1, 5, 9, 11, 16, 33, 42, 45, 50, 77],
   software: "https://github.com/NostrDanish/SIP-Booster-Relay",
   version: "1.0.0",
@@ -4116,7 +4116,7 @@ var SIP01_SCHEMA_STATEMENTS = [
     value INTEGER NOT NULL DEFAULT 0
   )`
 ];
-var SCHEMA_VERSION = 8;
+var SCHEMA_VERSION = 9;
 function migrationV7Statements() {
   return [
     // Rebuild event_tags_cache_multi without the restrictive CHECK list.
