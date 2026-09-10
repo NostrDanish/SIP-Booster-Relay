@@ -7277,8 +7277,7 @@ async function initializeDatabase(db) {
       dbg(`Migrating schema ${currentVersion} \u2192 ${SCHEMA_VERSION}...`);
       const migrationStatements = [
         ...currentVersion < 7 ? migrationV7Statements() : [],
-        ...currentVersion < 8 ? migrationV8Statements() : [],
-        ...currentVersion < 9 ? migrationV9Statements() : []
+        ...currentVersion < 8 ? migrationV8Statements() : []
       ];
       for (const statement of migrationStatements) {
         try {
