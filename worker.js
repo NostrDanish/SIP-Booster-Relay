@@ -9552,9 +9552,13 @@ _RelayWebSocket.ENDPOINT_HINTS = {
   "relay-ME-primary": "eeur"
 };
 var RelayWebSocket = _RelayWebSocket;
+
+// entry.ts
+var RelayWebSocket2 = RelayWebSocket;
+var entry_default = relay_worker_default;
 export {
-  RelayWebSocket,
-  relay_worker_default as default
+  RelayWebSocket2 as RelayWebSocket,
+  entry_default as default
 };
 /*! Bundled license information:
 
