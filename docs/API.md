@@ -66,9 +66,14 @@ take the first usable token; unusable operator values add no clause.
 Plain words and `"quoted phrases"` match title/description/URL
 (case-insensitive, AND semantics). Unknown operators are ignored (NIP-50).
 
-**Ranking**: +4 per term in title, +2 in description, +min(indexer_count, 8)
-independent-agreement boost, small recency tiebreak. `limit` applies after
-ranking.
+**Ranking**: with the FTS5 index (schema v9+, default on D1), text terms are
+matched by `bm25` relevance (title-weighted) with independent-indexer
+agreement and recency as tiebreaks; without it (or if FTS5 is unavailable),
+terms fall back to substring LIKE matching scored by title/description hits
+(+4/+2), agreement boost (+min(indexer_count, 8)), and recency. `limit`
+applies after ranking. Live subscription delivery uses the in-memory matcher
+(a superset approximation of stored FTS tokenization — stored query results
+are authoritative).
 
 ### NIP-45 count
 
@@ -100,7 +105,8 @@ All endpoints return JSON with CORS enabled.
 |---|---|
 | `GET /` + `Accept: application/nostr+json` | NIP-11 relay information (incl. `uncaged_index`) |
 | `GET /.well-known/nostr.json?name=…` | NIP-05 |
-| `GET /api/health` | `{ status, events, mode, version, time }` |
+| `GET /api/health` | `{ status, events, schema_ok, mode, version, time }` |
+| `GET /metrics` | Prometheus text exposition (counters + gauges) |
 | `GET /api/relay-info` | Public relay configuration for UIs |
 | `GET /api/stats` | Index statistics + metrics + DB size |
 | `GET /api/indexers?limit=&offset=` | Paginated indexer list |
@@ -124,7 +130,8 @@ are additionally gated to `SERVICE_OWNER_PUBKEY`.
 | `POST /api/service/pay/lightning` | customer | `{ event }` kind-9735 zap receipt → verified, credit granted |
 | `POST /api/service/pay/pre` | customer | `{ txHash }` → verified on Base, credit granted |
 | `GET /api/service/payment-status?pubkey=` | — | Whether a pubkey holds an unused deploy credit |
-| `POST /api/service/deploy` | customer + credit | `{ cfToken, cfAccountId, workerName }` → provisions D1 + worker + subdomain in the customer's account |
+| `POST /api/service/deploy` | customer + credit | `{ cfToken, cfAccountId, workerName, relayName?, relayNpub?, ownerPubkey?, paymentMode?, paymentSats?, authRequired? }` → provisions D1 + worker + subdomain in the customer's account (policy fields become runtime bindings) |
+| `GET /api/service/my-deployments` | customer | The caller's own deployment history |
 | `GET /api/service/admin/settings` | owner | Current live settings |
 | `POST /api/service/admin/settings` | owner | `{ key, value }` — update price/wallet |
 | `GET /api/service/admin/payments` | owner | Payment ledger |

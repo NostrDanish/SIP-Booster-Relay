@@ -77,6 +77,25 @@ NEG budgets: `NEG_OPEN_PER_IP_PER_MIN` (10), `NEG_MAX_CONCURRENT_SESSIONS` (25) 
 Runtime values live in D1 (`service_settings`) and win over these defaults;
 the /admin dashboard edits them.
 
+## Runtime overrides (per-deployment, no rebuild)
+
+Plain-text Worker bindings override compile-time config at runtime — this is
+how hosted-deploy customers get their own identity/policy from one stock
+bundle (`src/runtime-config.ts`):
+
+| Binding | Overrides |
+|---|---|
+| `RELAY_NAME` / `RELAY_PUBKEY` / `RELAY_CONTACT` / `RELAY_NPUB` | NIP-11 identity + payment recipient |
+| `SERVICE_OWNER_PUBKEY` | /admin owner |
+| `DEPLOY_SERVICE_ENABLED` | `"true"` enables the service API (used by the standalone service worker) |
+| `PAYMENT_MODE` | `free` / `donation` / `pay-to-relay` |
+| `RELAY_ACCESS_PRICE_SATS` | access price in sats |
+| `AUTH_REQUIRED` | NIP-42 requirement toggle |
+
+Relay mode and NIP toggles stay compile-time (`src/config.ts`) — they shape
+the ingestion pipeline, so they're an operator decision, not a deploy-time
+knob.
+
 ## NIP-42 auth
 
 | Option | Default | Meaning |
@@ -120,6 +139,7 @@ entries pass; block lists always apply.
 | `DB_PRUNE_TARGET_GB` | `8` | Prune down to this size. |
 | `DB_PRUNE_BATCH_SIZE` | `1000` | Events per batch. |
 | `pruneProtectedKinds` | `{0, 3, 10002, 39697}` | Never pruned by age. |
+| `DEBUG_LOGS` | `false` | Verbose per-event/query logging (observability cost control). |
 
 ## Bindings (wrangler.toml / wrangler.jsonc)
 

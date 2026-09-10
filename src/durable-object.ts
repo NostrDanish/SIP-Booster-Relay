@@ -21,8 +21,6 @@ import {
   PUBKEY_RATE_LIMIT,
   REQ_RATE_LIMIT,
   SIP01_INDEXER_RATE_LIMIT,
-  PAY_TO_RELAY_ENABLED,
-  AUTH_REQUIRED,
   AUTH_TIMEOUT_MS,
   NIP50_ENABLED,
   NIP45_ENABLED,
@@ -45,6 +43,7 @@ import { SIP01_KIND, extractSip01Fields } from '../shared/sip01.js';
 import { parseSearchQuery, matchSip01Search } from '../shared/search-query.js';
 import { bumpMetric } from './sip01/ingest';
 import { dbg } from './log';
+import { runtimePaymentMode, runtimeAuthRequired } from './runtime-config';
 
 // Session attachment data structure (minimal - auth state stored in session)
 interface SessionAttachment {
@@ -137,6 +136,16 @@ export class RelayWebSocket implements DurableObject {
     'relay-AFR-primary': 'weur',
     'relay-ME-primary': 'eeur'
   };
+
+  /** Pay-to-relay required (runtime override-aware). */
+  private paymentRequired(): boolean {
+    return runtimePaymentMode(this.env) === 'pay-to-relay';
+  }
+
+  /** NIP-42 auth required (runtime override-aware). */
+  private authRequired(): boolean {
+    return runtimeAuthRequired(this.env);
+  }
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -544,7 +553,7 @@ export class RelayWebSocket implements DurableObject {
 
     this.state.acceptWebSocket(server);
 
-    if (AUTH_REQUIRED && session.challenge) {
+    if (this.authRequired() && session.challenge) {
       this.sendAuth(server, session.challenge);
     }
 
@@ -581,7 +590,7 @@ export class RelayWebSocket implements DurableObject {
       reqRateLimiter: new RateLimiter(REQ_RATE_LIMIT.rate, REQ_RATE_LIMIT.capacity),
       bookmark,
       host,
-      challenge: challenge ?? (AUTH_REQUIRED ? this.generateAuthChallenge() : undefined),
+      challenge: challenge ?? (this.authRequired() ? this.generateAuthChallenge() : undefined),
       authenticatedPubkeys: new Set(authenticatedPubkeys),
       hasPaid,
       ip
@@ -614,14 +623,14 @@ export class RelayWebSocket implements DurableObject {
         attachment.bookmark,
         attachment.host,
         restoredPubkeys,
-        attachment.challenge || (AUTH_REQUIRED ? this.generateAuthChallenge() : undefined),
+        attachment.challenge || (this.authRequired() ? this.generateAuthChallenge() : undefined),
         attachment.hasPaid,
         subscriptions,
         attachment.ip,
       );
       this.sessions.set(attachment.sessionId, session);
 
-      if (AUTH_REQUIRED && restoredPubkeys.length === 0 && session.challenge) {
+      if (this.authRequired() && restoredPubkeys.length === 0 && session.challenge) {
         this.sendAuth(ws, session.challenge);
       }
     }
@@ -858,7 +867,7 @@ export class RelayWebSocket implements DurableObject {
       }
 
       // Check if pay to relay is enabled
-      if (PAY_TO_RELAY_ENABLED && event.kind !== 1059) {
+      if (this.paymentRequired() && event.kind !== 1059) {
         let hasPaid = await this.getCachedPaymentStatus(event.pubkey);
 
         if (hasPaid === null) {
@@ -940,7 +949,7 @@ export class RelayWebSocket implements DurableObject {
       return;
     }
 
-    if (AUTH_REQUIRED && session.authenticatedPubkeys.size === 0) {
+    if (this.authRequired() && session.authenticatedPubkeys.size === 0) {
       this.sendClosed(session.webSocket, subscriptionId, 'auth-required: authentication required to subscribe');
       return;
     }
@@ -1110,7 +1119,7 @@ export class RelayWebSocket implements DurableObject {
       return;
     }
 
-    if (AUTH_REQUIRED && session.authenticatedPubkeys.size === 0) {
+    if (this.authRequired() && session.authenticatedPubkeys.size === 0) {
       this.sendClosed(session.webSocket, queryId, 'auth-required: authentication required');
       return;
     }
@@ -1194,7 +1203,7 @@ export class RelayWebSocket implements DurableObject {
       return;
     }
 
-    if (AUTH_REQUIRED && session.authenticatedPubkeys.size === 0) {
+    if (this.authRequired() && session.authenticatedPubkeys.size === 0) {
       this.sendNegErr(session.webSocket, subId, 'auth-required: authentication required to sync');
       return;
     }
@@ -1388,7 +1397,7 @@ export class RelayWebSocket implements DurableObject {
 
       session.authenticatedPubkeys.add(authEvent.pubkey);
 
-      if (PAY_TO_RELAY_ENABLED) {
+      if (this.paymentRequired()) {
         const paid = await hasPaidForRelay(authEvent.pubkey, this.env);
         if (paid !== null) {
           session.hasPaid = paid;

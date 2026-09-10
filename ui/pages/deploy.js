@@ -316,6 +316,18 @@ async function initHostedTrack(root) {
         <div><label>Relay display name</label><input type="text" id="hs-relay-name" placeholder="My SIP Relay"></div>
         <div><label>Relay owner npub (admin + payment recipient)</label><input type="text" id="hs-owner-npub" placeholder="npub1… (defaults to your signed-in key)"></div>
       </div>
+      <div class="field-row">
+        <div><label>Relay payment mode</label>
+          <select id="hs-payment-mode">
+            <option value="free" selected>Free (open relay)</option>
+            <option value="donation">Donation (optional zap button)</option>
+            <option value="pay-to-relay">Pay-to-publish (zap required)</option>
+          </select>
+        </div>
+        <div><label>Access price (sats)</label><input type="number" id="hs-payment-sats" value="1000" min="1"></div>
+        <div><label class="inline" style="margin-top:1.6rem"><input type="checkbox" id="hs-auth"> Require NIP-42 auth</label></div>
+      </div>
+      <p class="faint small">These become runtime bindings on your relay — changeable later without a rebuild.</p>
     </div>
 
     <div class="deploy-step" id="hs-go-step">
@@ -413,6 +425,9 @@ async function initHostedTrack(root) {
         relayName: /** @type {HTMLInputElement} */ (body.querySelector('#hs-relay-name')).value.trim() || undefined,
         relayNpub: ownerNpubInput || hexToNpub(pk) || undefined,
         ownerPubkey: npubToHex(ownerNpubInput) || pk,
+        paymentMode: /** @type {HTMLSelectElement} */ (body.querySelector('#hs-payment-mode')).value,
+        paymentSats: Math.max(1, parseInt(/** @type {HTMLInputElement} */ (body.querySelector('#hs-payment-sats')).value, 10) || 1000),
+        authRequired: /** @type {HTMLInputElement} */ (body.querySelector('#hs-auth')).checked,
       };
       if (!payload.cfToken || !payload.cfAccountId || !payload.workerName) {
         out.innerHTML = `<div class="notice"><strong>Missing Cloudflare details.</strong></div>`;

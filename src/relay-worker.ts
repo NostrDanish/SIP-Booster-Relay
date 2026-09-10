@@ -33,7 +33,7 @@ import { verifyZapReceipt, hasPaidForRelay, savePaidPubkey } from './pay';
 import { serveMiniLanding } from './mini-landing';
 import { handleServiceApi } from './service/routes';
 import { dbg } from './log';
-import { runtimeRelayName, runtimeRelayPubkey, runtimeRelayContact, runtimeRelayNpub } from './runtime-config';
+import { runtimeRelayName, runtimeRelayPubkey, runtimeRelayContact, runtimeRelayNpub, runtimePaymentMode, runtimePaymentPriceSats, runtimeAuthRequired } from './runtime-config';
 
 // Import config values
 const {
@@ -1820,13 +1820,14 @@ function handleRelayInfoRequest(request: Request, env: Env): Response {
     };
   }
 
-  if (PAYMENT_MODE !== 'free') {
+  const paymentMode = runtimePaymentMode(env);
+  if (paymentMode !== 'free') {
     const url = new URL(request.url);
     responseInfo.payments_url = `${url.protocol}//${url.host}`;
   }
-  if (PAY_TO_RELAY_ENABLED) {
+  if (paymentMode === 'pay-to-relay') {
     responseInfo.fees = {
-      admission: [{ amount: RELAY_ACCESS_PRICE_SATS * 1000, unit: "msats" }]
+      admission: [{ amount: runtimePaymentPriceSats(env) * 1000, unit: "msats" }]
     };
   }
 
@@ -1997,10 +1998,10 @@ async function handleApiRequest(url: URL, request: Request, env: Env): Promise<R
       nip50: NIP50_ENABLED,
       nip45: NIP45_ENABLED,
       nip77: NIP77_ENABLED,
-      auth_required: config.AUTH_REQUIRED,
-      payment_mode: PAYMENT_MODE,
-      payment_sats: RELAY_ACCESS_PRICE_SATS,
-      payment_npub: relayNpub,
+      auth_required: runtimeAuthRequired(env),
+      payment_mode: runtimePaymentMode(env),
+      payment_sats: runtimePaymentPriceSats(env),
+      payment_npub: runtimeRelayNpub(env),
       supported_operators: [...SUPPORTED_NIP50_OPERATORS],
     });
   }

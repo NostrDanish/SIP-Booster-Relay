@@ -160,6 +160,18 @@ export async function handleServiceApi(request: Request, env: Env, url: URL): Pr
     return json({ paid: await hasDeployCredit(session, pubkey) });
   }
 
+  // Customer self-service: their own deployments (their Nostr key is the
+  // credential — NIP-98 signed).
+  if (path === 'my-deployments' && request.method === 'GET') {
+    const pubkey = await authedPubkey(request, rawBody);
+    if (!pubkey) return json({ error: 'sign in with Nostr first (signed auth required)' }, 401);
+    const rows = await session
+      .prepare("SELECT id, worker_name, relay_url, status, created_at FROM deploy_jobs WHERE pubkey = ? ORDER BY id DESC LIMIT 100")
+      .bind(pubkey)
+      .all();
+    return json({ deployments: rows.results ?? [] });
+  }
+
   /* ---------------- deploy ---------------- */
   if (path === 'deploy' && request.method === 'POST') {
     if (!check.ok) {
@@ -207,6 +219,9 @@ export async function handleServiceApi(request: Request, env: Env, url: URL): Pr
         relayName: body.relayName ? String(body.relayName) : undefined,
         relayNpub: body.relayNpub ? String(body.relayNpub) : undefined,
         ownerPubkey: body.ownerPubkey ? String(body.ownerPubkey) : pubkey,
+        paymentMode: body.paymentMode ? String(body.paymentMode) : undefined,
+        paymentSats: typeof body.paymentSats === 'number' ? body.paymentSats : undefined,
+        authRequired: typeof body.authRequired === 'boolean' ? body.authRequired : undefined,
       });
     } catch (error: any) {
       result = { ok: false, error: error?.message ?? 'deploy failed', steps: [] };

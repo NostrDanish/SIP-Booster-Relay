@@ -23,6 +23,10 @@ export interface DeployRequest {
   relayName?: string;
   relayNpub?: string;
   ownerPubkey?: string;
+  /** Per-deployment policy overrides. */
+  paymentMode?: string;
+  paymentSats?: number;
+  authRequired?: boolean;
 }
 
 export interface DeployResult {
@@ -165,6 +169,15 @@ export async function orchestrateDeploy(req: DeployRequest): Promise<DeployResul
   if (req.ownerPubkey && /^[0-9a-f]{64}$/.test(req.ownerPubkey)) {
     bindings.push({ name: 'SERVICE_OWNER_PUBKEY', type: 'plain_text', text: req.ownerPubkey });
     bindings.push({ name: 'RELAY_PUBKEY', type: 'plain_text', text: req.ownerPubkey });
+  }
+  if (req.paymentMode && ['free', 'donation', 'pay-to-relay'].includes(req.paymentMode)) {
+    bindings.push({ name: 'PAYMENT_MODE', type: 'plain_text', text: req.paymentMode });
+  }
+  if (typeof req.paymentSats === 'number' && Number.isInteger(req.paymentSats) && req.paymentSats > 0 && req.paymentSats < 100000000) {
+    bindings.push({ name: 'RELAY_ACCESS_PRICE_SATS', type: 'plain_text', text: String(req.paymentSats) });
+  }
+  if (typeof req.authRequired === 'boolean') {
+    bindings.push({ name: 'AUTH_REQUIRED', type: 'plain_text', text: String(req.authRequired) });
   }
 
   const metadata = {

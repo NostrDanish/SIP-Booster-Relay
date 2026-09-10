@@ -1,0 +1,23 @@
+name: e2e smoke test
+
+# Daily end-to-end smoke test against the live relay (pattern from
+# relay.cashu.email's fork: catch production drift before users do).
+# Set the target in repo Settings → Variables → RELAY_URL.
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run smoke test
+        env:
+          RELAY_URL: ${{ vars.RELAY_URL }}
+        run: node scripts/e2e-smoke.mjs

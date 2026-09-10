@@ -51,10 +51,16 @@ The cron also runs `PRAGMA optimize` + `ANALYZE` for the query planner.
 
 ## Monitoring
 
-- `/api/health` — `{ status, events, mode, version, time }` — cheap liveness
-  probe for uptime monitors.
+- `/api/health` — `{ status, events, schema_ok, mode, version, time }` —
+  cheap liveness probe for uptime monitors.
 - `/api/stats` — full statistics document (counts, top facets, metrics,
   database size).
+- `/metrics` (or `/api/metrics`) — **Prometheus text exposition** of the
+  relay_metrics counters + document/observation/indexer gauges + DB size.
+  Point Prometheus/Grafana at it.
+- `DEBUG_LOGS` (config) — verbose per-event/query logging is **off by
+  default**: at relay scale, log volume is an observability cost center
+  (lesson from relay.cashu.email's cost incident). Errors always log.
 - Cloudflare dashboard: Workers analytics, D1 size/reads/writes, DO request
   counts. Recommended alert: D1 size > 8 GB.
 
@@ -88,6 +94,14 @@ Travel (paid) or periodically export:
 ```bash
 npx wrangler d1 export sip01-relay --remote --output backup.sql
 ```
+
+> **FTS5 caveat:** since schema v9 the database contains an FTS5 **virtual
+> table** (`sip01_fts`). `wrangler d1 export` cannot dump databases with
+> virtual tables — export the base tables with `--table` flags (events,
+> sip01_documents, sip01_observations, sip01_indexers, relay_metrics), or
+> rely on D1 Time Travel. The FTS index is a derived structure: it rebuilds
+> from `sip01_documents` via the v9 migration's backfill or ordinary
+> re-indexing.
 
 ## Upgrading
 

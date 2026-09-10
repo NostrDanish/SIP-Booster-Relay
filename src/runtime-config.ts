@@ -45,3 +45,24 @@ export function runtimeDeployServiceEnabled(env: Env): boolean {
   if (v === 'true' || v === '1' || v === 'on') return true; // standalone service worker
   return config.DEPLOY_SERVICE_ENABLED;
 }
+
+/** Payment mode override: PAYMENT_MODE = free | donation | pay-to-relay. */
+export function runtimePaymentMode(env: Env): 'free' | 'donation' | 'pay-to-relay' {
+  const v = env.PAYMENT_MODE?.trim().toLowerCase();
+  if (v === 'free' || v === 'donation' || v === 'pay-to-relay') return v;
+  return config.PAYMENT_MODE;
+}
+
+export function runtimePaymentPriceSats(env: Env): number {
+  const v = Number.parseInt(env.RELAY_ACCESS_PRICE_SATS?.trim() ?? '', 10);
+  if (Number.isFinite(v) && v > 0) return v;
+  return config.RELAY_ACCESS_PRICE_SATS;
+}
+
+/** NIP-42 auth requirement override: AUTH_REQUIRED = true | false. */
+export function runtimeAuthRequired(env: Env): boolean {
+  const v = env.AUTH_REQUIRED?.trim().toLowerCase();
+  if (v === 'true' || v === '1' || v === 'on') return true;
+  if (v === 'false' || v === '0' || v === 'off') return false;
+  return config.AUTH_REQUIRED;
+}

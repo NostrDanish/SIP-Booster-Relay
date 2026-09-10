@@ -66,6 +66,35 @@ mistakes inherited code for original work (or vice versa).
   enabled, `Accept` header matching uses `includes`, and the SIP-01
   `uncaged_index` block is added (SIP-01 §15).
 
+## Learnings from the wider fork ecosystem (2026 review)
+
+A survey of upstream + all 22 forks (network compare API) found most forks
+dormant; three carried real engineering we adopted (with attribution), all
+compatible with SIP-01 (no wire-format changes):
+
+- **rabble/nosflare (Divine Video fork)** — the deepest fork: D1 **FTS5**
+  full-text search with BM25 (adopted as our `sip01_fts` index + ranked
+  NIP-50 path), a Prometheus metrics surface (adopted as `/metrics`), a
+  versioned migration runner (we kept our system_config versioning + added
+  per-version migration functions), and safe-column allowlists (we already
+  whitelist operator columns). Their FK-removal lesson informed our
+  FK-free SIP table design.
+- **Amperstrand/nosflare (relay.cashu.email)** — operational cost lessons:
+  verbose logging gated behind a debug flag (adopted as `DEBUG_LOGS` /
+  `dbg()`), observability sampling off by default, and a **daily e2e smoke
+  test in CI** against the live relay (adopted as
+  `.github/workflows/e2e-smoke.yml` + `scripts/e2e-smoke.mjs`).
+- **jongan69/OpenDating** — proof the codebase carries Blossom/R2 media
+  patterns; deliberately NOT adopted (SIP-01 stores compact metadata, not
+  payloads — D1-is-not-the-web stays the design rule; R2 remains the
+  documented future for artifacts).
+- **PastaGringo/nosflare** — deploy-script ergonomics (placeholder
+  replacement + dependency preflight), superseded here by the one-click
+  button + hosted service.
+- **deploy.nosflare.com** — the reference paid-deploy UX; our hosted track
+  matches its scope and adds Nostr-native identity, PRE payments, bundle
+  pinning, and customer self-service (`/api/service/my-deployments`).
+
 ## Added (new in this fork)
 
 - **`shared/sip01.js`** — byte-compatible SIP-01 v1 implementation (§7

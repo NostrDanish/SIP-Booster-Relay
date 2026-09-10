@@ -94,6 +94,9 @@ export interface Env {
   RELAY_CONTACT?: string;
   SERVICE_OWNER_PUBKEY?: string;
   DEPLOY_SERVICE_ENABLED?: string;
+  PAYMENT_MODE?: string;
+  RELAY_ACCESS_PRICE_SATS?: string;
+  AUTH_REQUIRED?: string;
   /** Standalone deploy service's D1 (wrangler.service.toml). */
   SERVICE_DATABASE?: D1Database;
 }
