@@ -134,7 +134,7 @@ export const PAYMENT_MODE: 'free' | 'donation' | 'pay-to-relay' = 'free';
 // Derived for upstream-compatible checks.
 export const PAY_TO_RELAY_ENABLED = PAYMENT_MODE === 'pay-to-relay';
 
-export const relayNpub = "npub1udrjdn9kyn6tk6ht400anfqltctqe2tm5t4p87kclrljnflcf09qvl3tay"; // Use your own npub
+export const relayNpub = "npub1jzha7heltdlq5tdc5uqw0a8d4e2zl9022f8phmjj9h8fhjem0v2qmtdeke"; // Use your own npub
 export const RELAY_ACCESS_PRICE_SATS = 212121; // Price in SATS for relay access
 
 /** Hex pubkey of the relay operator (payment recipient). Derived from
@@ -161,7 +161,7 @@ export const RELAY_ACCESS_PRICE_SATS = 212121; // Price in SATS for relay access
 export const DEPLOY_SERVICE_ENABLED = false;
 
 /** The service owner's pubkey (hex) — only this key can sign into /admin. */
-export const SERVICE_OWNER_PUBKEY = "e34726ccb624f4bb6aebabdfd9a41f5e160ca97ba2ea13fad8f8ff29a7f84bca";
+export const SERVICE_OWNER_PUBKEY = "90afdf5f3f5b7e0a2db8a700e7f4edae542f95ea524e1bee522dce9bcb3b7b14";
 
 /** Default deployment price in sats (Lightning, paid as a Nostr zap). */
 export const DEPLOY_PRICE_SATS = 21420;
@@ -222,8 +222,8 @@ export const DEBUG_LOGS = false;
 export const relayInfo: RelayInfo = {
   name: "UNCAGED SIP Relay",
   description: "A serverless SIP-01 search index relay — decentralized web-index observations (Nostr kind 39697) on Cloudflare Workers + D1. One shared decentralized index. Many independent indexers. No single owner.",
-  pubkey: "e34726ccb624f4bb6aebabdfd9a41f5e160ca97ba2ea13fad8f8ff29a7f84bca",
-  contact: "npub1udrjdn9kyn6tk6ht400anfqltctqe2tm5t4p87kclrljnflcf09qvl3tay",
+  pubkey: "90afdf5f3f5b7e0a2db8a700e7f4edae542f95ea524e1bee522dce9bcb3b7b14",
+  contact: "npub1jzha7heltdlq5tdc5uqw0a8d4e2zl9022f8phmjj9h8fhjem0v2qmtdeke",
   supported_nips: [1, 5, 9, 11, 16, 33, 42, 45, 50, 77],
   software: "https://github.com/NostrDanish/SIP-Booster-Relay",
   version: "1.0.0",

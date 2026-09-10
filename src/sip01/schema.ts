@@ -90,7 +90,7 @@ export const SIP01_SCHEMA_STATEMENTS: string[] = [
  * Schema version. v7: SIP-01 tag-cache rebuild (incl. `l`/`x`). v8:
  * idempotent deployment tracking (deploy job status/steps; audit P1).
  */
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 export function migrationV7Statements(): string[] {
   return [
