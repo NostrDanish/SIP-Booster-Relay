@@ -2397,8 +2397,8 @@ export default {
         return await handleServiceApi(request, env, url);
       }
 
-      // Operator JSON API
-      if (url.pathname.startsWith('/api/')) {
+      // Operator JSON API (+ /metrics alias served from the same handler)
+      if (url.pathname.startsWith('/api/') || url.pathname === '/metrics') {
         await ensureDatabase(env.RELAY_DATABASE);
         return await handleApiRequest(url, request, env);
       }
