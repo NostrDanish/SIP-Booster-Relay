@@ -16,7 +16,7 @@ import { existsSync } from 'node:fs';
 
 // 1. Bundle the relay worker (plain JS shared/ modules are imported as ESM).
 await build({
-  entryPoints: ['worker.ts'],
+  entryPoints: ['entry.ts'],
   bundle: true,
   outfile: 'worker.js',
   platform: 'browser',
