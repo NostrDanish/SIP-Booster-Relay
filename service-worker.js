@@ -8,7 +8,7 @@ var __export = (target, all) => {
 // src/config.ts
 var config_exports = {};
 __export(config_exports, {
-  AUTH_REQUIRED: () => AUTH_REQUIRED2,
+  AUTH_REQUIRED: () => AUTH_REQUIRED,
   AUTH_TIMEOUT_MS: () => AUTH_TIMEOUT_MS,
   BASE_CHAIN_ID: () => BASE_CHAIN_ID,
   BASE_RPC_QUORUM: () => BASE_RPC_QUORUM,
@@ -132,7 +132,7 @@ var DEPLOY_BUNDLE_REF = "405dc089b8ec8c4fbd1a3b294a16b6bb4718467a";
 var DEPLOY_BUNDLE_SHA256 = "";
 var DEPLOY_BUNDLE_URL = `https://raw.githubusercontent.com/NostrDanish/SIP-Booster-Relay/${DEPLOY_BUNDLE_REF}/worker.js`;
 var DEPLOY_MAX_PER_IP_PER_DAY = 10;
-var AUTH_REQUIRED2 = false;
+var AUTH_REQUIRED = false;
 var AUTH_TIMEOUT_MS = 6e5;
 var DEBUG_LOGS = false;
 var relayInfo = {
@@ -158,7 +158,7 @@ var relayInfo = {
     max_event_tags: 2e3,
     max_content_length: 7e4,
     // min_pow_difficulty: 0,
-    auth_required: AUTH_REQUIRED2,
+    auth_required: AUTH_REQUIRED,
     payment_required: PAY_TO_RELAY_ENABLED,
     restricted_writes: PAY_TO_RELAY_ENABLED || SIP01_INDEXER_POLICY === "allowlist",
     // created_at_lower_limit: 0,
@@ -447,7 +447,7 @@ function runtimeAuthRequired(env) {
     return true;
   if (v === "false" || v === "0" || v === "off")
     return false;
-  return AUTH_REQUIRED2;
+  return AUTH_REQUIRED;
 }
 __name(runtimeAuthRequired, "runtimeAuthRequired");
 
@@ -6041,7 +6041,7 @@ var _RelayWebSocket = class _RelayWebSocket {
         this.sendOK(session.webSocket, event.id, false, "invalid: kind 22242 events are for authentication only");
         return;
       }
-      if (AUTH_REQUIRED) {
+      if (this.authRequired()) {
         if (session.authenticatedPubkeys.size === 0) {
           this.sendOK(session.webSocket, event.id, false, "auth-required: authenticate to publish events");
           return;
@@ -6867,6 +6867,20 @@ function migrationV8Statements() {
   ];
 }
 __name(migrationV8Statements, "migrationV8Statements");
+function migrationV9Statements() {
+  return [
+    `ALTER TABLE sip01_documents ADD COLUMN fts_id INTEGER`,
+    `UPDATE sip01_documents SET fts_id = rowid WHERE fts_id IS NULL`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_sip01_documents_fts_id ON sip01_documents(fts_id)`,
+    `CREATE VIRTUAL TABLE IF NOT EXISTS sip01_fts USING fts5(d UNINDEXED, title, description, canonical_url, topics, tokenize='porter unicode61')`,
+    `INSERT INTO sip01_fts (rowid, d, title, description, canonical_url, topics)
+       SELECT fts_id, d, title, COALESCE(description, ''), canonical_url, COALESCE(topics, '[]')
+       FROM sip01_documents
+       WHERE fts_id IS NOT NULL
+         AND NOT EXISTS (SELECT 1 FROM sip01_fts f WHERE f.rowid = sip01_documents.fts_id)`
+  ];
+}
+__name(migrationV9Statements, "migrationV9Statements");
 var SERVICE_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS service_settings (
     key TEXT PRIMARY KEY,
@@ -7277,7 +7291,8 @@ async function initializeDatabase(db) {
       dbg(`Migrating schema ${currentVersion} \u2192 ${SCHEMA_VERSION}...`);
       const migrationStatements = [
         ...currentVersion < 7 ? migrationV7Statements() : [],
-        ...currentVersion < 8 ? migrationV8Statements() : []
+        ...currentVersion < 8 ? migrationV8Statements() : [],
+        ...currentVersion < 9 ? migrationV9Statements() : []
       ];
       for (const statement of migrationStatements) {
         try {
