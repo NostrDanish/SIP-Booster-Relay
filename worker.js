@@ -4017,9 +4017,9 @@ function buildSip01SearchSql(parsed, limit, extras = {}) {
     { keywordMode: useFts ? "fts" : "like" }
   );
   const { rankSql, params: rankParams } = buildSip01Rank(parsed);
-  const ftsJoin = useFts ? "JOIN sip01_fts f ON f.rowid = doc.fts_id" : "";
+  const ftsJoin = useFts ? "JOIN sip01_fts ON sip01_fts.rowid = doc.fts_id" : "";
   const bm25Select = useFts ? ", bm25(sip01_fts, 10.0, 5.0, 2.0, 1.5) AS bm25rank" : "";
-  const whereParts = [...useFts ? ["f MATCH ?"] : [], ...docConditions];
+  const whereParts = [...useFts ? ["sip01_fts MATCH ?"] : [], ...docConditions];
   const where = whereParts.length > 0 ? `WHERE ${whereParts.join(" AND ")}` : "";
   const whereParams = [...useFts ? [ftsMatch] : [], ...docParams];
   const docSelect = `
@@ -4116,7 +4116,7 @@ var SIP01_SCHEMA_STATEMENTS = [
     value INTEGER NOT NULL DEFAULT 0
   )`
 ];
-var SCHEMA_VERSION = 9;
+var SCHEMA_VERSION = 10;
 function migrationV7Statements() {
   return [
     // Rebuild event_tags_cache_multi without the restrictive CHECK list.
@@ -4174,6 +4174,10 @@ function migrationV9Statements() {
   ];
 }
 __name(migrationV9Statements, "migrationV9Statements");
+function migrationV10Statements() {
+  return migrationV9Statements();
+}
+__name(migrationV10Statements, "migrationV10Statements");
 var SERVICE_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS service_settings (
     key TEXT PRIMARY KEY,
@@ -6005,7 +6009,8 @@ async function initializeDatabase(db) {
       const migrationStatements = [
         ...currentVersion < 7 ? migrationV7Statements() : [],
         ...currentVersion < 8 ? migrationV8Statements() : [],
-        ...currentVersion < 9 ? migrationV9Statements() : []
+        ...currentVersion < 9 ? migrationV9Statements() : [],
+        ...currentVersion < 10 ? migrationV10Statements() : []
       ];
       for (const statement of migrationStatements) {
         try {
@@ -6014,6 +6019,12 @@ async function initializeDatabase(db) {
           if (!error?.message?.includes("duplicate column"))
             throw error;
         }
+      }
+      const sentinel = await session.prepare(
+        "SELECT COUNT(*) AS n FROM sqlite_master WHERE name IN ('events', 'sip01_documents', 'sip01_observations', 'sip01_indexers', 'sip01_fts')"
+      ).first();
+      if ((sentinel?.n ?? 0) < 5) {
+        throw new Error("schema migration incomplete \u2014 sentinel objects missing (will retry on next request)");
       }
       await session.prepare(
         "INSERT OR REPLACE INTO system_config (key, value) VALUES ('schema_version', ?)"
