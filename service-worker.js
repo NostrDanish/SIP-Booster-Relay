@@ -5076,21 +5076,43 @@ function sqlForOrGroup(group) {
   return { sql: group.negated ? `NOT (${joined})` : `(${joined})`, params };
 }
 __name(sqlForOrGroup, "sqlForOrGroup");
-function buildSip01SearchConditions(parsed) {
+function buildFtsMatch(parsed) {
+  const parts = [];
+  for (const kw of parsed.keywords) {
+    if (/^[a-z0-9_]+$/.test(kw)) {
+      parts.push(`${kw}*`);
+    } else {
+      const cleaned = kw.replace(/["*()^]/g, " ").replace(/\s+/g, " ").trim();
+      if (cleaned)
+        parts.push(`"${cleaned}"`);
+    }
+  }
+  for (const ph of parsed.phrases) {
+    const cleaned = ph.replace(/"/g, "").trim();
+    if (cleaned)
+      parts.push(`"${cleaned}"`);
+  }
+  return parts.length > 0 ? parts.join(" AND ") : null;
+}
+__name(buildFtsMatch, "buildFtsMatch");
+function buildSip01SearchConditions(parsed, opts = {}) {
   const docConditions = [];
   const docParams = [];
   const eventConditions = [];
   const eventParams = [];
+  const useFts = opts.keywordMode === "fts";
   const pushText = /* @__PURE__ */ __name((needleRaw, negated) => {
     const needle = `%${escapeLike(needleRaw.toLowerCase())}%`;
     const clause = `(lower(doc.title) LIKE ? ESCAPE '\\' OR lower(doc.description) LIKE ? ESCAPE '\\' OR lower(doc.canonical_url) LIKE ? ESCAPE '\\')`;
     docConditions.push(negated ? `NOT ${clause}` : clause);
     docParams.push(needle, needle, needle);
   }, "pushText");
-  for (const kw of parsed.keywords)
-    pushText(kw, false);
-  for (const ph of parsed.phrases)
-    pushText(ph, false);
+  if (!useFts) {
+    for (const kw of parsed.keywords)
+      pushText(kw, false);
+    for (const ph of parsed.phrases)
+      pushText(ph, false);
+  }
   const grouped = groupSearchOps(parsed);
   for (const group of grouped.orGroups) {
     const fragment = sqlForOrGroup(group);
@@ -5145,33 +5167,46 @@ function buildSip01Rank(parsed) {
 }
 __name(buildSip01Rank, "buildSip01Rank");
 function buildSip01SearchSql(parsed, limit, extras = {}) {
-  const { docConditions, docParams, eventConditions, eventParams } = buildSip01SearchConditions(parsed);
+  const fts = extras.fts === true;
+  const ftsMatch = fts ? buildFtsMatch(parsed) : null;
+  const useFts = ftsMatch !== null;
+  const { docConditions, docParams, eventConditions, eventParams } = buildSip01SearchConditions(
+    parsed,
+    { keywordMode: useFts ? "fts" : "like" }
+  );
   const { rankSql, params: rankParams } = buildSip01Rank(parsed);
-  const where = docConditions.length > 0 ? `WHERE ${docConditions.join(" AND ")}` : "";
+  const ftsJoin = useFts ? "JOIN sip01_fts f ON f.rowid = doc.fts_id" : "";
+  const bm25Select = useFts ? ", bm25(sip01_fts, 10.0, 5.0, 2.0, 1.5) AS bm25rank" : "";
+  const whereParts = [...useFts ? ["f MATCH ?"] : [], ...docConditions];
+  const where = whereParts.length > 0 ? `WHERE ${whereParts.join(" AND ")}` : "";
+  const whereParams = [...useFts ? [ftsMatch] : [], ...docParams];
   const docSelect = `
-    SELECT doc.d AS d, doc.last_seen AS last_seen, (${rankSql}) AS rank
+    SELECT doc.d AS d, doc.last_seen AS last_seen, (${rankSql}) AS rank${bm25Select}
     FROM sip01_documents doc
+    ${ftsJoin}
     ${where}
   `;
   const docSet = parsed.distinctDomain ? `
-    SELECT d, MAX(rank) AS rank, MAX(last_seen) AS last_seen FROM (
-      SELECT doc.d AS d, doc.url_host AS url_host, doc.last_seen AS last_seen, (${rankSql}) AS rank
+    SELECT d, MAX(rank) AS rank, ${useFts ? "MIN(bm25rank) AS bm25rank," : ""} MAX(last_seen) AS last_seen FROM (
+      SELECT doc.d AS d, doc.url_host AS url_host, doc.last_seen AS last_seen, (${rankSql}) AS rank${bm25Select}
       FROM sip01_documents doc
+      ${ftsJoin}
       ${where}
     ) GROUP BY url_host
   ` : docSelect;
   const outerConditions = [...eventConditions, ...extras.extraConditions ?? []];
   const outerWhere = outerConditions.length > 0 ? `WHERE ${outerConditions.join(" AND ")}` : "";
+  const orderBy = useFts ? "ORDER BY r.bm25rank ASC, r.rank DESC, e.created_at DESC" : "ORDER BY r.rank DESC, e.created_at DESC";
   const sql = `
     SELECT e.id, e.pubkey, e.created_at, e.kind, e.tags, e.content, e.sig, r.rank
     FROM (${docSet}) r
     JOIN sip01_observations o ON o.d = r.d
     JOIN events e ON e.id = o.event_id
     ${outerWhere}
-    ORDER BY r.rank DESC, e.created_at DESC
+    ${orderBy}
     LIMIT ?
   `;
-  const baseParams = [...rankParams, ...docParams, ...eventParams, ...extras.extraParams ?? [], limit];
+  const baseParams = [...rankParams, ...whereParams, ...eventParams, ...extras.extraParams ?? [], limit];
   return { sql, params: baseParams };
 }
 __name(buildSip01SearchSql, "buildSip01SearchSql");
@@ -5291,8 +5326,35 @@ async function ingestSip01Observation(session, event) {
     ).bind(event.pubkey, event.pubkey, event.pubkey)
   );
   await session.batch(statements);
+  await ftsUpsertDocument(session, fields.d);
 }
 __name(ingestSip01Observation, "ingestSip01Observation");
+async function ftsUpsertDocument(session, d) {
+  try {
+    const doc = await session.prepare("SELECT rowid, fts_id, d, title, description, canonical_url, topics FROM sip01_documents WHERE d = ?").bind(d).first();
+    if (!doc)
+      return;
+    let ftsId = doc.fts_id;
+    if (!ftsId) {
+      ftsId = doc.rowid;
+      await session.prepare("UPDATE sip01_documents SET fts_id = ? WHERE d = ?").bind(ftsId, d).run();
+    }
+    await session.prepare("DELETE FROM sip01_fts WHERE rowid = ?").bind(ftsId).run().catch(() => void 0);
+    await session.prepare("INSERT INTO sip01_fts (rowid, d, title, description, canonical_url, topics) VALUES (?, ?, ?, ?, ?, ?)").bind(ftsId, doc.d, doc.title ?? "", doc.description ?? "", doc.canonical_url ?? "", doc.topics ?? "[]").run();
+  } catch {
+  }
+}
+__name(ftsUpsertDocument, "ftsUpsertDocument");
+async function ftsDeleteDocument(session, d) {
+  try {
+    const row = await session.prepare("SELECT rowid FROM sip01_fts WHERE d = ?").bind(d).first();
+    if (row) {
+      await session.prepare("DELETE FROM sip01_fts WHERE rowid = ?").bind(row.rowid).run();
+    }
+  } catch {
+  }
+}
+__name(ftsDeleteDocument, "ftsDeleteDocument");
 async function removeSip01Observations(session, eventIds) {
   if (eventIds.length === 0)
     return;
@@ -5324,6 +5386,14 @@ async function removeSip01Observations(session, eventIds) {
     statements.push(
       session.prepare(`DELETE FROM sip01_documents WHERE d = ? AND NOT EXISTS (SELECT 1 FROM sip01_observations WHERE d = ?)`).bind(d, d)
     );
+  }
+  for (const d of ds) {
+    const stillThere = await session.prepare("SELECT 1 FROM sip01_documents WHERE d = ? LIMIT 1").bind(d).first().catch(() => null);
+    if (stillThere) {
+      await ftsUpsertDocument(session, d);
+    } else {
+      await ftsDeleteDocument(session, d);
+    }
   }
   for (const pubkey of pubkeys) {
     statements.push(
@@ -6711,7 +6781,7 @@ var SIP01_SCHEMA_STATEMENTS = [
     value INTEGER NOT NULL DEFAULT 0
   )`
 ];
-var SCHEMA_VERSION = 9;
+var SCHEMA_VERSION = 8;
 function migrationV7Statements() {
   return [
     // Rebuild event_tags_cache_multi without the restrictive CHECK list.
@@ -6755,20 +6825,6 @@ function migrationV8Statements() {
   ];
 }
 __name(migrationV8Statements, "migrationV8Statements");
-function migrationV9Statements() {
-  return [
-    `ALTER TABLE sip01_documents ADD COLUMN fts_id INTEGER`,
-    `UPDATE sip01_documents SET fts_id = rowid WHERE fts_id IS NULL`,
-    `CREATE UNIQUE INDEX IF NOT EXISTS idx_sip01_documents_fts_id ON sip01_documents(fts_id)`,
-    `CREATE VIRTUAL TABLE IF NOT EXISTS sip01_fts USING fts5(d UNINDEXED, title, description, canonical_url, topics, tokenize='porter unicode61')`,
-    `INSERT INTO sip01_fts (rowid, d, title, description, canonical_url, topics)
-       SELECT fts_id, d, title, COALESCE(description, ''), canonical_url, COALESCE(topics, '[]')
-       FROM sip01_documents
-       WHERE fts_id IS NOT NULL
-         AND NOT EXISTS (SELECT 1 FROM sip01_fts f WHERE f.rowid = sip01_documents.fts_id)`
-  ];
-}
-__name(migrationV9Statements, "migrationV9Statements");
 var SERVICE_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS service_settings (
     key TEXT PRIMARY KEY,
@@ -6807,6 +6863,24 @@ var SERVICE_SCHEMA_STATEMENTS = [
 ];
 
 // src/sip01/search.ts
+var ftsProbe = null;
+function ftsAvailable(session) {
+  if (!ftsProbe) {
+    ftsProbe = (async () => {
+      try {
+        await session.prepare("SELECT rowid FROM sip01_fts LIMIT 1").first();
+        return true;
+      } catch {
+        return false;
+      }
+    })().catch(() => false);
+    ftsProbe.catch(() => {
+      ftsProbe = null;
+    });
+  }
+  return ftsProbe;
+}
+__name(ftsAvailable, "ftsAvailable");
 function clampSearchLimit(limit) {
   if (!limit || !Number.isFinite(limit) || limit <= 0)
     return Math.min(50, SEARCH_MAX_RESULTS);
@@ -6856,9 +6930,12 @@ async function executeSearch(session, filter) {
   const events = [];
   const seen = /* @__PURE__ */ new Set();
   if (wantSip01) {
+    const hasTextTerms = parsed.keywords.length > 0 || parsed.phrases.length > 0;
+    const useFts = hasTextTerms && await ftsAvailable(session);
     const { sql, params } = buildSip01SearchSql(parsed, limit, {
       extraConditions: extras.conditions,
-      extraParams: extras.params
+      extraParams: extras.params,
+      fts: useFts
     });
     try {
       const result = await session.prepare(sql).bind(...params).all();
@@ -6877,7 +6954,36 @@ async function executeSearch(session, filter) {
         });
       }
     } catch (error) {
-      console.error("sip01 search query failed:", error, sql);
+      if (useFts) {
+        console.error("sip01 FTS search failed, falling back to LIKE:", error);
+        ftsProbe = Promise.resolve(false);
+        const fallback = buildSip01SearchSql(parsed, limit, {
+          extraConditions: extras.conditions,
+          extraParams: extras.params,
+          fts: false
+        });
+        try {
+          const result = await session.prepare(fallback.sql).bind(...fallback.params).all();
+          for (const row of result.results ?? []) {
+            if (seen.has(row.id))
+              continue;
+            seen.add(row.id);
+            events.push({
+              id: row.id,
+              pubkey: row.pubkey,
+              created_at: row.created_at,
+              kind: row.kind,
+              tags: JSON.parse(row.tags),
+              content: row.content,
+              sig: row.sig
+            });
+          }
+        } catch (fallbackError) {
+          console.error("sip01 LIKE fallback search failed:", fallbackError);
+        }
+      } else {
+        console.error("sip01 search query failed:", error, sql);
+      }
     }
   }
   const genericKinds = kinds === void 0 ? void 0 : otherKinds;
@@ -7129,8 +7235,7 @@ async function initializeDatabase(db) {
       console.log(`Migrating schema ${currentVersion} \u2192 ${SCHEMA_VERSION}...`);
       const migrationStatements = [
         ...currentVersion < 7 ? migrationV7Statements() : [],
-        ...currentVersion < 8 ? migrationV8Statements() : [],
-        ...currentVersion < 9 ? migrationV9Statements() : []
+        ...currentVersion < 8 ? migrationV8Statements() : []
       ];
       for (const statement of migrationStatements) {
         try {
