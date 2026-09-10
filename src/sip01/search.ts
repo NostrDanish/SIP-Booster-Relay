@@ -29,6 +29,35 @@ import type { NostrEvent, NostrFilter } from '../types';
 
 type Session = D1DatabaseSession;
 
+/**
+ * Per-isolate probe: is the FTS5 index usable (schema v9+ applied and the
+ * platform supports FTS5)? On any error we permanently fall back to LIKE for
+ * this isolate. The probe is negative-cached only after failure.
+ */
+let ftsProbe: Promise<boolean> | null = null;
+
+function ftsAvailable(session: Session): Promise<boolean> {
+  if (!ftsProbe) {
+    ftsProbe = (async () => {
+      try {
+        await session.prepare('SELECT rowid FROM sip01_fts LIMIT 1').first();
+        return true;
+      } catch {
+        return false;
+      }
+    })().catch(() => false);
+    ftsProbe.catch(() => {
+      ftsProbe = null; // allow a later retry after a transient error
+    });
+  }
+  return ftsProbe;
+}
+
+/** Reset the cached probe (tests). */
+export function _resetFtsProbe(): void {
+  ftsProbe = null;
+}
+
 /** Clamp a search result limit. */
 export function clampSearchLimit(limit: number | undefined): number {
   if (!limit || !Number.isFinite(limit) || limit <= 0) return Math.min(50, SEARCH_MAX_RESULTS);
@@ -93,9 +122,13 @@ export async function executeSearch(session: Session, filter: NostrFilter): Prom
 
   // --- SIP-01 ranked path over the document index.
   if (wantSip01) {
+    const hasTextTerms = parsed.keywords.length > 0 || parsed.phrases.length > 0;
+    const useFts = hasTextTerms && (await ftsAvailable(session));
+
     const { sql, params } = buildSip01SearchSql(parsed, limit, {
       extraConditions: extras.conditions,
       extraParams: extras.params,
+      fts: useFts,
     });
     try {
       const result = await session.prepare(sql).bind(...params).all();
@@ -113,7 +146,37 @@ export async function executeSearch(session: Session, filter: NostrFilter): Prom
         });
       }
     } catch (error) {
-      console.error('sip01 search query failed:', error, sql);
+      // An FTS failure (e.g. unsupported platform quirk) must not lose the
+      // query — fall back to the LIKE path once, then remember.
+      if (useFts) {
+        console.error('sip01 FTS search failed, falling back to LIKE:', error);
+        ftsProbe = Promise.resolve(false);
+        const fallback = buildSip01SearchSql(parsed, limit, {
+          extraConditions: extras.conditions,
+          extraParams: extras.params,
+          fts: false,
+        });
+        try {
+          const result = await session.prepare(fallback.sql).bind(...fallback.params).all();
+          for (const row of result.results ?? []) {
+            if (seen.has(row.id as string)) continue;
+            seen.add(row.id as string);
+            events.push({
+              id: row.id as string,
+              pubkey: row.pubkey as string,
+              created_at: row.created_at as number,
+              kind: row.kind as number,
+              tags: JSON.parse(row.tags as string),
+              content: row.content as string,
+              sig: row.sig as string,
+            });
+          }
+        } catch (fallbackError) {
+          console.error('sip01 LIKE fallback search failed:', fallbackError);
+        }
+      } else {
+        console.error('sip01 search query failed:', error, sql);
+      }
     }
   }
 

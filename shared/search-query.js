@@ -522,14 +522,47 @@ function sqlForOrGroup(group) {
 }
 
 /**
+ * Build an FTS5 MATCH expression from keywords + phrases (D1 supports FTS5;
+ * lowercase `fts5`). Sanitization rules (no FTS5 operator injection):
+ *   - pure [a-z0-9_] keywords → bare prefix token `kw*`
+ *   - anything else → quoted phrase (quotes stripped)
+ *   - phrases (already quoted in the query) → quoted phrase
+ * All terms AND together, matching the LIKE path's AND semantics.
+ * Returns null when there are no usable terms.
+ *
+ * @param {ParsedSearchQuery} parsed
+ * @returns {string | null}
+ */
+export function buildFtsMatch(parsed) {
+  const parts = [];
+  for (const kw of parsed.keywords) {
+    if (/^[a-z0-9_]+$/.test(kw)) {
+      parts.push(`${kw}*`);
+    } else {
+      const cleaned = kw.replace(/["*()^]/g, ' ').replace(/\s+/g, ' ').trim();
+      if (cleaned) parts.push(`"${cleaned}"`);
+    }
+  }
+  for (const ph of parsed.phrases) {
+    const cleaned = ph.replace(/"/g, '').trim();
+    if (cleaned) parts.push(`"${cleaned}"`);
+  }
+  return parts.length > 0 ? parts.join(' AND ') : null;
+}
+
+/**
  * Build the WHERE conditions for a parsed query, split by the relation they
  * target: `doc.*` (document index, applied in the inner query) and
  * `o.*`/`e.*` (observation/event level, applied after the join).
  *
+ * When `opts.keywordMode` is `'fts'`, keywords/phrases emit NO LIKE clauses —
+ * the caller joins sip01_fts with the buildFtsMatch() expression instead.
+ *
  * @param {ParsedSearchQuery} parsed
+ * @param {{ keywordMode?: 'like' | 'fts' }} [opts]
  * @returns {{ docConditions: string[], docParams: any[], eventConditions: string[], eventParams: any[] }}
  */
-export function buildSip01SearchConditions(parsed) {
+export function buildSip01SearchConditions(parsed, opts = {}) {
   /** @type {string[]} */
   const docConditions = [];
   /** @type {any[]} */
@@ -539,6 +572,8 @@ export function buildSip01SearchConditions(parsed) {
   /** @type {any[]} */
   const eventParams = [];
 
+  const useFts = opts.keywordMode === 'fts';
+
   const pushText = (needleRaw, negated) => {
     const needle = `%${escapeLike(needleRaw.toLowerCase())}%`;
     const clause =
@@ -547,8 +582,10 @@ export function buildSip01SearchConditions(parsed) {
     docParams.push(needle, needle, needle);
   };
 
-  for (const kw of parsed.keywords) pushText(kw, false);
-  for (const ph of parsed.phrases) pushText(ph, false);
+  if (!useFts) {
+    for (const kw of parsed.keywords) pushText(kw, false);
+    for (const ph of parsed.phrases) pushText(ph, false);
+  }
 
   const grouped = groupSearchOps(parsed);
 
@@ -639,20 +676,36 @@ export function buildSip01Rank(parsed) {
  *
  * @param {ParsedSearchQuery} parsed
  * @param {number} limit Max events to return (already clamped by the caller).
- * @param {{ extraConditions?: string[], extraParams?: any[] }} [extras]
+ * @param {{ extraConditions?: string[], extraParams?: any[], fts?: boolean }} [extras]
  *   Additional event-level restrictions (alias `e`): authors, ids,
  *   since/until, `#tag` EXISTS clauses — the NIP-50 "other filter fields".
+ *   `fts: true` routes keywords/phrases through the FTS5 index (sip01_fts,
+ *   bm25 ranking) instead of LIKE.
  * @returns {SqlFragment}
  */
 export function buildSip01SearchSql(parsed, limit, extras = {}) {
-  const { docConditions, docParams, eventConditions, eventParams } = buildSip01SearchConditions(parsed);
+  const fts = extras.fts === true;
+  const ftsMatch = fts ? buildFtsMatch(parsed) : null;
+  const useFts = ftsMatch !== null;
+
+  const { docConditions, docParams, eventConditions, eventParams } = buildSip01SearchConditions(
+    parsed,
+    { keywordMode: useFts ? 'fts' : 'like' },
+  );
   const { rankSql, params: rankParams } = buildSip01Rank(parsed);
 
-  const where = docConditions.length > 0 ? `WHERE ${docConditions.join(' AND ')}` : '';
+  // FTS mode: join the FTS5 index and let bm25 drive text relevance.
+  const ftsJoin = useFts ? 'JOIN sip01_fts f ON f.rowid = doc.fts_id' : '';
+  const bm25Select = useFts ? ', bm25(sip01_fts, 10.0, 5.0, 2.0, 1.5) AS bm25rank' : '';
+
+  const whereParts = [...(useFts ? ['f MATCH ?'] : []), ...docConditions];
+  const where = whereParts.length > 0 ? `WHERE ${whereParts.join(' AND ')}` : '';
+  const whereParams = [...(useFts ? [ftsMatch] : []), ...docParams];
 
   const docSelect = `
-    SELECT doc.d AS d, doc.last_seen AS last_seen, (${rankSql}) AS rank
+    SELECT doc.d AS d, doc.last_seen AS last_seen, (${rankSql}) AS rank${bm25Select}
     FROM sip01_documents doc
+    ${ftsJoin}
     ${where}
   `;
 
@@ -660,9 +713,10 @@ export function buildSip01SearchSql(parsed, limit, extras = {}) {
   // aggregate semantics: bare columns come from a row with the max value).
   const docSet = parsed.distinctDomain
     ? `
-    SELECT d, MAX(rank) AS rank, MAX(last_seen) AS last_seen FROM (
-      SELECT doc.d AS d, doc.url_host AS url_host, doc.last_seen AS last_seen, (${rankSql}) AS rank
+    SELECT d, MAX(rank) AS rank, ${useFts ? 'MIN(bm25rank) AS bm25rank,' : ''} MAX(last_seen) AS last_seen FROM (
+      SELECT doc.d AS d, doc.url_host AS url_host, doc.last_seen AS last_seen, (${rankSql}) AS rank${bm25Select}
       FROM sip01_documents doc
+      ${ftsJoin}
       ${where}
     ) GROUP BY url_host
   `
@@ -671,19 +725,23 @@ export function buildSip01SearchSql(parsed, limit, extras = {}) {
   const outerConditions = [...eventConditions, ...(extras.extraConditions ?? [])];
   const outerWhere = outerConditions.length > 0 ? `WHERE ${outerConditions.join(' AND ')}` : '';
 
+  const orderBy = useFts
+    ? 'ORDER BY r.bm25rank ASC, r.rank DESC, e.created_at DESC'
+    : 'ORDER BY r.rank DESC, e.created_at DESC';
+
   const sql = `
     SELECT e.id, e.pubkey, e.created_at, e.kind, e.tags, e.content, e.sig, r.rank
     FROM (${docSet}) r
     JOIN sip01_observations o ON o.d = r.d
     JOIN events e ON e.id = o.event_id
     ${outerWhere}
-    ORDER BY r.rank DESC, e.created_at DESC
+    ${orderBy}
     LIMIT ?
   `;
 
   // Parameter order follows textual order in the assembled statement:
-  // rank expression (SELECT list), document WHERE, outer WHERE, LIMIT.
-  const baseParams = [...rankParams, ...docParams, ...eventParams, ...(extras.extraParams ?? []), limit];
+  // rank expression (SELECT list), FTS MATCH, document WHERE, outer WHERE, LIMIT.
+  const baseParams = [...rankParams, ...whereParams, ...eventParams, ...(extras.extraParams ?? []), limit];
 
   return { sql, params: baseParams };
 }

@@ -162,6 +162,52 @@ export async function ingestSip01Observation(session: Session, event: NostrEvent
 
   // D1 batches cap at 100 statements; this is 6.
   await session.batch(statements);
+
+  // FTS index maintenance (v9+; best-effort — the LIKE search path is the
+  // fallback when the FTS table is unavailable).
+  await ftsUpsertDocument(session, fields.d);
+}
+
+/**
+ * Sync one document row into sip01_fts (delete-then-insert). Reads the
+ * document's final post-upsert state so the FTS row always matches the
+ * canonical row.
+ */
+export async function ftsUpsertDocument(session: Session, d: string): Promise<void> {
+  try {
+    const doc = await session
+      .prepare('SELECT rowid, fts_id, d, title, description, canonical_url, topics FROM sip01_documents WHERE d = ?')
+      .bind(d)
+      .first();
+    if (!doc) return;
+
+    let ftsId = doc.fts_id as number | null;
+    if (!ftsId) {
+      ftsId = doc.rowid as number;
+      await session.prepare('UPDATE sip01_documents SET fts_id = ? WHERE d = ?').bind(ftsId, d).run();
+    }
+
+    await session.prepare('DELETE FROM sip01_fts WHERE rowid = ?').bind(ftsId).run().catch(() => undefined);
+    await session
+      .prepare('INSERT INTO sip01_fts (rowid, d, title, description, canonical_url, topics) VALUES (?, ?, ?, ?, ?, ?)')
+      .bind(ftsId, doc.d, doc.title ?? '', doc.description ?? '', doc.canonical_url ?? '', doc.topics ?? '[]')
+      .run();
+  } catch {
+    /* FTS table unavailable (pre-v9 DB or platform without FTS5) — search
+       falls back to LIKE. Never fail ingestion over the index. */
+  }
+}
+
+/** Remove a document's FTS row (called when its last observation is removed). */
+export async function ftsDeleteDocument(session: Session, d: string): Promise<void> {
+  try {
+    const row = await session.prepare('SELECT rowid FROM sip01_fts WHERE d = ?').bind(d).first();
+    if (row) {
+      await session.prepare('DELETE FROM sip01_fts WHERE rowid = ?').bind(row.rowid).run();
+    }
+  } catch {
+    /* best-effort */
+  }
 }
 
 /**
@@ -210,6 +256,20 @@ export async function removeSip01Observations(session: Session, eventIds: string
         .prepare(`DELETE FROM sip01_documents WHERE d = ? AND NOT EXISTS (SELECT 1 FROM sip01_observations WHERE d = ?)`)
         .bind(d, d),
     );
+  }
+
+  // Keep the FTS index in sync: refresh surviving documents, drop removed ones.
+  for (const d of ds) {
+    const stillThere = await session
+      .prepare('SELECT 1 FROM sip01_documents WHERE d = ? LIMIT 1')
+      .bind(d)
+      .first()
+      .catch(() => null);
+    if (stillThere) {
+      await ftsUpsertDocument(session, d);
+    } else {
+      await ftsDeleteDocument(session, d);
+    }
   }
 
   for (const pubkey of pubkeys) {

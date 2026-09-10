@@ -45,6 +45,7 @@ import {
   matchSip01Search,
   parseDateValue,
   buildSip01SearchSql,
+  buildFtsMatch,
 } from './search-query.js';
 import {
   Negentropy,
@@ -329,6 +330,33 @@ export async function runAllTests(log = () => {}) {
       'SQL path adds no url_host clause for unusable site:',
     );
     assert(withoutBad.sql.length > 0, 'baseline SQL built');
+  });
+
+  await test('nip50: FTS5 match expression is sanitized (no operator injection)', async () => {
+    eq(buildFtsMatch(parseSearchQuery('bitcoin privacy')), 'bitcoin* AND privacy*', 'bare prefix tokens');
+    eq(buildFtsMatch(parseSearchQuery('"cold storage"')), '"cold storage"', 'phrase kept');
+    // FTS5 specials must never leak unquoted: AND/OR/NOT/NEAR/:/^/*/( )
+    const evil = buildFtsMatch(parseSearchQuery('bitcoin) OR (site:x'));
+    assert(evil === null || !/OR\s*\(/.test(evil), `operator injection leak: ${evil}`);
+    eq(buildFtsMatch(parseSearchQuery('site:github.com')), null, 'no text terms → no MATCH');
+  });
+
+  await test('nip50: FTS5 SQL assembly (MATCH join + bm25 + param order)', async () => {
+    const p = parseSearchQuery('bitcoin site:github.com');
+    const { sql, params } = buildSip01SearchSql(p, 10, { fts: true });
+    assert(sql.includes('sip01_fts'), 'joins FTS table');
+    assert(sql.includes('f MATCH ?'), 'MATCH clause present');
+    assert(sql.includes('bm25('), 'bm25 ranking');
+    assert(sql.includes('ORDER BY r.bm25rank ASC'), 'bm25 ascending order');
+    assert(!sql.includes('LIKE'), 'no LIKE for text terms in FTS mode');
+    // params: rank parts first, then MATCH, then operator params, then limit
+    eq(params[params.length - 1], 10, 'limit last');
+    assert(params.includes('bitcoin*'), 'match param present');
+    assert(params.includes('github.com'), 'site param present');
+    // LIKE mode stays the default
+    const like = buildSip01SearchSql(p, 10);
+    assert(like.sql.includes('LIKE'), 'LIKE path default');
+    assert(!like.sql.includes('sip01_fts'), 'no FTS join in LIKE mode');
   });
 
   await test('nip50: buildSip01SearchSql assembles sane SQL', async () => {
