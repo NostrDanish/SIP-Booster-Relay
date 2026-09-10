@@ -346,7 +346,9 @@ export async function runAllTests(log = () => {}) {
     const { sql, params } = buildSip01SearchSql(p, 10, { fts: true });
     assert(sql.includes('sip01_fts'), 'joins FTS table');
     assert(sql.includes('f MATCH ?'), 'MATCH clause present');
-    assert(sql.includes('bm25(f,'), 'bm25 uses the table alias (SQLite alias scoping)');
+    assert(sql.includes('bm25(sip01_fts,'), 'bm25 uses the un-aliased FTS table name (auxiliary functions reject aliases)');
+    assert(sql.includes('sip01_fts MATCH ?'), 'MATCH on the un-aliased FTS table');
+    assert(!sql.includes('sip01_fts f '), 'no FTS table alias');
     assert(sql.includes('bm25('), 'bm25 ranking');
     assert(sql.includes('ORDER BY r.bm25rank ASC'), 'bm25 ascending order');
     assert(!sql.includes('LIKE'), 'no LIKE for text terms in FTS mode');
