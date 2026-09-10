@@ -44,6 +44,7 @@ import { Negentropy, NegentropyStorageVector, hexToBytes as negHexToBytes, bytes
 import { SIP01_KIND, extractSip01Fields } from '../shared/sip01.js';
 import { parseSearchQuery, matchSip01Search } from '../shared/search-query.js';
 import { bumpMetric } from './sip01/ingest';
+import { dbg } from './log';
 
 // Session attachment data structure (minimal - auth state stored in session)
 interface SessionAttachment {
@@ -155,7 +156,7 @@ export class RelayWebSocket implements DurableObject {
 
   // Alarm handler - called when scheduled alarm fires
   async alarm(): Promise<void> {
-    console.log(`Alarm triggered for DO ${this.doName}`);
+    dbg(`Alarm triggered for DO ${this.doName}`);
 
     const now = Date.now();
     const idleTime = now - this.lastActivityTime;
@@ -163,24 +164,24 @@ export class RelayWebSocket implements DurableObject {
     const activeWebSockets = this.state.getWebSockets();
     const activeCount = activeWebSockets.length;
 
-    console.log(`DO ${this.doName} - Active WebSockets: ${activeCount}, Idle time: ${idleTime}ms`);
+    dbg(`DO ${this.doName} - Active WebSockets: ${activeCount}, Idle time: ${idleTime}ms`);
 
     // Reclaim idle NEG sessions
     this.reclaimIdleNegSessions();
 
     if (activeCount === 0) {
-      console.log(`Cleaning up DO ${this.doName} - no active connections`);
+      dbg(`Cleaning up DO ${this.doName} - no active connections`);
       await this.cleanup();
       return;
     }
 
     const nextAlarm = now + this.IDLE_TIMEOUT;
     await this.state.storage.setAlarm(nextAlarm);
-    console.log(`Next alarm scheduled for DO ${this.doName} in ${this.IDLE_TIMEOUT}ms`);
+    dbg(`Next alarm scheduled for DO ${this.doName} in ${this.IDLE_TIMEOUT}ms`);
   }
 
   private async cleanup(): Promise<void> {
-    console.log(`Running cleanup for DO ${this.doName}`);
+    dbg(`Running cleanup for DO ${this.doName}`);
 
     this.queryCache.clear();
     this.queryCacheIndex.clear();
@@ -192,7 +193,7 @@ export class RelayWebSocket implements DurableObject {
 
     await this.cleanupOrphanedSubscriptions();
 
-    console.log(`Cleanup complete for DO ${this.doName}`);
+    dbg(`Cleanup complete for DO ${this.doName}`);
   }
 
   private async cleanupOrphanedSubscriptions(): Promise<void> {
@@ -220,7 +221,7 @@ export class RelayWebSocket implements DurableObject {
 
       if (keysToDelete.length > 0) {
         await this.state.storage.delete(keysToDelete);
-        console.log(`Cleaned up ${keysToDelete.length} orphaned subscription entries`);
+        dbg(`Cleaned up ${keysToDelete.length} orphaned subscription entries`);
       }
     } catch (error) {
       console.error('Error cleaning up orphaned subscriptions:', error);
@@ -233,7 +234,7 @@ export class RelayWebSocket implements DurableObject {
     if (existingAlarm === null) {
       const alarmTime = Date.now() + this.IDLE_TIMEOUT;
       await this.state.storage.setAlarm(alarmTime);
-      console.log(`Scheduled first alarm for DO ${this.doName}`);
+      dbg(`Scheduled first alarm for DO ${this.doName}`);
     }
   }
 
@@ -299,7 +300,7 @@ export class RelayWebSocket implements DurableObject {
     const cacheKey = JSON.stringify({ filters, bookmark });
 
     if (this.activeQueries.has(cacheKey)) {
-      console.log('Returning in-flight query result (deduplication)');
+      dbg('Returning in-flight query result (deduplication)');
       return await this.activeQueries.get(cacheKey)!;
     }
 
@@ -312,10 +313,10 @@ export class RelayWebSocket implements DurableObject {
       if (globalCached) {
         const cachedDate = globalCached.headers.get('X-Cache-Time');
         if (cachedDate && Date.now() - parseInt(cachedDate) > 300000) {
-          console.log('Global cache entry expired, deleting');
+          dbg('Global cache entry expired, deleting');
           await globalCache.delete(globalCacheKey);
         } else {
-          console.log('Returning globally cached query result');
+          dbg('Returning globally cached query result');
           const result = await globalCached.json() as QueryResult;
 
           this.queryCache.set(cacheKey, {
@@ -409,7 +410,7 @@ export class RelayWebSocket implements DurableObject {
         this.removeFromCacheIndex(key);
       }
 
-      console.log(`Evicted ${toRemove} low-scoring cache entries (LFU)`);
+      dbg(`Evicted ${toRemove} low-scoring cache entries (LFU)`);
     }
   }
 
@@ -493,7 +494,7 @@ export class RelayWebSocket implements DurableObject {
     }
 
     if (keysToInvalidate.size > 0) {
-      console.log(`Invalidated ${keysToInvalidate.size} local cache entries for event ${event.id} (kind:${event.kind}, author:${event.pubkey.substring(0, 8)}...)`);
+      dbg(`Invalidated ${keysToInvalidate.size} local cache entries for event ${event.id} (kind:${event.kind}, author:${event.pubkey.substring(0, 8)}...)`);
     }
   }
 
@@ -518,7 +519,7 @@ export class RelayWebSocket implements DurableObject {
     this.region = url.searchParams.get('region') || this.region || 'unknown';
     const colo = url.searchParams.get('colo') || 'default';
 
-    console.log(`WebSocket connection to DO: ${this.doName} (region: ${this.region}, colo: ${colo})`);
+    dbg(`WebSocket connection to DO: ${this.doName} (region: ${this.region}, colo: ${colo})`);
 
     const webSocketPair = new WebSocketPair();
     const [client, server] = Object.values(webSocketPair);
@@ -550,7 +551,7 @@ export class RelayWebSocket implements DurableObject {
     this.lastActivityTime = Date.now();
     await this.scheduleAlarmIfNeeded();
 
-    console.log(`New WebSocket session: ${sessionId} on DO ${this.doName}`);
+    dbg(`New WebSocket session: ${sessionId} on DO ${this.doName}`);
 
     return new Response(null, {
       status: 101,
@@ -672,7 +673,7 @@ export class RelayWebSocket implements DurableObject {
   async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean): Promise<void> {
     const attachment = ws.deserializeAttachment() as SessionAttachment | null;
     if (attachment) {
-      console.log(`WebSocket closed: ${attachment.sessionId} on DO ${this.doName}`);
+      dbg(`WebSocket closed: ${attachment.sessionId} on DO ${this.doName}`);
       this.sessions.delete(attachment.sessionId);
 
       // Reclaim this connection's NEG sessions
@@ -687,7 +688,7 @@ export class RelayWebSocket implements DurableObject {
       const activeWebSockets = this.state.getWebSockets();
       if (activeWebSockets.length === 0) {
         await this.state.storage.deleteAlarm();
-        console.log(`Deleted alarm for DO ${this.doName} - no active connections remaining`);
+        dbg(`Deleted alarm for DO ${this.doName} - no active connections remaining`);
       }
     }
   }
@@ -711,7 +712,7 @@ export class RelayWebSocket implements DurableObject {
 
       this.processedEvents.set(event.id, Date.now());
 
-      console.log(`DO ${this.doName} received event ${event.id} from ${sourceDoId}`);
+      dbg(`DO ${this.doName} received event ${event.id} from ${sourceDoId}`);
 
       this.invalidateRelevantCaches(event);
       await this.broadcastToLocalSessions(event);
@@ -842,7 +843,7 @@ export class RelayWebSocket implements DurableObject {
           ? session.sipRateLimiter
           : session.pubkeyRateLimiter;
         if (!limiter.removeToken()) {
-          console.log(`Rate limit exceeded for pubkey ${event.pubkey} (kind ${event.kind})`);
+          dbg(`Rate limit exceeded for pubkey ${event.pubkey} (kind ${event.kind})`);
           this.sendOK(session.webSocket, event.id, false, 'rate-limited: slow down there chief');
           return;
         }
@@ -919,7 +920,7 @@ export class RelayWebSocket implements DurableObject {
         this.processedEvents.set(event.id, Date.now());
         this.invalidateRelevantCaches(event);
 
-        console.log(`DO ${this.doName} broadcasting event ${event.id}`);
+        dbg(`DO ${this.doName} broadcasting event ${event.id}`);
         await this.broadcastEvent(event);
       } else {
         this.sendOK(session.webSocket, event.id, false, result.message);
@@ -1034,7 +1035,7 @@ export class RelayWebSocket implements DurableObject {
     session.subscriptions.set(subscriptionId, filters);
     await this.saveSubscriptions(session.id, session.subscriptions);
 
-    console.log(`New subscription ${subscriptionId} for session ${session.id} on DO ${this.doName}`);
+    dbg(`New subscription ${subscriptionId} for session ${session.id} on DO ${this.doName}`);
 
     try {
       await ensureDatabase(this.env.RELAY_DATABASE);
@@ -1085,7 +1086,7 @@ export class RelayWebSocket implements DurableObject {
     const deleted = session.subscriptions.delete(subscriptionId);
     if (deleted) {
       await this.saveSubscriptions(session.id, session.subscriptions);
-      console.log(`Closed subscription ${subscriptionId} for session ${session.id} on DO ${this.doName}`);
+      dbg(`Closed subscription ${subscriptionId} for session ${session.id} on DO ${this.doName}`);
       this.sendClosed(session.webSocket, subscriptionId, 'Subscription closed');
     } else {
       this.sendClosed(session.webSocket, subscriptionId, 'Subscription not found');
@@ -1175,7 +1176,7 @@ export class RelayWebSocket implements DurableObject {
     for (const [key, neg] of this.negSessions) {
       if (now - neg.createdAt > NEG_SESSION_TIMEOUT_MS) {
         this.negSessions.delete(key);
-        console.log(`Reclaimed idle NEG session ${key}`);
+        dbg(`Reclaimed idle NEG session ${key}`);
       }
     }
   }
@@ -1269,7 +1270,7 @@ export class RelayWebSocket implements DurableObject {
 
       bumpMetric(this.env.RELAY_DATABASE.withSession('first-primary'), 'neg_sessions').catch(() => undefined);
 
-      console.log(`NEG-OPEN ${subId}: reconciling ${items.length} items for session ${session.id}`);
+      dbg(`NEG-OPEN ${subId}: reconciling ${items.length} items for session ${session.id}`);
       this.sendNegMsg(session.webSocket, subId, negBytesToHex(result.message!));
     } catch (error: any) {
       console.error('NEG-OPEN failed:', error);
@@ -1448,7 +1449,7 @@ export class RelayWebSocket implements DurableObject {
     }
 
     if (broadcastCount > 0) {
-      console.log(`Event ${event.id} broadcast to ${broadcastCount} local subscriptions on DO ${this.doName}`);
+      dbg(`Event ${event.id} broadcast to ${broadcastCount} local subscriptions on DO ${this.doName}`);
     }
   }
 
@@ -1470,7 +1471,7 @@ export class RelayWebSocket implements DurableObject {
     );
 
     const successful = results.filter(r => r.status === 'fulfilled').length;
-    console.log(`Event ${event.id} broadcast from DO ${this.doName} to ${successful}/${broadcasts.length} remote DOs`);
+    dbg(`Event ${event.id} broadcast from DO ${this.doName} to ${successful}/${broadcasts.length} remote DOs`);
   }
 
   private async sendToSpecificDO(doName: string, event: NostrEvent): Promise<Response> {

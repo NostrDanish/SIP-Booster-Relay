@@ -210,6 +210,11 @@ export const DEPLOY_MAX_PER_IP_PER_DAY = 10;
 export const AUTH_REQUIRED = false; // Set to true to require NIP-42 auth for reads+writes
 export const AUTH_TIMEOUT_MS = 600000; // 10 minutes - how long the challenge is valid
 
+// Verbose logging. Off by default: on Workers, observability log volume is a
+// cost center at relay scale (lesson from relay.cashu.email's cost incident).
+// Errors are always logged regardless.
+export const DEBUG_LOGS = false;
+
 // ---------------------------------------------------------------------------
 // Relay info (NIP-11)
 // ---------------------------------------------------------------------------

@@ -6711,7 +6711,7 @@ var SIP01_SCHEMA_STATEMENTS = [
     value INTEGER NOT NULL DEFAULT 0
   )`
 ];
-var SCHEMA_VERSION = 9;
+var SCHEMA_VERSION = 8;
 function migrationV7Statements() {
   return [
     // Rebuild event_tags_cache_multi without the restrictive CHECK list.
@@ -6755,20 +6755,6 @@ function migrationV8Statements() {
   ];
 }
 __name(migrationV8Statements, "migrationV8Statements");
-function migrationV9Statements() {
-  return [
-    `ALTER TABLE sip01_documents ADD COLUMN fts_id INTEGER`,
-    `UPDATE sip01_documents SET fts_id = rowid WHERE fts_id IS NULL`,
-    `CREATE UNIQUE INDEX IF NOT EXISTS idx_sip01_documents_fts_id ON sip01_documents(fts_id)`,
-    `CREATE VIRTUAL TABLE IF NOT EXISTS sip01_fts USING fts5(d UNINDEXED, title, description, canonical_url, topics, tokenize='porter unicode61')`,
-    `INSERT INTO sip01_fts (rowid, d, title, description, canonical_url, topics)
-       SELECT fts_id, d, title, COALESCE(description, ''), canonical_url, COALESCE(topics, '[]')
-       FROM sip01_documents
-       WHERE fts_id IS NOT NULL
-         AND NOT EXISTS (SELECT 1 FROM sip01_fts f WHERE f.rowid = sip01_documents.fts_id)`
-  ];
-}
-__name(migrationV9Statements, "migrationV9Statements");
 var SERVICE_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS service_settings (
     key TEXT PRIMARY KEY,
@@ -7129,8 +7115,7 @@ async function initializeDatabase(db) {
       console.log(`Migrating schema ${currentVersion} \u2192 ${SCHEMA_VERSION}...`);
       const migrationStatements = [
         ...currentVersion < 7 ? migrationV7Statements() : [],
-        ...currentVersion < 8 ? migrationV8Statements() : [],
-        ...currentVersion < 9 ? migrationV9Statements() : []
+        ...currentVersion < 8 ? migrationV8Statements() : []
       ];
       for (const statement of migrationStatements) {
         try {

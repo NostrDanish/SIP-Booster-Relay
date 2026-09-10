@@ -4079,7 +4079,7 @@ var SIP01_SCHEMA_STATEMENTS = [
     value INTEGER NOT NULL DEFAULT 0
   )`
 ];
-var SCHEMA_VERSION = 9;
+var SCHEMA_VERSION = 8;
 function migrationV7Statements() {
   return [
     // Rebuild event_tags_cache_multi without the restrictive CHECK list.
@@ -4123,20 +4123,6 @@ function migrationV8Statements() {
   ];
 }
 __name(migrationV8Statements, "migrationV8Statements");
-function migrationV9Statements() {
-  return [
-    `ALTER TABLE sip01_documents ADD COLUMN fts_id INTEGER`,
-    `UPDATE sip01_documents SET fts_id = rowid WHERE fts_id IS NULL`,
-    `CREATE UNIQUE INDEX IF NOT EXISTS idx_sip01_documents_fts_id ON sip01_documents(fts_id)`,
-    `CREATE VIRTUAL TABLE IF NOT EXISTS sip01_fts USING fts5(d UNINDEXED, title, description, canonical_url, topics, tokenize='porter unicode61')`,
-    `INSERT INTO sip01_fts (rowid, d, title, description, canonical_url, topics)
-       SELECT fts_id, d, title, COALESCE(description, ''), canonical_url, COALESCE(topics, '[]')
-       FROM sip01_documents
-       WHERE fts_id IS NOT NULL
-         AND NOT EXISTS (SELECT 1 FROM sip01_fts f WHERE f.rowid = sip01_documents.fts_id)`
-  ];
-}
-__name(migrationV9Statements, "migrationV9Statements");
 var SERVICE_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS service_settings (
     key TEXT PRIMARY KEY,
@@ -4360,18 +4346,6 @@ async function getDatabaseSizeBytes(session) {
   }
 }
 __name(getDatabaseSizeBytes, "getDatabaseSizeBytes");
-async function getMetrics(session) {
-  const out = {};
-  try {
-    const rows = await session.prepare("SELECT key, value FROM relay_metrics").all();
-    for (const row of rows.results ?? []) {
-      out[row.key] = row.value;
-    }
-  } catch {
-  }
-  return out;
-}
-__name(getMetrics, "getMetrics");
 async function getSip01Stats(session) {
   const now = Math.floor(Date.now() / 1e3);
   const dayAgo = now - 86400;
@@ -5833,8 +5807,7 @@ async function initializeDatabase(db) {
       console.log(`Migrating schema ${currentVersion} \u2192 ${SCHEMA_VERSION}...`);
       const migrationStatements = [
         ...currentVersion < 7 ? migrationV7Statements() : [],
-        ...currentVersion < 8 ? migrationV8Statements() : [],
-        ...currentVersion < 9 ? migrationV9Statements() : []
+        ...currentVersion < 8 ? migrationV8Statements() : []
       ];
       for (const statement of migrationStatements) {
         try {
@@ -7206,45 +7179,6 @@ async function handleApiRequest(url, request, env) {
       payment_sats: RELAY_ACCESS_PRICE_SATS2,
       payment_npub: relayNpub2,
       supported_operators: [...SUPPORTED_NIP50_OPERATORS]
-    });
-  }
-  if (path === "/metrics" || path === "/api/metrics") {
-    const session2 = env.RELAY_DATABASE.withSession("first-unconstrained");
-    const metrics = await getMetrics(session2);
-    let counts = null;
-    try {
-      counts = await session2.prepare(
-        `SELECT
-             (SELECT COUNT(*) FROM events) AS events,
-             (SELECT COUNT(*) FROM sip01_documents) AS documents,
-             (SELECT COUNT(*) FROM sip01_observations) AS observations,
-             (SELECT COUNT(*) FROM sip01_indexers) AS indexers`
-      ).first();
-    } catch {
-    }
-    const sizeBytes = await getDatabaseSizeBytes(session2);
-    const lines = [
-      "# HELP siprelay_info Relay build info",
-      "# TYPE siprelay_info gauge",
-      `siprelay_info{version="${relayInfo2.version}",mode="${RELAY_MODE2}"} 1`
-    ];
-    const gauges = [
-      ["siprelay_events_total", counts?.events ?? 0, "events stored"],
-      ["siprelay_documents", counts?.documents ?? 0, "SIP-01 documents"],
-      ["siprelay_observations", counts?.observations ?? 0, "SIP-01 observations"],
-      ["siprelay_indexers", counts?.indexers ?? 0, "SIP-01 indexers"],
-      ["siprelay_database_size_bytes", sizeBytes, "D1 database size"]
-    ];
-    for (const [name, value, help] of gauges) {
-      lines.push(`# HELP ${name} ${help}`, `# TYPE ${name} gauge`, `${name} ${value}`);
-    }
-    for (const [key, value] of Object.entries(metrics)) {
-      const name = `siprelay_${key.replace(/[^a-z0-9_]/g, "_")}_total`;
-      lines.push(`# TYPE ${name} counter`, `${name} ${value}`);
-    }
-    return new Response(lines.join("\n") + "\n", {
-      status: 200,
-      headers: { "Content-Type": "text/plain; version=0.0.4", "Access-Control-Allow-Origin": "*" }
     });
   }
   if (path === "/api/health") {

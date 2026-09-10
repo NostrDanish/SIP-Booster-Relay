@@ -32,6 +32,7 @@ import { executeSearch } from './sip01/search';
 import { verifyZapReceipt, hasPaidForRelay, savePaidPubkey } from './pay';
 import { serveMiniLanding } from './mini-landing';
 import { handleServiceApi } from './service/routes';
+import { dbg } from './log';
 import { runtimeRelayName, runtimeRelayPubkey, runtimeRelayContact, runtimeRelayNpub } from './runtime-config';
 
 // Import config values
@@ -254,7 +255,7 @@ async function initializeDatabase(db: D1Database): Promise<void> {
     const currentVersion = versionResult ? parseInt(versionResult.value) : 0;
 
     if (currentVersion < SCHEMA_VERSION) {
-      console.log(`Migrating schema ${currentVersion} → ${SCHEMA_VERSION}...`);
+      dbg(`Migrating schema ${currentVersion} → ${SCHEMA_VERSION}...`);
       const migrationStatements = [
         ...(currentVersion < 7 ? migrationV7Statements() : []),
         ...(currentVersion < 8 ? migrationV8Statements() : []),
@@ -270,7 +271,7 @@ async function initializeDatabase(db: D1Database): Promise<void> {
       await session.prepare(
         "INSERT OR REPLACE INTO system_config (key, value) VALUES ('schema_version', ?)"
       ).bind(String(SCHEMA_VERSION)).run();
-      console.log('Schema migration completed');
+      dbg('Schema migration completed');
     }
 
     await session.prepare(
@@ -292,7 +293,7 @@ async function initializeDatabase(db: D1Database): Promise<void> {
       WHERE t.tag_name IN (${CACHED_TAG_NAMES.map((t) => `'${t}'`).join(', ')})
     `).run();
 
-    console.log("Database initialization completed!");
+    dbg("Database initialization completed!");
   } catch (error) {
     console.error("Failed to initialize database:", error);
     throw error;
@@ -541,7 +542,7 @@ async function processEvent(event: NostrEvent, sessionId: string, env: Env): Pro
         const validation = await validateSip01Event(event as any);
         if (!validation.valid) {
           await bumpMetric(session, 'sip01_validation_failures');
-          console.log(`sip01: rejected observation ${event.id}: ${validation.errors.join('; ')}`);
+          dbg(`sip01: rejected observation ${event.id}: ${validation.errors.join('; ')}`);
           return { success: false, message: `invalid: ${validation.errors[0]}` };
         }
       }
@@ -597,7 +598,7 @@ async function saveEventToDatabase(event: NostrEvent, env: Env): Promise<{ succe
           session.prepare("DELETE FROM event_tags_cache_multi WHERE event_id = ?").bind(oldId),
           session.prepare("DELETE FROM events WHERE id = ?").bind(oldId),
         ]);
-        console.log(`Replaced older event ${oldId} with newer event ${event.id} (kind ${event.kind})`);
+        dbg(`Replaced older event ${oldId} with newer event ${event.id} (kind ${event.kind})`);
       }
     }
 
@@ -625,7 +626,7 @@ async function saveEventToDatabase(event: NostrEvent, env: Env): Promise<{ succe
         if (event.kind === SIP01_KIND && SIP01_INDEXING) {
           await removeSip01Observations(session, [oldId]);
         }
-        console.log(`Replaced older parameterized event ${oldId} with newer event ${event.id} (kind ${event.kind}, d=${dTag})`);
+        dbg(`Replaced older parameterized event ${oldId} with newer event ${event.id} (kind ${event.kind}, d=${dTag})`);
       }
     }
 
@@ -695,7 +696,7 @@ async function saveEventToDatabase(event: NostrEvent, env: Env): Promise<{ succe
 
     // Check if the event was actually inserted (not a duplicate that slipped through)
     if (insertResult.meta.changes === 0) {
-      console.log(`Event ${event.id} already exists in database (race condition duplicate)`);
+      dbg(`Event ${event.id} already exists in database (race condition duplicate)`);
       return { success: false, message: "duplicate: event already exists", bookmark: session.getBookmark() ?? undefined };
     }
 
@@ -755,7 +756,7 @@ async function saveEventToDatabase(event: NostrEvent, env: Env): Promise<{ succe
       headers: { 'Cache-Control': 'max-age=3600' }
     }));
 
-    console.log(`Event ${event.id} saved directly to database`);
+    dbg(`Event ${event.id} saved directly to database`);
     return { success: true, message: "Event saved successfully", bookmark: session.getBookmark() ?? undefined };
 
   } catch (error: any) {
@@ -767,7 +768,7 @@ async function saveEventToDatabase(event: NostrEvent, env: Env): Promise<{ succe
 
 // Helper function for kind 5
 async function processDeletionEvent(event: NostrEvent, env: Env): Promise<{ success: boolean; message: string; bookmark?: string }> {
-  console.log(`Processing deletion event ${event.id}`);
+  dbg(`Processing deletion event ${event.id}`);
   const deletedEventIds = event.tags.filter(tag => tag[0] === "e").map(tag => tag[1]);
 
   const session = env.RELAY_DATABASE.withSession('first-primary');
@@ -860,7 +861,7 @@ async function processDeletionEvent(event: NostrEvent, env: Env): Promise<{ succ
       }
 
       deletedCount = idsToDelete.length;
-      console.log(`Batch deleted ${deletedCount} events from D1.`);
+      dbg(`Batch deleted ${deletedCount} events from D1.`);
     } catch (error) {
       console.error('Error batch deleting events:', error);
       errors.push('error batch deleting events');
@@ -1520,7 +1521,7 @@ async function queryDatabaseChunked(filter: NostrFilter, bookmark: string, env: 
     content: row.content as string,
     sig: row.sig as string
   }));
-  console.log(`Found ${events.length} events (chunked)`);
+  dbg(`Found ${events.length} events (chunked)`);
 
   return { events };
 }
@@ -1529,7 +1530,7 @@ async function queryDatabaseChunked(filter: NostrFilter, bookmark: string, env: 
 async function queryEvents(filters: NostrFilter[], bookmark: string, env: Env): Promise<QueryResult> {
   await ensureDatabase(env.RELAY_DATABASE);
   try {
-    console.log(`Processing query with ${filters.length} filters and bookmark: ${bookmark}`);
+    dbg(`Processing query with ${filters.length} filters and bookmark: ${bookmark}`);
     const session = env.RELAY_DATABASE.withSession(bookmark);
     const eventSet = new Map<string, NostrEvent>();
 
@@ -1566,7 +1567,7 @@ async function queryEvents(filters: NostrFilter[], bookmark: string, env: Env): 
         break;
       }
 
-      console.log(`Filter has arrays >${CHUNK_SIZE} items, using chunked query...`);
+      dbg(`Filter has arrays >${CHUNK_SIZE} items, using chunked query...`);
       const chunkedResult = await queryDatabaseChunked(filter, bookmark, env);
       for (const event of chunkedResult.events) {
         if (totalEventsRead >= GLOBAL_MAX_EVENTS) break;
@@ -1589,7 +1590,7 @@ async function queryEvents(filters: NostrFilter[], bookmark: string, env: Env): 
             console.warn(`Query precheck: estimated ${estimatedRows} rows, skipping filter to prevent timeout`);
             continue;
           } else {
-            console.log(`Query precheck: estimated ${estimatedRows} rows, proceeding`);
+            dbg(`Query precheck: estimated ${estimatedRows} rows, proceeding`);
           }
         }
 
@@ -1612,7 +1613,7 @@ async function queryEvents(filters: NostrFilter[], bookmark: string, env: Env): 
             const result = results[i];
 
             if (i === 0 && result.meta) {
-              console.log({
+              dbg({
                 servedByRegion: result.meta.served_by_region ?? "",
                 servedByPrimary: result.meta.served_by_primary ?? false,
                 batchSize: results.length
@@ -1657,7 +1658,7 @@ async function queryEvents(filters: NostrFilter[], bookmark: string, env: Env): 
     });
 
     const newBookmark = session.getBookmark();
-    console.log(`Found ${events.length} events. New bookmark: ${newBookmark}`);
+    dbg(`Found ${events.length} events. New bookmark: ${newBookmark}`);
     return { events, bookmark: newBookmark };
 
   } catch (error: any) {
@@ -2188,7 +2189,7 @@ async function getOptimalDO(cf: any, env: Env): Promise<{ stub: DurableObjectStu
       // @ts-ignore
       return { stub, doName: endpoint.name };
     } catch (error) {
-      console.log(`Failed to connect to ${endpoint.name}: ${error}`);
+      dbg(`Failed to connect to ${endpoint.name}: ${error}`);
     }
   }
 
@@ -2221,7 +2222,7 @@ async function pruneOldEvents(session: D1DatabaseSession, targetSizeBytes: numbe
   let totalEventsDeleted = 0;
   let currentSize = await getDatabaseSizeBytes(session);
 
-  console.log(`Starting database pruning. Current size: ${(currentSize / (1024 * 1024 * 1024)).toFixed(2)} GB, Target: ${(targetSizeBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`);
+  dbg(`Starting database pruning. Current size: ${(currentSize / (1024 * 1024 * 1024)).toFixed(2)} GB, Target: ${(targetSizeBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`);
 
   const protectedKinds = new Set<number>(pruneProtectedKinds);
   if (SIP01_PRUNE_ALLOWED) protectedKinds.delete(SIP01_KIND);
@@ -2239,7 +2240,7 @@ async function pruneOldEvents(session: D1DatabaseSession, targetSizeBytes: numbe
     `).bind(DB_PRUNE_BATCH_SIZE).all();
 
     if (!oldestEvents.results || oldestEvents.results.length === 0) {
-      console.log('No more events eligible for pruning');
+      dbg('No more events eligible for pruning');
       break;
     }
 
@@ -2260,13 +2261,13 @@ async function pruneOldEvents(session: D1DatabaseSession, targetSizeBytes: numbe
     const deletedCount = pruneResults[3]?.meta?.changes || eventIds.length;
     totalEventsDeleted += deletedCount;
 
-    console.log(`Pruned ${deletedCount} events (total: ${totalEventsDeleted})`);
+    dbg(`Pruned ${deletedCount} events (total: ${totalEventsDeleted})`);
 
     currentSize = await getDatabaseSizeBytes(session);
-    console.log(`Current database size: ${(currentSize / (1024 * 1024 * 1024)).toFixed(2)} GB`);
+    dbg(`Current database size: ${(currentSize / (1024 * 1024 * 1024)).toFixed(2)} GB`);
 
     if (totalEventsDeleted >= 100000) {
-      console.log('Reached maximum pruning limit for this run (100,000 events)');
+      dbg('Reached maximum pruning limit for this run (100,000 events)');
       break;
     }
   }
@@ -2395,7 +2396,7 @@ export default {
 
   // Scheduled handler for 24hr database maintenance (runs daily at 00:00 UTC)
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    console.log('Running scheduled 24hr database maintenance...');
+    dbg('Running scheduled 24hr database maintenance...');
 
     try {
       const session = env.RELAY_DATABASE.withSession('first-primary');
@@ -2403,24 +2404,24 @@ export default {
       if (DB_PRUNING_ENABLED) {
         const currentSizeBytes = await getDatabaseSizeBytes(session);
         const currentSizeGB = currentSizeBytes / (1024 * 1024 * 1024);
-        console.log(`Current database size: ${currentSizeGB.toFixed(2)} GB (threshold: ${DB_SIZE_THRESHOLD_GB} GB)`);
+        dbg(`Current database size: ${currentSizeGB.toFixed(2)} GB (threshold: ${DB_SIZE_THRESHOLD_GB} GB)`);
 
         if (currentSizeGB >= DB_SIZE_THRESHOLD_GB) {
-          console.log(`Database size (${currentSizeGB.toFixed(2)} GB) exceeds threshold (${DB_SIZE_THRESHOLD_GB} GB). Starting pruning...`);
+          dbg(`Database size (${currentSizeGB.toFixed(2)} GB) exceeds threshold (${DB_SIZE_THRESHOLD_GB} GB). Starting pruning...`);
           const targetSizeBytes = DB_PRUNE_TARGET_GB * 1024 * 1024 * 1024;
           const pruneResult = await pruneOldEvents(session, targetSizeBytes);
-          console.log(`Pruning completed. Deleted ${pruneResult.eventsDeleted} events. Final size: ${(pruneResult.finalSizeBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`);
+          dbg(`Pruning completed. Deleted ${pruneResult.eventsDeleted} events. Final size: ${(pruneResult.finalSizeBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`);
         } else {
-          console.log('Database size is within limits. No pruning needed.');
+          dbg('Database size is within limits. No pruning needed.');
         }
       } else {
-        console.log('Database pruning is disabled.');
+        dbg('Database pruning is disabled.');
       }
 
-      console.log('Running PRAGMA optimize...');
+      dbg('Running PRAGMA optimize...');
       await session.prepare('PRAGMA optimize').run();
 
-      console.log('Running ANALYZE on all tables...');
+      dbg('Running ANALYZE on all tables...');
       await session.prepare('ANALYZE events').run();
       await session.prepare('ANALYZE tags').run();
       await session.prepare('ANALYZE event_tags_cache_multi').run();
@@ -2429,7 +2430,7 @@ export default {
       await session.prepare('ANALYZE sip01_observations').run().catch(() => undefined);
       await session.prepare('ANALYZE sip01_indexers').run().catch(() => undefined);
 
-      console.log('Scheduled 24hr database maintenance completed successfully');
+      dbg('Scheduled 24hr database maintenance completed successfully');
     } catch (error) {
       console.error('Scheduled maintenance failed:', error);
     }
