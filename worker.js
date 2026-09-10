@@ -7887,7 +7887,7 @@ var relay_worker_default = {
         await ensureDatabase(env.RELAY_DATABASE);
         return await handleServiceApi(request, env, url);
       }
-      if (url.pathname.startsWith("/api/")) {
+      if (url.pathname.startsWith("/api/") || url.pathname === "/metrics") {
         await ensureDatabase(env.RELAY_DATABASE);
         return await handleApiRequest(url, request, env);
       }
