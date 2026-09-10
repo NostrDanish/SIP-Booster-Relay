@@ -45,6 +45,7 @@ __export(config_exports, {
   DB_PRUNE_TARGET_GB: () => DB_PRUNE_TARGET_GB,
   DB_PRUNING_ENABLED: () => DB_PRUNING_ENABLED,
   DB_SIZE_THRESHOLD_GB: () => DB_SIZE_THRESHOLD_GB,
+  DEBUG_LOGS: () => DEBUG_LOGS,
   DEPLOY_BUNDLE_REF: () => DEPLOY_BUNDLE_REF,
   DEPLOY_BUNDLE_SHA256: () => DEPLOY_BUNDLE_SHA256,
   DEPLOY_BUNDLE_URL: () => DEPLOY_BUNDLE_URL,
@@ -160,6 +161,7 @@ var DEPLOY_BUNDLE_URL = `https://raw.githubusercontent.com/NostrDanish/SIP-Boost
 var DEPLOY_MAX_PER_IP_PER_DAY = 10;
 var AUTH_REQUIRED = false;
 var AUTH_TIMEOUT_MS = 6e5;
+var DEBUG_LOGS = false;
 var relayInfo = {
   name: "UNCAGED SIP Relay",
   description: "A serverless SIP-01 search index relay \u2014 decentralized web-index observations (Nostr kind 39697) on Cloudflare Workers + D1. One shared decentralized index. Many independent indexers. No single owner.",
@@ -5739,6 +5741,13 @@ async function handleServiceApi(request, env, url) {
 }
 __name(handleServiceApi, "handleServiceApi");
 
+// src/log.ts
+function dbg(...args) {
+  if (DEBUG_LOGS)
+    console.log(...args);
+}
+__name(dbg, "dbg");
+
 // src/relay-worker.ts
 var {
   relayInfo: relayInfo2,
@@ -5924,7 +5933,7 @@ async function initializeDatabase(db) {
     ).first();
     const currentVersion = versionResult ? parseInt(versionResult.value) : 0;
     if (currentVersion < SCHEMA_VERSION) {
-      console.log(`Migrating schema ${currentVersion} \u2192 ${SCHEMA_VERSION}...`);
+      dbg(`Migrating schema ${currentVersion} \u2192 ${SCHEMA_VERSION}...`);
       const migrationStatements = [
         ...currentVersion < 7 ? migrationV7Statements() : [],
         ...currentVersion < 8 ? migrationV8Statements() : []
@@ -5940,7 +5949,7 @@ async function initializeDatabase(db) {
       await session.prepare(
         "INSERT OR REPLACE INTO system_config (key, value) VALUES ('schema_version', ?)"
       ).bind(String(SCHEMA_VERSION)).run();
-      console.log("Schema migration completed");
+      dbg("Schema migration completed");
     }
     await session.prepare(
       "INSERT OR REPLACE INTO system_config (key, value) VALUES ('db_initialized', '1')"
@@ -5958,7 +5967,7 @@ async function initializeDatabase(db) {
       INNER JOIN tags t ON e.id = t.event_id
       WHERE t.tag_name IN (${CACHED_TAG_NAMES.map((t) => `'${t}'`).join(", ")})
     `).run();
-    console.log("Database initialization completed!");
+    dbg("Database initialization completed!");
   } catch (error) {
     console.error("Failed to initialize database:", error);
     throw error;
@@ -6149,7 +6158,7 @@ async function processEvent(event, sessionId, env) {
         const validation = await validateSip01Event(event);
         if (!validation.valid) {
           await bumpMetric(session, "sip01_validation_failures");
-          console.log(`sip01: rejected observation ${event.id}: ${validation.errors.join("; ")}`);
+          dbg(`sip01: rejected observation ${event.id}: ${validation.errors.join("; ")}`);
           return { success: false, message: `invalid: ${validation.errors[0]}` };
         }
       }
@@ -6192,7 +6201,7 @@ async function saveEventToDatabase(event, env) {
           session.prepare("DELETE FROM event_tags_cache_multi WHERE event_id = ?").bind(oldId),
           session.prepare("DELETE FROM events WHERE id = ?").bind(oldId)
         ]);
-        console.log(`Replaced older event ${oldId} with newer event ${event.id} (kind ${event.kind})`);
+        dbg(`Replaced older event ${oldId} with newer event ${event.id} (kind ${event.kind})`);
       }
     }
     const isParameterizedReplaceable = event.kind >= 3e4 && event.kind < 4e4;
@@ -6215,7 +6224,7 @@ async function saveEventToDatabase(event, env) {
         if (event.kind === SIP01_KIND && SIP01_INDEXING2) {
           await removeSip01Observations(session, [oldId]);
         }
-        console.log(`Replaced older parameterized event ${oldId} with newer event ${event.id} (kind ${event.kind}, d=${dTag})`);
+        dbg(`Replaced older parameterized event ${oldId} with newer event ${event.id} (kind ${event.kind}, d=${dTag})`);
       }
     }
     let contentHash2 = null;
@@ -6269,7 +6278,7 @@ async function saveEventToDatabase(event, env) {
       contentPreview
     ).run();
     if (insertResult.meta.changes === 0) {
-      console.log(`Event ${event.id} already exists in database (race condition duplicate)`);
+      dbg(`Event ${event.id} already exists in database (race condition duplicate)`);
       return { success: false, message: "duplicate: event already exists", bookmark: session.getBookmark() ?? void 0 };
     }
     const postInsertBatch = [];
@@ -6313,7 +6322,7 @@ async function saveEventToDatabase(event, env) {
     await cache.put(cacheKey, new Response("cached", {
       headers: { "Cache-Control": "max-age=3600" }
     }));
-    console.log(`Event ${event.id} saved directly to database`);
+    dbg(`Event ${event.id} saved directly to database`);
     return { success: true, message: "Event saved successfully", bookmark: session.getBookmark() ?? void 0 };
   } catch (error) {
     console.error(`Error saving event to database: ${error.message}`);
@@ -6323,7 +6332,7 @@ async function saveEventToDatabase(event, env) {
 }
 __name(saveEventToDatabase, "saveEventToDatabase");
 async function processDeletionEvent(event, env) {
-  console.log(`Processing deletion event ${event.id}`);
+  dbg(`Processing deletion event ${event.id}`);
   const deletedEventIds = event.tags.filter((tag) => tag[0] === "e").map((tag) => tag[1]);
   const session = env.RELAY_DATABASE.withSession("first-primary");
   const addressTags = event.tags.filter((tag) => tag[0] === "a").map((tag) => tag[1]);
@@ -6397,7 +6406,7 @@ async function processDeletionEvent(event, env) {
         await session.batch(deleteStatements.slice(i, i + 90));
       }
       deletedCount = idsToDelete.length;
-      console.log(`Batch deleted ${deletedCount} events from D1.`);
+      dbg(`Batch deleted ${deletedCount} events from D1.`);
     } catch (error) {
       console.error("Error batch deleting events:", error);
       errors.push("error batch deleting events");
@@ -6916,14 +6925,14 @@ async function queryDatabaseChunked(filter, bookmark, env) {
     content: row.content,
     sig: row.sig
   }));
-  console.log(`Found ${events.length} events (chunked)`);
+  dbg(`Found ${events.length} events (chunked)`);
   return { events };
 }
 __name(queryDatabaseChunked, "queryDatabaseChunked");
 async function queryEvents(filters, bookmark, env) {
   await ensureDatabase(env.RELAY_DATABASE);
   try {
-    console.log(`Processing query with ${filters.length} filters and bookmark: ${bookmark}`);
+    dbg(`Processing query with ${filters.length} filters and bookmark: ${bookmark}`);
     const session = env.RELAY_DATABASE.withSession(bookmark);
     const eventSet = /* @__PURE__ */ new Map();
     const chunkedFilters = [];
@@ -6949,7 +6958,7 @@ async function queryEvents(filters, bookmark, env) {
         console.warn(`Global event limit reached (${GLOBAL_MAX_EVENTS}), stopping query`);
         break;
       }
-      console.log(`Filter has arrays >${CHUNK_SIZE} items, using chunked query...`);
+      dbg(`Filter has arrays >${CHUNK_SIZE} items, using chunked query...`);
       const chunkedResult = await queryDatabaseChunked(filter, bookmark, env);
       for (const event of chunkedResult.events) {
         if (totalEventsRead >= GLOBAL_MAX_EVENTS)
@@ -6970,7 +6979,7 @@ async function queryEvents(filters, bookmark, env) {
             console.warn(`Query precheck: estimated ${estimatedRows} rows, skipping filter to prevent timeout`);
             continue;
           } else {
-            console.log(`Query precheck: estimated ${estimatedRows} rows, proceeding`);
+            dbg(`Query precheck: estimated ${estimatedRows} rows, proceeding`);
           }
         }
         validFilters.push(filter);
@@ -6988,7 +6997,7 @@ async function queryEvents(filters, bookmark, env) {
           for (let i = 0; i < results.length; i++) {
             const result = results[i];
             if (i === 0 && result.meta) {
-              console.log({
+              dbg({
                 servedByRegion: result.meta.served_by_region ?? "",
                 servedByPrimary: result.meta.served_by_primary ?? false,
                 batchSize: results.length
@@ -7030,7 +7039,7 @@ async function queryEvents(filters, bookmark, env) {
       return a.id.localeCompare(b.id);
     });
     const newBookmark = session.getBookmark();
-    console.log(`Found ${events.length} events. New bookmark: ${newBookmark}`);
+    dbg(`Found ${events.length} events. New bookmark: ${newBookmark}`);
     return { events, bookmark: newBookmark };
   } catch (error) {
     console.error(`Error querying events: ${error.message}`);
@@ -7666,7 +7675,7 @@ async function getOptimalDO(cf, env) {
       const stub2 = env.RELAY_WEBSOCKET.get(id2, { locationHint: endpoint.hint });
       return { stub: stub2, doName: endpoint.name };
     } catch (error) {
-      console.log(`Failed to connect to ${endpoint.name}: ${error}`);
+      dbg(`Failed to connect to ${endpoint.name}: ${error}`);
     }
   }
   const fallback = ALL_ENDPOINTS[1];
@@ -7692,7 +7701,7 @@ __name(getDatabaseSizeBytes2, "getDatabaseSizeBytes");
 async function pruneOldEvents(session, targetSizeBytes) {
   let totalEventsDeleted = 0;
   let currentSize = await getDatabaseSizeBytes2(session);
-  console.log(`Starting database pruning. Current size: ${(currentSize / (1024 * 1024 * 1024)).toFixed(2)} GB, Target: ${(targetSizeBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`);
+  dbg(`Starting database pruning. Current size: ${(currentSize / (1024 * 1024 * 1024)).toFixed(2)} GB, Target: ${(targetSizeBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`);
   const protectedKinds = new Set(pruneProtectedKinds2);
   if (SIP01_PRUNE_ALLOWED2)
     protectedKinds.delete(SIP01_KIND);
@@ -7706,7 +7715,7 @@ async function pruneOldEvents(session, targetSizeBytes) {
       LIMIT ?
     `).bind(DB_PRUNE_BATCH_SIZE2).all();
     if (!oldestEvents.results || oldestEvents.results.length === 0) {
-      console.log("No more events eligible for pruning");
+      dbg("No more events eligible for pruning");
       break;
     }
     const eventIds = oldestEvents.results.map((row) => row.id);
@@ -7722,11 +7731,11 @@ async function pruneOldEvents(session, targetSizeBytes) {
     ]);
     const deletedCount = pruneResults[3]?.meta?.changes || eventIds.length;
     totalEventsDeleted += deletedCount;
-    console.log(`Pruned ${deletedCount} events (total: ${totalEventsDeleted})`);
+    dbg(`Pruned ${deletedCount} events (total: ${totalEventsDeleted})`);
     currentSize = await getDatabaseSizeBytes2(session);
-    console.log(`Current database size: ${(currentSize / (1024 * 1024 * 1024)).toFixed(2)} GB`);
+    dbg(`Current database size: ${(currentSize / (1024 * 1024 * 1024)).toFixed(2)} GB`);
     if (totalEventsDeleted >= 1e5) {
-      console.log("Reached maximum pruning limit for this run (100,000 events)");
+      dbg("Reached maximum pruning limit for this run (100,000 events)");
       break;
     }
   }
@@ -7820,27 +7829,27 @@ var relay_worker_default = {
   },
   // Scheduled handler for 24hr database maintenance (runs daily at 00:00 UTC)
   async scheduled(event, env, ctx) {
-    console.log("Running scheduled 24hr database maintenance...");
+    dbg("Running scheduled 24hr database maintenance...");
     try {
       const session = env.RELAY_DATABASE.withSession("first-primary");
       if (DB_PRUNING_ENABLED2) {
         const currentSizeBytes = await getDatabaseSizeBytes2(session);
         const currentSizeGB = currentSizeBytes / (1024 * 1024 * 1024);
-        console.log(`Current database size: ${currentSizeGB.toFixed(2)} GB (threshold: ${DB_SIZE_THRESHOLD_GB2} GB)`);
+        dbg(`Current database size: ${currentSizeGB.toFixed(2)} GB (threshold: ${DB_SIZE_THRESHOLD_GB2} GB)`);
         if (currentSizeGB >= DB_SIZE_THRESHOLD_GB2) {
-          console.log(`Database size (${currentSizeGB.toFixed(2)} GB) exceeds threshold (${DB_SIZE_THRESHOLD_GB2} GB). Starting pruning...`);
+          dbg(`Database size (${currentSizeGB.toFixed(2)} GB) exceeds threshold (${DB_SIZE_THRESHOLD_GB2} GB). Starting pruning...`);
           const targetSizeBytes = DB_PRUNE_TARGET_GB2 * 1024 * 1024 * 1024;
           const pruneResult = await pruneOldEvents(session, targetSizeBytes);
-          console.log(`Pruning completed. Deleted ${pruneResult.eventsDeleted} events. Final size: ${(pruneResult.finalSizeBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`);
+          dbg(`Pruning completed. Deleted ${pruneResult.eventsDeleted} events. Final size: ${(pruneResult.finalSizeBytes / (1024 * 1024 * 1024)).toFixed(2)} GB`);
         } else {
-          console.log("Database size is within limits. No pruning needed.");
+          dbg("Database size is within limits. No pruning needed.");
         }
       } else {
-        console.log("Database pruning is disabled.");
+        dbg("Database pruning is disabled.");
       }
-      console.log("Running PRAGMA optimize...");
+      dbg("Running PRAGMA optimize...");
       await session.prepare("PRAGMA optimize").run();
-      console.log("Running ANALYZE on all tables...");
+      dbg("Running ANALYZE on all tables...");
       await session.prepare("ANALYZE events").run();
       await session.prepare("ANALYZE tags").run();
       await session.prepare("ANALYZE event_tags_cache_multi").run();
@@ -7848,7 +7857,7 @@ var relay_worker_default = {
       await session.prepare("ANALYZE sip01_documents").run().catch(() => void 0);
       await session.prepare("ANALYZE sip01_observations").run().catch(() => void 0);
       await session.prepare("ANALYZE sip01_indexers").run().catch(() => void 0);
-      console.log("Scheduled 24hr database maintenance completed successfully");
+      dbg("Scheduled 24hr database maintenance completed successfully");
     } catch (error) {
       console.error("Scheduled maintenance failed:", error);
     }
@@ -8412,24 +8421,24 @@ var _RelayWebSocket = class _RelayWebSocket {
   }
   // Alarm handler - called when scheduled alarm fires
   async alarm() {
-    console.log(`Alarm triggered for DO ${this.doName}`);
+    dbg(`Alarm triggered for DO ${this.doName}`);
     const now = Date.now();
     const idleTime = now - this.lastActivityTime;
     const activeWebSockets = this.state.getWebSockets();
     const activeCount = activeWebSockets.length;
-    console.log(`DO ${this.doName} - Active WebSockets: ${activeCount}, Idle time: ${idleTime}ms`);
+    dbg(`DO ${this.doName} - Active WebSockets: ${activeCount}, Idle time: ${idleTime}ms`);
     this.reclaimIdleNegSessions();
     if (activeCount === 0) {
-      console.log(`Cleaning up DO ${this.doName} - no active connections`);
+      dbg(`Cleaning up DO ${this.doName} - no active connections`);
       await this.cleanup();
       return;
     }
     const nextAlarm = now + this.IDLE_TIMEOUT;
     await this.state.storage.setAlarm(nextAlarm);
-    console.log(`Next alarm scheduled for DO ${this.doName} in ${this.IDLE_TIMEOUT}ms`);
+    dbg(`Next alarm scheduled for DO ${this.doName} in ${this.IDLE_TIMEOUT}ms`);
   }
   async cleanup() {
-    console.log(`Running cleanup for DO ${this.doName}`);
+    dbg(`Running cleanup for DO ${this.doName}`);
     this.queryCache.clear();
     this.queryCacheIndex.clear();
     this.activeQueries.clear();
@@ -8438,7 +8447,7 @@ var _RelayWebSocket = class _RelayWebSocket {
     this.negSessions.clear();
     this.sessions.clear();
     await this.cleanupOrphanedSubscriptions();
-    console.log(`Cleanup complete for DO ${this.doName}`);
+    dbg(`Cleanup complete for DO ${this.doName}`);
   }
   async cleanupOrphanedSubscriptions() {
     try {
@@ -8462,7 +8471,7 @@ var _RelayWebSocket = class _RelayWebSocket {
       }
       if (keysToDelete.length > 0) {
         await this.state.storage.delete(keysToDelete);
-        console.log(`Cleaned up ${keysToDelete.length} orphaned subscription entries`);
+        dbg(`Cleaned up ${keysToDelete.length} orphaned subscription entries`);
       }
     } catch (error) {
       console.error("Error cleaning up orphaned subscriptions:", error);
@@ -8473,7 +8482,7 @@ var _RelayWebSocket = class _RelayWebSocket {
     if (existingAlarm === null) {
       const alarmTime = Date.now() + this.IDLE_TIMEOUT;
       await this.state.storage.setAlarm(alarmTime);
-      console.log(`Scheduled first alarm for DO ${this.doName}`);
+      dbg(`Scheduled first alarm for DO ${this.doName}`);
     }
   }
   // Storage helper methods for subscriptions
@@ -8528,7 +8537,7 @@ var _RelayWebSocket = class _RelayWebSocket {
   async getCachedOrQuery(filters, bookmark) {
     const cacheKey = JSON.stringify({ filters, bookmark });
     if (this.activeQueries.has(cacheKey)) {
-      console.log("Returning in-flight query result (deduplication)");
+      dbg("Returning in-flight query result (deduplication)");
       return await this.activeQueries.get(cacheKey);
     }
     try {
@@ -8538,10 +8547,10 @@ var _RelayWebSocket = class _RelayWebSocket {
       if (globalCached) {
         const cachedDate = globalCached.headers.get("X-Cache-Time");
         if (cachedDate && Date.now() - parseInt(cachedDate) > 3e5) {
-          console.log("Global cache entry expired, deleting");
+          dbg("Global cache entry expired, deleting");
           await globalCache.delete(globalCacheKey);
         } else {
-          console.log("Returning globally cached query result");
+          dbg("Returning globally cached query result");
           const result = await globalCached.json();
           this.queryCache.set(cacheKey, {
             result,
@@ -8618,7 +8627,7 @@ var _RelayWebSocket = class _RelayWebSocket {
         this.queryCache.delete(key);
         this.removeFromCacheIndex(key);
       }
-      console.log(`Evicted ${toRemove} low-scoring cache entries (LFU)`);
+      dbg(`Evicted ${toRemove} low-scoring cache entries (LFU)`);
     }
   }
   addToCacheIndex(cacheKey, filters) {
@@ -8692,7 +8701,7 @@ var _RelayWebSocket = class _RelayWebSocket {
       this.removeFromCacheIndex(key);
     }
     if (keysToInvalidate.size > 0) {
-      console.log(`Invalidated ${keysToInvalidate.size} local cache entries for event ${event.id} (kind:${event.kind}, author:${event.pubkey.substring(0, 8)}...)`);
+      dbg(`Invalidated ${keysToInvalidate.size} local cache entries for event ${event.id} (kind:${event.kind}, author:${event.pubkey.substring(0, 8)}...)`);
     }
   }
   async fetch(request) {
@@ -8710,7 +8719,7 @@ var _RelayWebSocket = class _RelayWebSocket {
     }
     this.region = url.searchParams.get("region") || this.region || "unknown";
     const colo = url.searchParams.get("colo") || "default";
-    console.log(`WebSocket connection to DO: ${this.doName} (region: ${this.region}, colo: ${colo})`);
+    dbg(`WebSocket connection to DO: ${this.doName} (region: ${this.region}, colo: ${colo})`);
     const webSocketPair = new WebSocketPair();
     const [client, server] = Object.values(webSocketPair);
     const sessionId = crypto.randomUUID();
@@ -8734,7 +8743,7 @@ var _RelayWebSocket = class _RelayWebSocket {
     }
     this.lastActivityTime = Date.now();
     await this.scheduleAlarmIfNeeded();
-    console.log(`New WebSocket session: ${sessionId} on DO ${this.doName}`);
+    dbg(`New WebSocket session: ${sessionId} on DO ${this.doName}`);
     return new Response(null, {
       status: 101,
       webSocket: client
@@ -8830,7 +8839,7 @@ var _RelayWebSocket = class _RelayWebSocket {
   async webSocketClose(ws, code, reason, wasClean) {
     const attachment = ws.deserializeAttachment();
     if (attachment) {
-      console.log(`WebSocket closed: ${attachment.sessionId} on DO ${this.doName}`);
+      dbg(`WebSocket closed: ${attachment.sessionId} on DO ${this.doName}`);
       this.sessions.delete(attachment.sessionId);
       for (const key of [...this.negSessions.keys()]) {
         if (key.startsWith(`${attachment.sessionId}:`)) {
@@ -8841,7 +8850,7 @@ var _RelayWebSocket = class _RelayWebSocket {
       const activeWebSockets = this.state.getWebSockets();
       if (activeWebSockets.length === 0) {
         await this.state.storage.deleteAlarm();
-        console.log(`Deleted alarm for DO ${this.doName} - no active connections remaining`);
+        dbg(`Deleted alarm for DO ${this.doName} - no active connections remaining`);
       }
     }
   }
@@ -8860,7 +8869,7 @@ var _RelayWebSocket = class _RelayWebSocket {
         return new Response(JSON.stringify({ success: true, duplicate: true }));
       }
       this.processedEvents.set(event.id, Date.now());
-      console.log(`DO ${this.doName} received event ${event.id} from ${sourceDoId}`);
+      dbg(`DO ${this.doName} received event ${event.id} from ${sourceDoId}`);
       this.invalidateRelevantCaches(event);
       await this.broadcastToLocalSessions(event);
       const fiveMinutesAgo = Date.now() - 3e5;
@@ -8967,7 +8976,7 @@ var _RelayWebSocket = class _RelayWebSocket {
       if (!excludedRateLimitKinds.has(event.kind)) {
         const limiter = event.kind === SIP01_KIND && SIP01_ENABLED ? session.sipRateLimiter : session.pubkeyRateLimiter;
         if (!limiter.removeToken()) {
-          console.log(`Rate limit exceeded for pubkey ${event.pubkey} (kind ${event.kind})`);
+          dbg(`Rate limit exceeded for pubkey ${event.pubkey} (kind ${event.kind})`);
           this.sendOK(session.webSocket, event.id, false, "rate-limited: slow down there chief");
           return;
         }
@@ -9023,7 +9032,7 @@ var _RelayWebSocket = class _RelayWebSocket {
         this.sendOK(session.webSocket, event.id, true, result.message);
         this.processedEvents.set(event.id, Date.now());
         this.invalidateRelevantCaches(event);
-        console.log(`DO ${this.doName} broadcasting event ${event.id}`);
+        dbg(`DO ${this.doName} broadcasting event ${event.id}`);
         await this.broadcastEvent(event);
       } else {
         this.sendOK(session.webSocket, event.id, false, result.message);
@@ -9117,7 +9126,7 @@ var _RelayWebSocket = class _RelayWebSocket {
     }
     session.subscriptions.set(subscriptionId, filters);
     await this.saveSubscriptions(session.id, session.subscriptions);
-    console.log(`New subscription ${subscriptionId} for session ${session.id} on DO ${this.doName}`);
+    dbg(`New subscription ${subscriptionId} for session ${session.id} on DO ${this.doName}`);
     try {
       await ensureDatabase(this.env.RELAY_DATABASE);
       const searchFilters = filters.filter((f) => typeof f.search === "string" && f.search.trim() !== "");
@@ -9159,7 +9168,7 @@ var _RelayWebSocket = class _RelayWebSocket {
     const deleted = session.subscriptions.delete(subscriptionId);
     if (deleted) {
       await this.saveSubscriptions(session.id, session.subscriptions);
-      console.log(`Closed subscription ${subscriptionId} for session ${session.id} on DO ${this.doName}`);
+      dbg(`Closed subscription ${subscriptionId} for session ${session.id} on DO ${this.doName}`);
       this.sendClosed(session.webSocket, subscriptionId, "Subscription closed");
     } else {
       this.sendClosed(session.webSocket, subscriptionId, "Subscription not found");
@@ -9237,7 +9246,7 @@ var _RelayWebSocket = class _RelayWebSocket {
     for (const [key, neg] of this.negSessions) {
       if (now - neg.createdAt > NEG_SESSION_TIMEOUT_MS) {
         this.negSessions.delete(key);
-        console.log(`Reclaimed idle NEG session ${key}`);
+        dbg(`Reclaimed idle NEG session ${key}`);
       }
     }
   }
@@ -9307,7 +9316,7 @@ var _RelayWebSocket = class _RelayWebSocket {
         itemCount: items.length
       });
       bumpMetric(this.env.RELAY_DATABASE.withSession("first-primary"), "neg_sessions").catch(() => void 0);
-      console.log(`NEG-OPEN ${subId}: reconciling ${items.length} items for session ${session.id}`);
+      dbg(`NEG-OPEN ${subId}: reconciling ${items.length} items for session ${session.id}`);
       this.sendNegMsg(session.webSocket, subId, bytesToHex2(result.message));
     } catch (error) {
       console.error("NEG-OPEN failed:", error);
@@ -9456,7 +9465,7 @@ var _RelayWebSocket = class _RelayWebSocket {
       }
     }
     if (broadcastCount > 0) {
-      console.log(`Event ${event.id} broadcast to ${broadcastCount} local subscriptions on DO ${this.doName}`);
+      dbg(`Event ${event.id} broadcast to ${broadcastCount} local subscriptions on DO ${this.doName}`);
     }
   }
   async broadcastToOtherDOs(event) {
@@ -9475,7 +9484,7 @@ var _RelayWebSocket = class _RelayWebSocket {
       ]))
     );
     const successful = results.filter((r) => r.status === "fulfilled").length;
-    console.log(`Event ${event.id} broadcast from DO ${this.doName} to ${successful}/${broadcasts.length} remote DOs`);
+    dbg(`Event ${event.id} broadcast from DO ${this.doName} to ${successful}/${broadcasts.length} remote DOs`);
   }
   async sendToSpecificDO(doName, event) {
     try {
