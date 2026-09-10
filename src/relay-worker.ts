@@ -2006,6 +2006,49 @@ async function handleApiRequest(url: URL, request: Request, env: Env): Promise<R
     });
   }
 
+  // Prometheus text exposition (inspired by the Divine fork's metrics work).
+  if (path === '/metrics' || path === '/api/metrics') {
+    const session = env.RELAY_DATABASE.withSession('first-unconstrained');
+    const metrics = await sipApi.getMetrics(session);
+    let counts: any = null;
+    try {
+      counts = await session
+        .prepare(
+          `SELECT
+             (SELECT COUNT(*) FROM events) AS events,
+             (SELECT COUNT(*) FROM sip01_documents) AS documents,
+             (SELECT COUNT(*) FROM sip01_observations) AS observations,
+             (SELECT COUNT(*) FROM sip01_indexers) AS indexers`,
+        )
+        .first();
+    } catch { /* schema initializing */ }
+    const sizeBytes = await sipApi.getDatabaseSizeBytes(session);
+
+    const lines: string[] = [
+      '# HELP siprelay_info Relay build info',
+      '# TYPE siprelay_info gauge',
+      `siprelay_info{version="${relayInfo.version}",mode="${RELAY_MODE}"} 1`,
+    ];
+    const gauges: Array<[string, number, string]> = [
+      ['siprelay_events_total', counts?.events ?? 0, 'events stored'],
+      ['siprelay_documents', counts?.documents ?? 0, 'SIP-01 documents'],
+      ['siprelay_observations', counts?.observations ?? 0, 'SIP-01 observations'],
+      ['siprelay_indexers', counts?.indexers ?? 0, 'SIP-01 indexers'],
+      ['siprelay_database_size_bytes', sizeBytes, 'D1 database size'],
+    ];
+    for (const [name, value, help] of gauges) {
+      lines.push(`# HELP ${name} ${help}`, `# TYPE ${name} gauge`, `${name} ${value}`);
+    }
+    for (const [key, value] of Object.entries(metrics)) {
+      const name = `siprelay_${key.replace(/[^a-z0-9_]/g, '_')}_total`;
+      lines.push(`# TYPE ${name} counter`, `${name} ${value}`);
+    }
+    return new Response(lines.join('\n') + '\n', {
+      status: 200,
+      headers: { 'Content-Type': 'text/plain; version=0.0.4', 'Access-Control-Allow-Origin': '*' },
+    });
+  }
+
   if (path === '/api/health') {
     const session = env.RELAY_DATABASE.withSession('first-unconstrained');
     let events = 0;
