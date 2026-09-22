@@ -2,7 +2,7 @@
 
 ## Capacity model
 
-D1's practical ceiling is 10 GB. This relay stores **compact metadata**, not
+D1's ceiling is 5 GB on the free tier (hard-enforced since September 2026 — queries fail past the cap) and 10 GB on paid plans. This relay stores **compact metadata**, not
 web pages:
 
 - one `events` row per live observation (~0.5–2 KB typical), plus tag rows;
@@ -10,7 +10,7 @@ web pages:
 - one `sip01_documents` row per distinct URL (~200–600 bytes).
 
 A rough rule of thumb: **1 GB ≈ 1–2 million live observations** with tags and
-indexes. The default 10 GB ceiling therefore holds on the order of **10–20M**
+indexes. The 5 GB free-tier ceiling therefore holds on the order of **5–10M**
 live observations. Because kind 39697 is addressable, recrawls replace old
 rows — the index grows with the number of *distinct documents*, not with the
 number of *crawls*.
@@ -23,8 +23,8 @@ one giant one.
 ## Pruning
 
 Daily cron (00:00 UTC): if the database exceeds `DB_SIZE_THRESHOLD_GB`
-(9 GB), the oldest non-protected events are deleted in batches until
-`DB_PRUNE_TARGET_GB` (8 GB). Protected by default: kinds `0`, `3`, `10002`,
+(4 GB), the oldest non-protected events are deleted in batches until
+`DB_PRUNE_TARGET_GB` (3.5 GB). Protected by default: kinds `0`, `3`, `10002`,
 and **`39697`** — in an index relay, addressable observations are the product;
 deleting them by age silently shrinks the searchable index. Set
 `SIP01_PRUNE_ALLOWED = true` if you prefer bounded freshness over
@@ -34,7 +34,10 @@ The cron also runs `PRAGMA optimize` + `ANALYZE` for the query planner.
 
 ## Metrics
 
-`relay_metrics` counters (surfaced via `/api/stats` and the dashboard):
+`relay_metrics` counters (surfaced via `/api/stats` and the dashboard) —
+coalesced in memory and flushed to D1 in one batch every ≤ 15 s so metrics
+stay ~free against the 100k rows/day free-tier write budget; an isolate
+crash loses at most a few seconds of counts:
 
 | Key | Meaning |
 |---|---|
@@ -62,7 +65,7 @@ The cron also runs `PRAGMA optimize` + `ANALYZE` for the query planner.
   default**: at relay scale, log volume is an observability cost center
   (lesson from relay.cashu.email's cost incident). Errors always log.
 - Cloudflare dashboard: Workers analytics, D1 size/reads/writes, DO request
-  counts. Recommended alert: D1 size > 8 GB.
+  counts. Recommended alert: D1 size > 4 GB (free tier).
 
 ## Tuning
 

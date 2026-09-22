@@ -31,7 +31,7 @@
    acceleration structures. If they ever drift, they can be rebuilt from
    `events` (see `scripts/reindex` note in docs/OPERATIONS.md).
 2. **D1 is not the web.** D1 holds compact searchable metadata (titles,
-   descriptions, URLs, tags, hashes) — never page bodies. A 10 GB D1
+   descriptions, URLs, tags, hashes) — never page bodies. A 5 GB (free) / 10 GB (paid) D1
    database holds tens of millions of observations. Larger artifacts belong
    in R2/external storage in future revisions (the schema does not need to
    change for that).
