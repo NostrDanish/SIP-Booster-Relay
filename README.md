@@ -29,7 +29,8 @@ This is a **fork of [Nosflare](https://github.com/Spl0itable/nosflare) (MIT)** t
 - **Indexes for search** — a document/observation/indexer model on top of the canonical event store: one document row per `d` (URL identity), one observation row per live `(pubkey, d)`, one indexer row per publishing key. Provenance is never merged.
 - **NIP-50 search with web operators** — `site:` `domain:` `url:` `inurl:` `title:` `topic:` `type:` `platform:` `category:` `network:` `country:` `mime:` `filetype:` `source:` `lang:` `before:` `after:` `distinct:domain`, negations, plus relay-profile `indexer:` / `x:` / `d:`.
 - **NIP-77 federation** — negentropy set reconciliation so relays sync indexes efficiently: `["NEG-OPEN","sync",{"kinds":[39697]}, …]`.
-- **NIP-45 counts** — cheap observation counts for dashboards and engines.
+- **NIP-45 counts** — cheap observation counts for dashboards and engines, including COUNT-with-search on kind 39697 and `distinct:author` independent-indexer counts (relay-profile extension).
+- **Crawler heartbeats** — kind 16919 (indexstr/Crawlstr) accepted in `sip01` mode, so the ecosystem's crawler-network health view works against this relay.
 - **NIP-11 capability advertisement** — including the `uncaged_index` SIP-01 block (SIP-01 §15).
 - **Optional pay-to-relay** — Bitcoin Lightning via Nostr zaps with **cryptographically verified** kind 9735 receipts. Payment is relay policy, never protocol.
 - **Optional hosted deploy service** — sell relay deployments: customers sign in with Nostr, pay in sats (Lightning) or PRE (Presearch token on Base), and a stock relay is provisioned into their own Cloudflare account. Prices + receiving wallets are editable live from the owner's `/admin` dashboard.
@@ -103,6 +104,7 @@ More: [docs/API.md](docs/API.md).
 | [docs/SECURITY.md](docs/SECURITY.md) | Security model, threat surface, hardening |
 | [docs/FEDERATION.md](docs/FEDERATION.md) | NIP-77 sync + relay discovery/registry |
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | Pruning, metrics, monitoring, capacity |
+| [docs/FREE-TIER.md](docs/FREE-TIER.md) | Cloudflare free-tier budgets: request/CPU/D1/DO limits, write math, tuning knobs |
 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) | Common problems and fixes |
 | [docs/API.md](docs/API.md) | WebSocket + HTTP API reference with examples |
 | [docs/TESTING.md](docs/TESTING.md) | Conformance suite (browser + Node) |
@@ -118,7 +120,7 @@ The same suite runs in the browser at the relay's **`/tests`** page against the 
 
 ## Cost
 
-Small community relays typically run inside Cloudflare's free tier; the design (hibernating Durable Objects, D1 read replication, compact index metadata) keeps large relays cheap. D1's 10 GB cap is handled by design: **D1 holds compact searchable metadata, not the web.** See docs/OPERATIONS.md.
+Small community relays typically run inside Cloudflare's free tier; the design (hibernating Durable Objects, D1 read replication, compact index metadata) keeps large relays cheap. D1's size cap (5 GB free tier, hard-enforced) is handled by design: **D1 holds compact searchable metadata, not the web.** See docs/OPERATIONS.md.
 
 ## License
 
