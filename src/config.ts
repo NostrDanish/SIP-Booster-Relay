@@ -16,10 +16,12 @@ import { RelayInfo } from './types';
  * RELAY_MODE controls what this relay accepts:
  *
  *  - "sip01"   — SIP-01 optimized index relay. Only kind 39697 observations
- *                (plus kind 5 deletions and kind 9735 zap receipts when
- *                payment is enabled) are accepted for storage. Reads stay
- *                fully NIP-01 compatible. This is the recommended mode for
- *                a dedicated search-index node.
+ *                (plus kind 5 deletions, kind 9735 zap receipts when payment
+ *                is enabled, and kind 16919 crawler heartbeats so the
+ *                ecosystem's network-health view works against this relay)
+ *                are accepted for storage. Reads stay fully NIP-01
+ *                compatible. This is the recommended mode for a dedicated
+ *                search-index node.
  *  - "hybrid"  — General Nostr relay + first-class SIP-01 indexing. All
  *                kinds are accepted (subject to the allow/block lists
  *                below); kind 39697 additionally gets validated and indexed.
@@ -44,10 +46,18 @@ export const SIP01_VALIDATION = true;
  *  document-aware NIP-50 search operators. */
 export const SIP01_INDEXING = SIP01_ENABLED;
 
+/** Crawler node heartbeat kind (indexstr + Crawlstr; replaceable range). The
+ *  SIP-01 ecosystem dashboard reads these alongside kind 39697 for the
+ *  crawler-network health view, so a dedicated index relay should carry them
+ *  instead of splitting the network picture. Not validated (indexstr-owned
+ *  schema); stored as an ordinary replaceable event. */
+export const SIP01_HEARTBEAT_KIND = 16919;
+
 /** Kinds accepted for storage in "sip01" mode (kind 5 = deletions, kind
- *  9735 = zap receipts for payment verification). NIP-42 auth events
- *  (kind 22242) are never stored by any mode. */
-export const SIP01_MODE_ALLOWED_KINDS = new Set<number>([39697, 5, 9735]);
+ *  9735 = zap receipts for payment verification, kind 16919 = crawler
+ *  heartbeats). NIP-42 auth events (kind 22242) are never stored by any
+ *  mode. */
+export const SIP01_MODE_ALLOWED_KINDS = new Set<number>([39697, 5, 9735, SIP01_HEARTBEAT_KIND]);
 
 /** Per-indexer write rate limit for kind 39697 (token bucket: sustained
  *  rate per ms + burst capacity). Crawlers publish bursts of observations;
@@ -226,7 +236,7 @@ export const relayInfo: RelayInfo = {
   contact: "npub1jzha7heltdlq5tdc5uqw0a8d4e2zl9022f8phmjj9h8fhjem0v2qmtdeke",
   supported_nips: [1, 5, 9, 11, 16, 33, 42, 45, 50, 77],
   software: "https://github.com/NostrDanish/SIP-Booster-Relay",
-  version: "1.0.0",
+  version: "1.1.0",
   icon: "https://raw.githubusercontent.com/NostrDanish/SIP-Booster-Relay/main/images/icon.png",
 
   // Optional fields (uncomment as needed):
@@ -359,13 +369,16 @@ export const excludedRateLimitKinds = new Set<number>([
 ]);
 
 // ---------------------------------------------------------------------------
-// Database pruning (D1 has a 10GB limit)
+// Database pruning (D1 free tier: 5 GB, hard-enforced since 2026-09)
 // ---------------------------------------------------------------------------
 
 export const DB_PRUNING_ENABLED = true; // Set to false to disable automatic pruning
-export const DB_SIZE_THRESHOLD_GB = 9; // Start pruning when database exceeds this size (in GB)
+// D1 free tier is 5 GB total storage — and since 2026-09 the limit is HARD
+// enforced (queries fail past it). Defaults stay well under that; paid-tier
+// operators can raise these (D1 paid: 10 GB per database).
+export const DB_SIZE_THRESHOLD_GB = 4; // Start pruning when database exceeds this size (in GB)
 export const DB_PRUNE_BATCH_SIZE = 1000; // Number of events to delete per batch
-export const DB_PRUNE_TARGET_GB = 8; // Target size to prune down to (in GB)
+export const DB_PRUNE_TARGET_GB = 3.5; // Target size to prune down to (in GB)
 
 // Event kinds to preserve during pruning. In sip01/hybrid mode kind 39697
 // observations are protected by default: an addressable index record's value

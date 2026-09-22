@@ -17,8 +17,9 @@
  */
 
 /** Single-letter tags cached for generic NIP-01 `#x` tag filtering.
- *  Upstream set (p,e,a,t,d,r,L,s,u) plus SIP-01's filterable `l` and `x`. */
-export const CACHED_TAG_NAMES = ['p', 'e', 'a', 't', 'd', 'r', 'L', 's', 'u', 'l', 'x'] as const;
+ *  Upstream set (p,e,a,t,d,r,L,s,u) plus SIP-01's filterable `l`, `x` and
+ *  `v` (the UNCAGED relay profile's baseline set: #d, #u, #t, #x, #v, #l). */
+export const CACHED_TAG_NAMES = ['p', 'e', 'a', 't', 'd', 'r', 'L', 's', 'u', 'l', 'x', 'v'] as const;
 
 /** SQL for the SIP-01 tables (idempotent). */
 export const SIP01_SCHEMA_STATEMENTS: string[] = [
@@ -89,8 +90,10 @@ export const SIP01_SCHEMA_STATEMENTS: string[] = [
 /**
  * Schema version. v7: SIP-01 tag-cache rebuild (incl. `l`/`x`). v8:
  * idempotent deployment tracking (deploy job status/steps; audit P1).
+ * v9: FTS5 search index. v10: heal half-applied v9. v11: cache the `v`
+ * (schema-version) tag for baseline `#v` filters (relay profile §4).
  */
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 
 export function migrationV7Statements(): string[] {
   return [
@@ -165,6 +168,21 @@ export function migrationV9Statements(): string[] {
  */
 export function migrationV10Statements(): string[] {
   return migrationV9Statements();
+}
+
+/**
+ * v11: backfill the `v` tag into the multi-value tag cache so baseline
+ * `#v` filters (relay profile §4 — `{ "kinds": [39697], "#v": ["1"] }`)
+ * match observations stored before the tag joined CACHED_TAG_NAMES.
+ * Idempotent: INSERT OR IGNORE against the cache's PRIMARY KEY.
+ */
+export function migrationV11Statements(): string[] {
+  return [
+    `INSERT OR IGNORE INTO event_tags_cache_multi (event_id, pubkey, kind, created_at, tag_type, tag_value)
+      SELECT e.id, e.pubkey, e.kind, e.created_at, t.tag_name, t.tag_value
+      FROM events e INNER JOIN tags t ON e.id = t.event_id
+      WHERE t.tag_name = 'v'`,
+  ];
 }
 
 /** Column list for the main events table insert (kept in one place). */
