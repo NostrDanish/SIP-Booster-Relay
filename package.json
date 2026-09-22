@@ -1,6 +1,6 @@
 {
   "name": "uncaged-sip-relay",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "UNCAGED SIP Relay — serverless SIP-01 search index relay (Nostr kind 39697) on Cloudflare Workers + D1 + Durable Objects",
   "main": "src/index.ts",
   "type": "module",
