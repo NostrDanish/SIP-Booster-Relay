@@ -53,6 +53,8 @@ export const SUPPORTED_NIP50_OPERATORS = /** @type {const} */ ([
  * @property {string[]} ignored   `key:value` pairs that are not supported
  *                                (kept for transparency; ignored per NIP-50).
  * @property {boolean} distinctDomain  `distinct:domain` present.
+ * @property {boolean} distinctAuthor  `distinct:author` present (relay-profile
+ *                                COUNT extension: independent-indexer counts).
  * @property {string} raw         Original query string.
  */
 
@@ -73,7 +75,7 @@ const KNOWN_OPS = new Set([...SUPPORTED_NIP50_OPERATORS.filter((op) => op !== 'd
 export function parseSearchQuery(input) {
   const raw = String(input ?? '');
   /** @type {ParsedSearchQuery} */
-  const out = { keywords: [], phrases: [], ops: [], ignored: [], distinctDomain: false, raw };
+  const out = { keywords: [], phrases: [], ops: [], ignored: [], distinctDomain: false, distinctAuthor: false, raw };
 
   // Tokenizer: op:"quoted value" stays one token, bare "quoted phrases" stay
   // whole, everything else splits on whitespace.
@@ -108,6 +110,11 @@ export function parseSearchQuery(input) {
       if (op === 'distinct:domain' || op === 'distinct') {
         if (op === 'distinct:domain' || (op === 'distinct' && value === 'domain')) {
           if (!negated) out.distinctDomain = true;
+        } else if (op === 'distinct' && value.toLowerCase() === 'author') {
+          // Relay-profile extension (UNCAGED relay profile §3): COUNT with
+          // distinct:author returns the independent-indexer count; REQ
+          // search collapses to the best-ranked event per author.
+          if (!negated) out.distinctAuthor = true;
         } else {
           out.ignored.push(`${op}:${value}`);
         }
@@ -495,11 +502,17 @@ function sqlForOrGroup(group) {
       }
       break;
     }
-    case 'source':
-      // event-level: this observation's crawler software
-      clauses.push(`o.source IN ${inList(usable.length)}`);
-      params.push(...usable);
+    case 'source': {
+      // event-level: this observation's crawler software. Parity with the
+      // in-memory matcher: a value matches the full `source` tag OR the
+      // software name before the first `/` — source:crawlstr matches
+      // "crawlstr/1". substr equality avoids LIKE-escaping edge cases.
+      for (const v of usable) {
+        clauses.push(`(o.source = ? OR substr(o.source, 1, ?) = ?)`);
+        params.push(v, v.length + 1, `${v}/`);
+      }
       break;
+    }
     case 'indexer':
       // event-level: this observation's indexer pubkey
       clauses.push(`o.pubkey IN ${inList(usable.length)}`);
@@ -746,4 +759,63 @@ export function buildSip01SearchSql(parsed, limit, extras = {}) {
   const baseParams = [...rankParams, ...whereParams, ...eventParams, ...(extras.extraParams ?? []), limit];
 
   return { sql, params: baseParams };
+}
+
+/**
+ * NIP-45 COUNT over a SIP-01 search filter (relay-profile extension, spec
+ * §15: "Relay-specific extensions (e.g. distinct-author counting) are
+ * relay-profile features"). Mirrors {@link buildSip01SearchSql} matching
+ * exactly — same parsed query, same document/observation/event conditions —
+ * but returns a count instead of ranked events:
+ *
+ *   - default            → COUNT(*) over matching observation events
+ *   - `distinct:author`  → COUNT(DISTINCT o.pubkey) — the independent
+ *                          indexer count engines use for agreement scoring
+ *   - `distinct:domain`  → COUNT(DISTINCT doc.url_host)
+ *
+ * @param {ParsedSearchQuery} parsed
+ * @param {{ extraConditions?: string[], extraParams?: any[], fts?: boolean }} [extras]
+ * @returns {SqlFragment}
+ */
+export function buildSip01CountSql(parsed, extras = {}) {
+  const fts = extras.fts === true;
+  const ftsMatch = fts ? buildFtsMatch(parsed) : null;
+  const useFts = ftsMatch !== null;
+
+  const { docConditions, docParams, eventConditions, eventParams } = buildSip01SearchConditions(
+    parsed,
+    { keywordMode: useFts ? 'fts' : 'like' },
+  );
+
+  // Same un-aliased FTS join rule as the search path (bm25/auxiliary
+  // functions reject aliases; MATCH needs the table's real name).
+  const ftsJoin = useFts ? 'JOIN sip01_fts ON sip01_fts.rowid = doc.fts_id' : '';
+  const whereParts = [...(useFts ? ['sip01_fts MATCH ?'] : []), ...docConditions];
+  const where = whereParts.length > 0 ? `WHERE ${whereParts.join(' AND ')}` : '';
+  const whereParams = [...(useFts ? [ftsMatch] : []), ...docParams];
+
+  const countExpr = parsed.distinctAuthor
+    ? 'COUNT(DISTINCT o.pubkey)'
+    : parsed.distinctDomain
+      ? 'COUNT(DISTINCT r.url_host)'
+      : 'COUNT(*)';
+
+  const outerConditions = [...eventConditions, ...(extras.extraConditions ?? [])];
+  const outerWhere = outerConditions.length > 0 ? `WHERE ${outerConditions.join(' AND ')}` : '';
+
+  const sql = `
+    SELECT ${countExpr} AS count
+    FROM (
+      SELECT doc.d AS d, doc.url_host AS url_host
+      FROM sip01_documents doc
+      ${ftsJoin}
+      ${where}
+    ) r
+    JOIN sip01_observations o ON o.d = r.d
+    JOIN events e ON e.id = o.event_id
+    ${outerWhere}
+  `;
+
+  const params = [...whereParams, ...eventParams, ...(extras.extraParams ?? [])];
+  return { sql, params };
 }
