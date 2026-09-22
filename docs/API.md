@@ -20,9 +20,13 @@ metrics, and the dashboard; they are conveniences, not the protocol.
 ["CLOSE", "sub1"]   // → ["CLOSED", "sub1", "…"]
 ```
 
-Filterable single-letter tags on this relay: `p e a t d r L s u l x`
+Filterable single-letter tags on this relay: `p e a t d r L s u l x v`
 (SIP-01: `#d` document id, `#u` canonical URL, `#t` topics, `#l` language,
-`#x` content hash).
+`#x` content hash, `#v` schema version — e.g. `{ "kinds": [39697], "#v": ["1"] }`).
+
+The relay also stores **kind 16919 crawler heartbeats** (indexstr/Crawlstr
+network health, replaceable) in `sip01` mode, so the SIP-01 ecosystem
+dashboard's crawler-network view works against this relay.
 
 ### NIP-50 search
 
@@ -49,12 +53,13 @@ signal.
 | `country:` | ISO alpha-2 | `country:DE` |
 | `mime:` | exact MIME | `mime:application/pdf` |
 | `filetype:` | file extension (with common MIME aliases) | `filetype:pdf` |
-| `source:` | crawler software (`source` tag) | `source:crawlstr/1` |
+| `source:` | crawler software — full `source` tag **or** just the software name (`source:crawlstr` matches `crawlstr/1`) | `source:crawlstr/1` |
 | `lang:` | `l` tag (`language:` accepted as an alias) | `lang:en` |
 | `before:` / `after:` | the page's **claimed publication time** (`published` tag; unix or `YYYY-MM-DD`). Documents without one never match the positive form. Observation time uses the native `since`/`until` filter fields | `after:2026-01-01` |
 | `indexer:` *(profile)* | observed by pubkey | `indexer:<hex>` |
 | `x:` / `d:` *(profile)* | exact content hash / document id | `d:widx:…` |
 | `distinct:domain` | one best-ranked document per host | `nostr distinct:domain` |
+| `distinct:author` *(profile)* | collapse to the best-ranked event per indexer pubkey (reference-relay parity) — cheap independent-indexer view | `nostr distinct:author` |
 | `-op:` | negation | `-site:x.com` |
 
 Combining rules (aligned with the SIP-01 relay profile): repeated
@@ -82,9 +87,31 @@ are authoritative).
 // → ["COUNT", "c1", { "count": 3, "approximate": false }]
 ```
 
-Multiple filters are OR'd into one deduplicated count (an event matching
-several filters is counted once). `COUNT` with a `search` field is refused
-with `CLOSED` — count structured filters, search with NIP-50.
+Multiple plain filters are OR'd into one deduplicated count (an event
+matching several filters is counted once).
+
+**COUNT with search** (relay-profile extension, SIP-01 §15): for kind 39697
+filters the full NIP-50 operator set works inside `COUNT`, using the same
+matching as search — cheap aggregate answers for engines and dashboards:
+
+```jsonc
+["COUNT", "c2", { "kinds": [39697], "search": "bitcoin site:github.com" }]
+// → ["COUNT", "c2", { "count": 41, "approximate": false }]   (observation events)
+
+["COUNT", "c3", { "kinds": [39697], "#d": ["widx:…"], "search": "distinct:author" }]
+// → ["COUNT", "c3", { "count": 3, "approximate": false }]    (independent indexers)
+
+["COUNT", "c4", { "kinds": [39697], "search": "nostr distinct:domain" }]
+// → ["COUNT", "c4", { "count": 17, "approximate": false }]   (distinct hosts)
+```
+
+`distinct:author` counts distinct signing pubkeys — the independent-indexer
+approximation from the relay profile (Sybil keys and key rotation make
+"distinct pubkeys" and "independent indexers" different concepts; engines
+should weight indexer age/diversity/agreement, not treat the raw count as
+proof). Counts are exact; only multi-filter requests that mix filters are
+marked `approximate: true` (per-filter sums can overlap). `COUNT` with
+`search` targeting kinds other than 39697 is still refused with `CLOSED`.
 
 ### NIP-77 sync
 

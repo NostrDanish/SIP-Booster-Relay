@@ -79,6 +79,18 @@ Optional but recommended:
   add `[limits] cpu_ms = 300000` to wrangler.toml. Do NOT commit a `[limits]`
   block for free-plan deploys — the Cloudflare API rejects it (error 100328)
   and the deployment fails.
+- **Announce the relay to engines (NIP-66)**: SIP-01 engines (sip-01-core
+  relay discovery, 0xSearchstr, 0xPresearchstr) auto-discover search relays
+  from kind 30166 announcements on the big bootstrap relays, then verify the
+  relay's NIP-11 document. Publish yours:
+
+  ```bash
+  RELAY_NSEC=nsec1… node scripts/announce-relay.mjs wss://<name>.workers.dev
+  ```
+
+  Kind 30166 is addressable (re-announce to refresh; many relays prune these
+  aggressively — a daily cron is ideal). Your NIP-11 `uncaged_index` block
+  already passes the engines' verification phase.
 
 ## C. Shakespeare (cloud IDE)
 

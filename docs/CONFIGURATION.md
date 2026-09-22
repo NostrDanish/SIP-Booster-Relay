@@ -18,7 +18,7 @@ keys must never be committed.
 | `SIP01_ENABLED` | derived from mode | Master switch (off in `general` mode). |
 | `SIP01_VALIDATION` | `true` | Reject invalid kind 39697 events with `OK false invalid: …` (SIP-01 §12.4). |
 | `SIP01_INDEXING` | on when enabled | Maintain the document/observation/indexer tables and SIP-01 search. |
-| `SIP01_MODE_ALLOWED_KINDS` | `{39697, 5, 9735}` | Kinds stored in `sip01` mode. |
+| `SIP01_MODE_ALLOWED_KINDS` | `{39697, 5, 9735, 16919}` | Kinds stored in `sip01` mode (16919 = indexstr/Crawlstr crawler heartbeats, stored unvalidated as ordinary replaceable events so the ecosystem network-health view works against this relay). |
 | `SIP01_INDEXER_RATE_LIMIT` | `120/min`, burst 240 | Per-connection write bucket for kind 39697 (crawlers burst). |
 | `SIP01_MAX_EVENT_BYTES` | `65536` | Max serialized size of a kind 39697 event. |
 | `SIP01_INDEXER_POLICY` | `'open'` | `'open'` \| `'allowlist'` \| `'blocklist'` for indexer pubkeys. |
@@ -135,8 +135,8 @@ entries pass; block lists always apply.
 | Option | Default | Meaning |
 |---|---|---|
 | `DB_PRUNING_ENABLED` | `true` | Daily cron size check. |
-| `DB_SIZE_THRESHOLD_GB` | `9` | Start pruning at this D1 size. |
-| `DB_PRUNE_TARGET_GB` | `8` | Prune down to this size. |
+| `DB_SIZE_THRESHOLD_GB` | `4` | Start pruning at this D1 size (free tier: 5 GB hard cap). |
+| `DB_PRUNE_TARGET_GB` | `3.5` | Prune down to this size. |
 | `DB_PRUNE_BATCH_SIZE` | `1000` | Events per batch. |
 | `pruneProtectedKinds` | `{0, 3, 10002, 39697}` | Never pruned by age. |
 | `DEBUG_LOGS` | `false` | Verbose per-event/query logging (observability cost control). |
