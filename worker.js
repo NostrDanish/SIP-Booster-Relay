@@ -75,6 +75,7 @@ __export(config_exports, {
   SEARCH_MAX_RESULTS: () => SEARCH_MAX_RESULTS,
   SERVICE_OWNER_PUBKEY: () => SERVICE_OWNER_PUBKEY,
   SIP01_ENABLED: () => SIP01_ENABLED,
+  SIP01_HEARTBEAT_KIND: () => SIP01_HEARTBEAT_KIND,
   SIP01_INDEXER_POLICY: () => SIP01_INDEXER_POLICY,
   SIP01_INDEXER_RATE_LIMIT: () => SIP01_INDEXER_RATE_LIMIT,
   SIP01_INDEXING: () => SIP01_INDEXING,
@@ -116,7 +117,8 @@ var RELAY_MODE = "sip01";
 var SIP01_ENABLED = RELAY_MODE !== "general";
 var SIP01_VALIDATION = true;
 var SIP01_INDEXING = SIP01_ENABLED;
-var SIP01_MODE_ALLOWED_KINDS = /* @__PURE__ */ new Set([39697, 5, 9735]);
+var SIP01_HEARTBEAT_KIND = 16919;
+var SIP01_MODE_ALLOWED_KINDS = /* @__PURE__ */ new Set([39697, 5, 9735, SIP01_HEARTBEAT_KIND]);
 var SIP01_INDEXER_RATE_LIMIT = { rate: 120 / 6e4, capacity: 240 };
 var SIP01_MAX_EVENT_BYTES = 64 * 1024;
 var SIP01_INDEXER_POLICY = "open";
@@ -169,7 +171,7 @@ var relayInfo = {
   contact: "npub1jzha7heltdlq5tdc5uqw0a8d4e2zl9022f8phmjj9h8fhjem0v2qmtdeke",
   supported_nips: [1, 5, 9, 11, 16, 33, 42, 45, 50, 77],
   software: "https://github.com/NostrDanish/SIP-Booster-Relay",
-  version: "1.0.0",
+  version: "1.1.0",
   icon: "https://raw.githubusercontent.com/NostrDanish/SIP-Booster-Relay/main/images/icon.png",
   // Optional fields (uncomment as needed):
   // banner: "https://example.com/banner.jpg",
@@ -382,9 +384,9 @@ var excludedRateLimitKinds = /* @__PURE__ */ new Set([
   // ... kinds to exclude from EVENT rate limiting Ex: 1, 2, 3
 ]);
 var DB_PRUNING_ENABLED = true;
-var DB_SIZE_THRESHOLD_GB = 9;
+var DB_SIZE_THRESHOLD_GB = 4;
 var DB_PRUNE_BATCH_SIZE = 1e3;
-var DB_PRUNE_TARGET_GB = 8;
+var DB_PRUNE_TARGET_GB = 3.5;
 var SIP01_PRUNE_ALLOWED = false;
 var pruneProtectedKinds = /* @__PURE__ */ new Set([
   0,
@@ -3545,7 +3547,7 @@ var SUPPORTED_NIP50_OPERATORS = (
 var KNOWN_OPS = /* @__PURE__ */ new Set([...SUPPORTED_NIP50_OPERATORS.filter((op) => op !== "distinct:domain"), "language"]);
 function parseSearchQuery(input) {
   const raw = String(input ?? "");
-  const out = { keywords: [], phrases: [], ops: [], ignored: [], distinctDomain: false, raw };
+  const out = { keywords: [], phrases: [], ops: [], ignored: [], distinctDomain: false, distinctAuthor: false, raw };
   const tokens = [];
   const re = /(-?[a-zA-Z][a-zA-Z0-9]*(?::[a-zA-Z]+)?:"[^"]*")|"([^"]*)"|(\S+)/g;
   let m;
@@ -3574,6 +3576,9 @@ function parseSearchQuery(input) {
         if (op === "distinct:domain" || op === "distinct" && value === "domain") {
           if (!negated)
             out.distinctDomain = true;
+        } else if (op === "distinct" && value.toLowerCase() === "author") {
+          if (!negated)
+            out.distinctAuthor = true;
         } else {
           out.ignored.push(`${op}:${value}`);
         }
@@ -3895,10 +3900,13 @@ function sqlForOrGroup(group) {
       }
       break;
     }
-    case "source":
-      clauses.push(`o.source IN ${inList(usable.length)}`);
-      params.push(...usable);
+    case "source": {
+      for (const v of usable) {
+        clauses.push(`(o.source = ? OR substr(o.source, 1, ?) = ?)`);
+        params.push(v, v.length + 1, `${v}/`);
+      }
       break;
+    }
     case "indexer":
       clauses.push(`o.pubkey IN ${inList(usable.length)}`);
       params.push(...lower);
@@ -4052,9 +4060,40 @@ function buildSip01SearchSql(parsed, limit, extras = {}) {
   return { sql, params: baseParams };
 }
 __name(buildSip01SearchSql, "buildSip01SearchSql");
+function buildSip01CountSql(parsed, extras = {}) {
+  const fts = extras.fts === true;
+  const ftsMatch = fts ? buildFtsMatch(parsed) : null;
+  const useFts = ftsMatch !== null;
+  const { docConditions, docParams, eventConditions, eventParams } = buildSip01SearchConditions(
+    parsed,
+    { keywordMode: useFts ? "fts" : "like" }
+  );
+  const ftsJoin = useFts ? "JOIN sip01_fts ON sip01_fts.rowid = doc.fts_id" : "";
+  const whereParts = [...useFts ? ["sip01_fts MATCH ?"] : [], ...docConditions];
+  const where = whereParts.length > 0 ? `WHERE ${whereParts.join(" AND ")}` : "";
+  const whereParams = [...useFts ? [ftsMatch] : [], ...docParams];
+  const countExpr = parsed.distinctAuthor ? "COUNT(DISTINCT o.pubkey)" : parsed.distinctDomain ? "COUNT(DISTINCT r.url_host)" : "COUNT(*)";
+  const outerConditions = [...eventConditions, ...extras.extraConditions ?? []];
+  const outerWhere = outerConditions.length > 0 ? `WHERE ${outerConditions.join(" AND ")}` : "";
+  const sql = `
+    SELECT ${countExpr} AS count
+    FROM (
+      SELECT doc.d AS d, doc.url_host AS url_host
+      FROM sip01_documents doc
+      ${ftsJoin}
+      ${where}
+    ) r
+    JOIN sip01_observations o ON o.d = r.d
+    JOIN events e ON e.id = o.event_id
+    ${outerWhere}
+  `;
+  const params = [...whereParams, ...eventParams, ...extras.extraParams ?? []];
+  return { sql, params };
+}
+__name(buildSip01CountSql, "buildSip01CountSql");
 
 // src/sip01/schema.ts
-var CACHED_TAG_NAMES = ["p", "e", "a", "t", "d", "r", "L", "s", "u", "l", "x"];
+var CACHED_TAG_NAMES = ["p", "e", "a", "t", "d", "r", "L", "s", "u", "l", "x", "v"];
 var SIP01_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS sip01_documents (
     d TEXT PRIMARY KEY,
@@ -4116,7 +4155,7 @@ var SIP01_SCHEMA_STATEMENTS = [
     value INTEGER NOT NULL DEFAULT 0
   )`
 ];
-var SCHEMA_VERSION = 10;
+var SCHEMA_VERSION = 11;
 function migrationV7Statements() {
   return [
     // Rebuild event_tags_cache_multi without the restrictive CHECK list.
@@ -4178,6 +4217,15 @@ function migrationV10Statements() {
   return migrationV9Statements();
 }
 __name(migrationV10Statements, "migrationV10Statements");
+function migrationV11Statements() {
+  return [
+    `INSERT OR IGNORE INTO event_tags_cache_multi (event_id, pubkey, kind, created_at, tag_type, tag_value)
+      SELECT e.id, e.pubkey, e.kind, e.created_at, t.tag_name, t.tag_value
+      FROM events e INNER JOIN tags t ON e.id = t.event_id
+      WHERE t.tag_name = 'v'`
+  ];
+}
+__name(migrationV11Statements, "migrationV11Statements");
 var SERVICE_SCHEMA_STATEMENTS = [
   `CREATE TABLE IF NOT EXISTS service_settings (
     key TEXT PRIMARY KEY,
@@ -4216,14 +4264,43 @@ var SERVICE_SCHEMA_STATEMENTS = [
 ];
 
 // src/sip01/ingest.ts
+var metricBuffer = /* @__PURE__ */ new Map();
+var metricLastFlush = 0;
+var metricFlushInFlight = null;
+var METRIC_FLUSH_KEYS = 32;
+var METRIC_FLUSH_MS = 15e3;
+async function flushMetrics(session) {
+  if (metricBuffer.size === 0 || metricFlushInFlight)
+    return metricFlushInFlight ?? Promise.resolve();
+  const pending = [...metricBuffer.entries()];
+  metricBuffer.clear();
+  metricLastFlush = Date.now();
+  metricFlushInFlight = (async () => {
+    try {
+      await session.batch(
+        pending.map(
+          ([key, delta]) => session.prepare(
+            `INSERT INTO relay_metrics (key, value) VALUES (?, ?)
+               ON CONFLICT(key) DO UPDATE SET value = value + excluded.value`
+          ).bind(key, delta)
+        )
+      );
+    } catch (error) {
+      for (const [key, delta] of pending) {
+        metricBuffer.set(key, (metricBuffer.get(key) ?? 0) + delta);
+      }
+      console.error("metric flush failed:", error);
+    } finally {
+      metricFlushInFlight = null;
+    }
+  })();
+  return metricFlushInFlight;
+}
+__name(flushMetrics, "flushMetrics");
 async function bumpMetric(session, key, delta = 1) {
-  try {
-    await session.prepare(
-      `INSERT INTO relay_metrics (key, value) VALUES (?, ?)
-         ON CONFLICT(key) DO UPDATE SET value = value + excluded.value`
-    ).bind(key, delta).run();
-  } catch (error) {
-    console.error(`metric bump failed for ${key}:`, error);
+  metricBuffer.set(key, (metricBuffer.get(key) ?? 0) + delta);
+  if (metricBuffer.size >= METRIC_FLUSH_KEYS || Date.now() - metricLastFlush >= METRIC_FLUSH_MS) {
+    await flushMetrics(session);
   }
 }
 __name(bumpMetric, "bumpMetric");
@@ -4697,15 +4774,24 @@ async function executeSearch(session, filter) {
       extraParams: extras.params,
       fts: useFts
     });
+    const distinctAuthor = parsed.distinctAuthor;
     try {
       const result = await session.prepare(sql).bind(...params).all();
+      const seenAuthors = /* @__PURE__ */ new Set();
       for (const row of result.results ?? []) {
-        if (seen.has(row.id))
+        const id = row.id;
+        const pubkey = row.pubkey;
+        if (seen.has(id))
           continue;
-        seen.add(row.id);
+        if (distinctAuthor) {
+          if (seenAuthors.has(pubkey))
+            continue;
+          seenAuthors.add(pubkey);
+        }
+        seen.add(id);
         events.push({
-          id: row.id,
-          pubkey: row.pubkey,
+          id,
+          pubkey,
           created_at: row.created_at,
           kind: row.kind,
           tags: JSON.parse(row.tags),
@@ -4724,13 +4810,21 @@ async function executeSearch(session, filter) {
         });
         try {
           const result = await session.prepare(fallback.sql).bind(...fallback.params).all();
+          const fallbackSeenAuthors = /* @__PURE__ */ new Set();
           for (const row of result.results ?? []) {
-            if (seen.has(row.id))
+            const id = row.id;
+            const pubkey = row.pubkey;
+            if (seen.has(id))
               continue;
-            seen.add(row.id);
+            if (distinctAuthor) {
+              if (fallbackSeenAuthors.has(pubkey))
+                continue;
+              fallbackSeenAuthors.add(pubkey);
+            }
+            seen.add(id);
             events.push({
-              id: row.id,
-              pubkey: row.pubkey,
+              id,
+              pubkey,
               created_at: row.created_at,
               kind: row.kind,
               tags: JSON.parse(row.tags),
@@ -4785,13 +4879,22 @@ async function executeSearch(session, filter) {
     params.push(limit);
     try {
       const result = await session.prepare(sql).bind(...params).all();
+      const distinctAuthor = parsed.distinctAuthor;
+      const seenAuthors = /* @__PURE__ */ new Set();
       for (const row of result.results ?? []) {
-        if (seen.has(row.id))
+        const id = row.id;
+        const pubkey = row.pubkey;
+        if (seen.has(id))
           continue;
-        seen.add(row.id);
+        if (distinctAuthor) {
+          if (seenAuthors.has(pubkey))
+            continue;
+          seenAuthors.add(pubkey);
+        }
+        seen.add(id);
         events.push({
-          id: row.id,
-          pubkey: row.pubkey,
+          id,
+          pubkey,
           created_at: row.created_at,
           kind: row.kind,
           tags: JSON.parse(row.tags),
@@ -4806,6 +4909,41 @@ async function executeSearch(session, filter) {
   return events.slice(0, limit);
 }
 __name(executeSearch, "executeSearch");
+async function executeSearchCount(session, filter) {
+  const parsed = parseSearchQuery(String(filter.search ?? "").slice(0, 500));
+  const hasTextTerms = parsed.keywords.length > 0 || parsed.phrases.length > 0;
+  const useFts = hasTextTerms && await ftsAvailable(session);
+  const extras = eventFilterExtras(filter);
+  const { sql, params } = buildSip01CountSql(parsed, {
+    extraConditions: extras.conditions,
+    extraParams: extras.params,
+    fts: useFts
+  });
+  try {
+    const result = await session.prepare(sql).bind(...params).first();
+    return result?.count || 0;
+  } catch (error) {
+    if (useFts) {
+      console.error("sip01 FTS count failed, falling back to LIKE:", error);
+      ftsProbe = Promise.resolve(false);
+      const fallback = buildSip01CountSql(parsed, {
+        extraConditions: extras.conditions,
+        extraParams: extras.params,
+        fts: false
+      });
+      try {
+        const result = await session.prepare(fallback.sql).bind(...fallback.params).first();
+        return result?.count || 0;
+      } catch (fallbackError) {
+        console.error("sip01 LIKE fallback count failed:", fallbackError);
+        return 0;
+      }
+    }
+    console.error("sip01 count query failed:", error, sql);
+    return 0;
+  }
+}
+__name(executeSearchCount, "executeSearchCount");
 
 // shared/bech32.js
 var CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
@@ -6010,7 +6148,8 @@ async function initializeDatabase(db) {
         ...currentVersion < 7 ? migrationV7Statements() : [],
         ...currentVersion < 8 ? migrationV8Statements() : [],
         ...currentVersion < 9 ? migrationV9Statements() : [],
-        ...currentVersion < 10 ? migrationV10Statements() : []
+        ...currentVersion < 10 ? migrationV10Statements() : [],
+        ...currentVersion < 11 ? migrationV11Statements() : []
       ];
       for (const statement of migrationStatements) {
         try {
@@ -9327,23 +9466,47 @@ var _RelayWebSocket = class _RelayWebSocket {
       this.sendClosed(session.webSocket, queryId, "error: COUNT requires 1-10 filters");
       return;
     }
+    const searchFilters = [];
+    const plainFilters = [];
     for (const filter of filters) {
       if (typeof filter !== "object" || filter === null) {
         this.sendClosed(session.webSocket, queryId, "invalid: filter must be an object");
-        return;
-      }
-      if (filter.search !== void 0) {
-        this.sendClosed(session.webSocket, queryId, "blocked: COUNT with search is not supported by this relay");
         return;
       }
       if (calculateQueryComplexity(filter) > 500) {
         this.sendClosed(session.webSocket, queryId, "blocked: filter too complex to count");
         return;
       }
+      const hasSearch = typeof filter.search === "string" && filter.search.trim() !== "";
+      if (hasSearch) {
+        const kinds = Array.isArray(filter.kinds) ? filter.kinds : void 0;
+        const sipOnly = SIP01_INDEXING && (kinds === void 0 ? RELAY_MODE === "sip01" : kinds.every((k) => k === SIP01_KIND));
+        if (!sipOnly) {
+          this.sendClosed(session.webSocket, queryId, "blocked: COUNT with search is only supported for kind 39697 filters on this relay");
+          return;
+        }
+        searchFilters.push(filter);
+      } else {
+        plainFilters.push(filter);
+      }
     }
     try {
-      const count = await countEvents(filters, session.bookmark, this.env);
-      this.sendCount(session.webSocket, queryId, count);
+      let count;
+      let approximate = false;
+      if (searchFilters.length === 0) {
+        count = await countEvents(plainFilters, session.bookmark, this.env);
+      } else {
+        approximate = filters.length > 1;
+        count = 0;
+        const d1 = this.env.RELAY_DATABASE.withSession(session.bookmark);
+        for (const filter of searchFilters) {
+          count += await executeSearchCount(d1, filter);
+        }
+        if (plainFilters.length > 0) {
+          count += await countEvents(plainFilters, session.bookmark, this.env);
+        }
+      }
+      this.sendCount(session.webSocket, queryId, count, approximate);
       bumpMetric(this.env.RELAY_DATABASE.withSession("first-primary"), "count_queries").catch(() => void 0);
     } catch (error) {
       console.error("COUNT failed:", error);
@@ -9748,9 +9911,9 @@ var _RelayWebSocket = class _RelayWebSocket {
       console.error("Error sending EVENT:", error);
     }
   }
-  sendCount(ws, queryId, count) {
+  sendCount(ws, queryId, count, approximate = false) {
     try {
-      const countMessage = ["COUNT", queryId, { count, approximate: false }];
+      const countMessage = ["COUNT", queryId, { count, approximate }];
       ws.send(JSON.stringify(countMessage));
     } catch (error) {
       console.error("Error sending COUNT:", error);
