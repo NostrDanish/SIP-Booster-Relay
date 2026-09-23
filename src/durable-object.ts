@@ -30,6 +30,8 @@ import {
   NEG_OPEN_PER_IP_PER_MIN,
   NEG_MAX_CONCURRENT_SESSIONS,
   SIP01_ENABLED,
+  SIP01_INDEXING,
+  RELAY_MODE,
   isPubkeyAllowed,
   isEventKindAllowed,
   containsBlockedContent,
@@ -42,6 +44,7 @@ import { Negentropy, NegentropyStorageVector, hexToBytes as negHexToBytes, bytes
 import { SIP01_KIND, extractSip01Fields } from '../shared/sip01.js';
 import { parseSearchQuery, matchSip01Search } from '../shared/search-query.js';
 import { bumpMetric } from './sip01/ingest';
+import { executeSearchCount } from './sip01/search';
 import { dbg } from './log';
 import { runtimePaymentMode, runtimeAuthRequired } from './runtime-config';
 
@@ -1134,24 +1137,58 @@ export class RelayWebSocket implements DurableObject {
       return;
     }
 
+    const searchFilters: NostrFilter[] = [];
+    const plainFilters: NostrFilter[] = [];
+
     for (const filter of filters) {
       if (typeof filter !== 'object' || filter === null) {
         this.sendClosed(session.webSocket, queryId, 'invalid: filter must be an object');
-        return;
-      }
-      if (filter.search !== undefined) {
-        this.sendClosed(session.webSocket, queryId, 'blocked: COUNT with search is not supported by this relay');
         return;
       }
       if (calculateQueryComplexity(filter) > 500) {
         this.sendClosed(session.webSocket, queryId, 'blocked: filter too complex to count');
         return;
       }
+      const hasSearch = typeof filter.search === 'string' && filter.search.trim() !== '';
+      if (hasSearch) {
+        // COUNT with search is a SIP-01 relay-profile feature (spec §15):
+        // supported for kind 39697 filters only. `kinds` omitted is fine in
+        // sip01 mode (39697 is the only stored kind); elsewhere an omitted
+        // kinds would silently undercount, so require an explicit 39697.
+        const kinds = Array.isArray(filter.kinds) ? filter.kinds : undefined;
+        const sipOnly = SIP01_INDEXING && (kinds === undefined
+          ? RELAY_MODE === 'sip01'
+          : kinds.every((k: number) => k === SIP01_KIND));
+        if (!sipOnly) {
+          this.sendClosed(session.webSocket, queryId, 'blocked: COUNT with search is only supported for kind 39697 filters on this relay');
+          return;
+        }
+        searchFilters.push(filter);
+      } else {
+        plainFilters.push(filter);
+      }
     }
 
     try {
-      const count = await countEvents(filters, session.bookmark, this.env);
-      this.sendCount(session.webSocket, queryId, count);
+      let count: number;
+      // Multiple filters are OR'd; per-filter sums can double-count overlaps,
+      // so mixed/multi-filter results are marked approximate (NIP-45). The
+      // all-plain path stays exact via its UNION dedupe.
+      let approximate = false;
+      if (searchFilters.length === 0) {
+        count = await countEvents(plainFilters, session.bookmark, this.env);
+      } else {
+        approximate = filters.length > 1;
+        count = 0;
+        const d1 = this.env.RELAY_DATABASE.withSession(session.bookmark);
+        for (const filter of searchFilters) {
+          count += await executeSearchCount(d1, filter);
+        }
+        if (plainFilters.length > 0) {
+          count += await countEvents(plainFilters, session.bookmark, this.env);
+        }
+      }
+      this.sendCount(session.webSocket, queryId, count, approximate);
       bumpMetric(this.env.RELAY_DATABASE.withSession('first-primary'), 'count_queries').catch(() => undefined);
     } catch (error) {
       console.error('COUNT failed:', error);
@@ -1640,9 +1677,9 @@ export class RelayWebSocket implements DurableObject {
     }
   }
 
-  private sendCount(ws: WebSocket, queryId: string, count: number): void {
+  private sendCount(ws: WebSocket, queryId: string, count: number, approximate = false): void {
     try {
-      const countMessage = ['COUNT', queryId, { count, approximate: false }];
+      const countMessage = ['COUNT', queryId, { count, approximate }];
       ws.send(JSON.stringify(countMessage));
     } catch (error) {
       console.error('Error sending COUNT:', error);

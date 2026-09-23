@@ -46,8 +46,12 @@ replacement. These three cases are distinct on purpose (SIP-01 §2).
 ## Querying
 
 Baseline NIP-01 filters work everywhere: `kinds: [39697]`, `#d`, `#u`, `#t`,
-`#l`, `#x`, `authors`, `since`/`until`, `limit`. Single-letter tags are
-indexed in the multi-value tag cache.
+`#l`, `#x`, `#v`, `authors`, `since`/`until`, `limit`. Single-letter tags are
+indexed in the multi-value tag cache (the relay profile's full baseline set).
+
+In `sip01` mode the relay also accepts **kind 16919 crawler heartbeats**
+(indexstr/Crawlstr) as ordinary replaceable events, so the ecosystem
+dashboard's crawler-network health view can read them from this relay.
 
 NIP-50 acceleration with the SIP-01 operator set (§15) plus relay-profile
 operators `indexer:`, `x:`, `d:` — see docs/API.md for the full reference
@@ -57,7 +61,11 @@ publication time (`published` tag; observation time stays on `since`/
 `until`), `language:` aliases to `lang:`, and unusable operator values add
 no clause.
 
-NIP-45 `COUNT` for cheap counts (e.g. observations per `#d`).
+NIP-45 `COUNT` for cheap counts (e.g. observations per `#d`), plus the
+relay-profile **COUNT-with-search** extension for kind 39697 filters: the
+full operator set works inside `COUNT`, and `distinct:author` returns the
+independent-indexer count directly (spec §15's relay-profile counting
+extension) while `distinct:domain` counts distinct hosts. See docs/API.md.
 
 ## NIP-11 advertisement (§15)
 

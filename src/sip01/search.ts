@@ -21,6 +21,7 @@
 import {
   parseSearchQuery,
   buildSip01SearchSql,
+  buildSip01CountSql,
   escapeLike,
 } from '../../shared/search-query.js';
 import { SIP01_KIND } from '../../shared/sip01.js';
@@ -130,14 +131,25 @@ export async function executeSearch(session: Session, filter: NostrFilter): Prom
       extraParams: extras.params,
       fts: useFts,
     });
+    // distinct:author (relay-profile extension, reference relay parity):
+    // collapse the result set to the best-ranked event per indexer pubkey.
+    // Rows arrive rank-ordered, so first-seen-per-pubkey keeps the best.
+    const distinctAuthor = parsed.distinctAuthor;
     try {
       const result = await session.prepare(sql).bind(...params).all();
+      const seenAuthors = new Set<string>();
       for (const row of result.results ?? []) {
-        if (seen.has(row.id as string)) continue;
-        seen.add(row.id as string);
+        const id = row.id as string;
+        const pubkey = row.pubkey as string;
+        if (seen.has(id)) continue;
+        if (distinctAuthor) {
+          if (seenAuthors.has(pubkey)) continue;
+          seenAuthors.add(pubkey);
+        }
+        seen.add(id);
         events.push({
-          id: row.id as string,
-          pubkey: row.pubkey as string,
+          id,
+          pubkey,
           created_at: row.created_at as number,
           kind: row.kind as number,
           tags: JSON.parse(row.tags as string),
@@ -158,12 +170,19 @@ export async function executeSearch(session: Session, filter: NostrFilter): Prom
         });
         try {
           const result = await session.prepare(fallback.sql).bind(...fallback.params).all();
+          const fallbackSeenAuthors = new Set<string>();
           for (const row of result.results ?? []) {
-            if (seen.has(row.id as string)) continue;
-            seen.add(row.id as string);
+            const id = row.id as string;
+            const pubkey = row.pubkey as string;
+            if (seen.has(id)) continue;
+            if (distinctAuthor) {
+              if (fallbackSeenAuthors.has(pubkey)) continue;
+              fallbackSeenAuthors.add(pubkey);
+            }
+            seen.add(id);
             events.push({
-              id: row.id as string,
-              pubkey: row.pubkey as string,
+              id,
+              pubkey,
               created_at: row.created_at as number,
               kind: row.kind as number,
               tags: JSON.parse(row.tags as string),
@@ -223,12 +242,23 @@ export async function executeSearch(session: Session, filter: NostrFilter): Prom
 
     try {
       const result = await session.prepare(sql).bind(...params).all();
+      // distinct:author (relay-profile extension, reference relay parity):
+      // collapse the result set to the best-ranked event per indexer pubkey.
+      // Rows arrive rank-ordered, so first-seen-per-pubkey keeps the best.
+      const distinctAuthor = parsed.distinctAuthor;
+      const seenAuthors = new Set<string>();
       for (const row of result.results ?? []) {
-        if (seen.has(row.id as string)) continue;
-        seen.add(row.id as string);
+        const id = row.id as string;
+        const pubkey = row.pubkey as string;
+        if (seen.has(id)) continue;
+        if (distinctAuthor) {
+          if (seenAuthors.has(pubkey)) continue;
+          seenAuthors.add(pubkey);
+        }
+        seen.add(id);
         events.push({
-          id: row.id as string,
-          pubkey: row.pubkey as string,
+          id,
+          pubkey,
           created_at: row.created_at as number,
           kind: row.kind as number,
           tags: JSON.parse(row.tags as string),
@@ -242,4 +272,52 @@ export async function executeSearch(session: Session, filter: NostrFilter): Prom
   }
 
   return events.slice(0, limit);
+}
+
+/**
+ * NIP-45 COUNT over a SIP-01 search filter (relay-profile extension).
+ * Supports the full operator set plus `distinct:author` (independent
+ * indexer count) and `distinct:domain`. Exact counts — never approximate.
+ *
+ * Only kind 39697 filters are supported: COUNT with search targeting other
+ * kinds is refused by the caller (honest `blocked:` beats a wrong number).
+ */
+export async function executeSearchCount(session: Session, filter: NostrFilter): Promise<number> {
+  const parsed = parseSearchQuery(String(filter.search ?? '').slice(0, 500));
+
+  const hasTextTerms = parsed.keywords.length > 0 || parsed.phrases.length > 0;
+  const useFts = hasTextTerms && (await ftsAvailable(session));
+
+  const extras = eventFilterExtras(filter);
+  const { sql, params } = buildSip01CountSql(parsed, {
+    extraConditions: extras.conditions,
+    extraParams: extras.params,
+    fts: useFts,
+  });
+
+  try {
+    const result = await session.prepare(sql).bind(...params).first() as { count: number } | null;
+    return (result?.count as number) || 0;
+  } catch (error) {
+    if (useFts) {
+      // Same resilience rule as executeSearch: an FTS failure must not lose
+      // the query — fall back to LIKE once, then remember for this isolate.
+      console.error('sip01 FTS count failed, falling back to LIKE:', error);
+      ftsProbe = Promise.resolve(false);
+      const fallback = buildSip01CountSql(parsed, {
+        extraConditions: extras.conditions,
+        extraParams: extras.params,
+        fts: false,
+      });
+      try {
+        const result = await session.prepare(fallback.sql).bind(...fallback.params).first() as { count: number } | null;
+        return (result?.count as number) || 0;
+      } catch (fallbackError) {
+        console.error('sip01 LIKE fallback count failed:', fallbackError);
+        return 0;
+      }
+    }
+    console.error('sip01 count query failed:', error, sql);
+    return 0;
+  }
 }

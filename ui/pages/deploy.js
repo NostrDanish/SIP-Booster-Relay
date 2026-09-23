@@ -154,7 +154,7 @@ npm run build   # → worker.js (self-contained)</pre>
             <label class="inline"><input type="checkbox" id="cfg-nip45" checked> NIP-45 counts</label>
             <label class="inline"><input type="checkbox" id="cfg-nip77" checked> NIP-77 federation</label>
             <label class="inline"><input type="checkbox" id="cfg-auth"> Require NIP-42 auth</label>
-            <label class="inline"><input type="checkbox" id="cfg-pruning" checked> Auto-pruning at 9 GB</label>
+            <label class="inline"><input type="checkbox" id="cfg-pruning" checked> Auto-pruning at 4 GB (free tier)</label>
           </div>
           <button class="btn mt" id="generate">Generate configuration</button>
         </div>
@@ -182,16 +182,20 @@ npm run build   # → worker.js (self-contained)</pre>
             <code>wss://&lt;your-relay&gt;</code>. Observations appear on your dashboard immediately.</p>
           <h3 class="mt">Search engines</h3>
           <p class="small muted">Engines discover your relay from its NIP-11 <code>uncaged_index</code>
-            block and can federate with it over NIP-77. See docs → FEDERATION.</p>
+            block and its <strong>NIP-66 kind 30166 announcement</strong>, and can federate with it
+            over NIP-77. See docs → FEDERATION.</p>
         </div>
         <div>
-          <h3>Announce it on Nostr (optional)</h3>
-          <p class="small muted">Publish a plain note announcing your relay (uses your browser's Nostr
-            signer — nothing is signed without your approval):</p>
-          <button class="btn small ghost" id="announce">Announce with Nostr</button>
+          <h3>Announce it to engines (NIP-66)</h3>
+          <p class="small muted">Publish a signed <strong>kind 30166 relay announcement</strong> to the
+            engine bootstrap relays so SIP-01 search engines auto-discover this relay (uses your
+            browser's Nostr signer — nothing is signed without your approval):</p>
+          <button class="btn small ghost" id="announce">Announce relay (NIP-66)</button>
           <span class="small faint" id="announce-status" style="margin-left:.6rem"></span>
-          <p class="small faint mt">Registry convention: PRs to the SIP-01 repo's relay list are welcome;
-            always verify a relay's NIP-11 document before trusting its index.</p>
+          <p class="small faint mt">Headless alternative: <code>RELAY_NSEC=nsec1… node
+            scripts/announce-relay.mjs wss://&lt;your-relay&gt;</code>. Re-announce periodically —
+            many relays prune kind 30166. Registry convention: PRs to the SIP-01 repo's relay list
+            are welcome; always verify a relay's NIP-11 document before trusting its index.</p>
         </div>
       </div>
     </section>
@@ -653,28 +657,80 @@ function bindVerify(root) {
 
 /* ---------------- announcement ---------------- */
 
+/**
+ * Sign the NIP-66 kind 30166 relay announcement in the browser (NIP-07) and
+ * publish it to the engine bootstrap relays. Engines (sip-01-core relay
+ * discovery, 0xSearchstr, 0xPresearchstr) find relays via #N:['50'] on kind
+ * 30166, then verify the relay's NIP-11 document — so we announce with the
+ * operator's NIP-07 key (never the relay server, which holds no keys) using
+ * the relay's own NIP-11 document as the source of truth.
+ */
+async function announceRelayNip66(relayUrl, statusEl) {
+  if (!window.nostr || !window.nostr.signEvent) {
+    statusEl.textContent = 'no Nostr signer found (install a NIP-07 extension)';
+    return;
+  }
+  // Truthful by construction: N tags come from the relay's own NIP-11 doc.
+  statusEl.textContent = 'reading relay NIP-11…';
+  const httpUrl = relayUrl.replace(/^ws/, 'http');
+  let nip11;
+  try {
+    const res = await fetch(`${httpUrl}/`, { headers: { Accept: 'application/nostr+json' } });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    nip11 = await res.json();
+  } catch (error) {
+    statusEl.textContent = `could not fetch NIP-11: ${error.message}`;
+    return;
+  }
+  const nips = Array.isArray(nip11.supported_nips) ? nip11.supported_nips : [];
+  const unsigned = {
+    kind: 30166,
+    created_at: Math.floor(Date.now() / 1000),
+    content: JSON.stringify(nip11),
+    tags: [
+      ['d', `${relayUrl}/`],
+      ...nips.map((n) => ['N', String(n)]),
+      ...(nip11.uncaged_index?.sip01 ? [['T', 'sip01-index']] : []),
+      ['alt', `Relay announcement: ${nip11.name ?? relayUrl}`],
+    ],
+  };
+  let signed;
+  try {
+    signed = await window.nostr.signEvent(unsigned);
+  } catch {
+    statusEl.textContent = 'signing declined';
+    return;
+  }
+  const targets = ['wss://relay.nostr.band/', 'wss://relay.primal.net/', 'wss://relay.damus.io/'];
+  const results = await Promise.all(targets.map((target) => new Promise((resolve) => {
+    let settled = false;
+    const done = (ok, detail) => { if (!settled) { settled = true; try { ws.close(); } catch { /* noop */ } resolve({ target, ok, detail }); } };
+    let ws;
+    try { ws = new WebSocket(target); } catch (error) { return done(false, error.message); }
+    const timer = setTimeout(() => done(false, 'timeout'), 10000);
+    ws.onopen = () => ws.send(JSON.stringify(['EVENT', signed]));
+    ws.onmessage = (m) => {
+      try {
+        const data = JSON.parse(String(m.data));
+        if (data[0] === 'OK' && data[1] === signed.id) { clearTimeout(timer); done(data[2] === true, String(data[3] ?? '')); }
+      } catch { /* ignore */ }
+    };
+    ws.onerror = () => { clearTimeout(timer); done(false, 'socket error'); };
+    ws.onclose = () => { clearTimeout(timer); done(false, 'closed'); };
+  })));
+  const okCount = results.filter((r) => r.ok).length;
+  statusEl.textContent = okCount > 0
+    ? `announced (kind 30166) to ${okCount}/${targets.length} bootstrap relays — engines pick it up within 24h. Re-announce periodically (many relays prune 30166).`
+    : `announcement failed (${results.map((r) => `${new URL(r.target).host}: ${r.detail}`).join('; ')}) — or run scripts/announce-relay.mjs from a terminal.`;
+  console.log('[deploy] kind 30166 announcement:', signed, results);
+}
+
 function bindAnnounce(root) {
   const btn = root.querySelector('#announce');
   const status = root.querySelector('#announce-status');
   btn.addEventListener('click', async () => {
-    if (!window.nostr || !window.nostr.signEvent) {
-      status.textContent = 'no Nostr signer found (install a NIP-07 extension)';
-      return;
-    }
     const verifiedUrl = /** @type {HTMLInputElement} */ (root.querySelector('#verify-url')).value.trim();
     const relayUrl = (verifiedUrl || getRelayHttpBase()).replace(/^http/, 'ws').replace(/\/+$/, '');
-    const note = {
-      kind: 1,
-      created_at: Math.floor(Date.now() / 1000),
-      tags: [['t', 'sip01'], ['t', 'nostr'], ['r', relayUrl]],
-      content: `I just deployed a SIP-01 decentralized search index relay: ${relayUrl}\n\nOne shared index. Many independent indexers. No single owner.\n\nSpec: https://github.com/NostrDanish/SIP-01`,
-    };
-    try {
-      const signed = await window.nostr.signEvent(note);
-      status.textContent = `signed — event ${signed.id.slice(0, 12)}… publish it to your usual relays from any client`;
-      console.log('[deploy] announcement event:', signed);
-    } catch (error) {
-      status.textContent = 'signing declined';
-    }
+    await announceRelayNip66(relayUrl, status);
   });
 }

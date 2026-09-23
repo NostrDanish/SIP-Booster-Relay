@@ -20,18 +20,57 @@ import type { NostrEvent } from '../types';
 
 type Session = D1DatabaseSession;
 
-/** Increment a relay metric counter (best-effort, never throws). */
+/**
+ * Relay metrics are observational counters — on the free D1 tier every row
+ * written counts against the 100k rows/day budget, and hot paths bump a
+ * metric on nearly every event. bumpMetric therefore coalesces deltas in
+ * memory (per isolate) and flushes when the buffer holds ≥32 keys or ≥15s
+ * have elapsed since the last flush. A burst of N events for the same key
+ * costs one row write instead of N; an isolate dying mid-window loses at
+ * most a few seconds of counts, which is fine for counters.
+ */
+const metricBuffer = new Map<string, number>();
+let metricLastFlush = 0;
+let metricFlushInFlight: Promise<void> | null = null;
+
+const METRIC_FLUSH_KEYS = 32;
+const METRIC_FLUSH_MS = 15000;
+
+async function flushMetrics(session: Session): Promise<void> {
+  if (metricBuffer.size === 0 || metricFlushInFlight) return metricFlushInFlight ?? Promise.resolve();
+  const pending = [...metricBuffer.entries()];
+  metricBuffer.clear();
+  metricLastFlush = Date.now();
+  metricFlushInFlight = (async () => {
+    try {
+      await session.batch(
+        pending.map(([key, delta]) =>
+          session
+            .prepare(
+              `INSERT INTO relay_metrics (key, value) VALUES (?, ?)
+               ON CONFLICT(key) DO UPDATE SET value = value + excluded.value`,
+            )
+            .bind(key, delta),
+        ),
+      );
+    } catch (error) {
+      // Re-queue on failure so counts are not lost to transient errors.
+      for (const [key, delta] of pending) {
+        metricBuffer.set(key, (metricBuffer.get(key) ?? 0) + delta);
+      }
+      console.error('metric flush failed:', error);
+    } finally {
+      metricFlushInFlight = null;
+    }
+  })();
+  return metricFlushInFlight;
+}
+
+/** Increment a relay metric counter (coalesced, best-effort, never throws). */
 export async function bumpMetric(session: Session, key: string, delta = 1): Promise<void> {
-  try {
-    await session
-      .prepare(
-        `INSERT INTO relay_metrics (key, value) VALUES (?, ?)
-         ON CONFLICT(key) DO UPDATE SET value = value + excluded.value`,
-      )
-      .bind(key, delta)
-      .run();
-  } catch (error) {
-    console.error(`metric bump failed for ${key}:`, error);
+  metricBuffer.set(key, (metricBuffer.get(key) ?? 0) + delta);
+  if (metricBuffer.size >= METRIC_FLUSH_KEYS || Date.now() - metricLastFlush >= METRIC_FLUSH_MS) {
+    await flushMetrics(session);
   }
 }
 

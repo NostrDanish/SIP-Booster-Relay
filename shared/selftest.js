@@ -45,6 +45,7 @@ import {
   matchSip01Search,
   parseDateValue,
   buildSip01SearchSql,
+  buildSip01CountSql,
   buildFtsMatch,
 } from './search-query.js';
 import {
@@ -345,13 +346,15 @@ export async function runAllTests(log = () => {}) {
     const p = parseSearchQuery('bitcoin site:github.com');
     const { sql, params } = buildSip01SearchSql(p, 10, { fts: true });
     assert(sql.includes('sip01_fts'), 'joins FTS table');
-    assert(sql.includes('f MATCH ?'), 'MATCH clause present');
     assert(sql.includes('bm25(sip01_fts,'), 'bm25 uses the un-aliased FTS table name (auxiliary functions reject aliases)');
     assert(sql.includes('sip01_fts MATCH ?'), 'MATCH on the un-aliased FTS table');
     assert(!sql.includes('sip01_fts f '), 'no FTS table alias');
     assert(sql.includes('bm25('), 'bm25 ranking');
     assert(sql.includes('ORDER BY r.bm25rank ASC'), 'bm25 ascending order');
-    assert(!sql.includes('LIKE'), 'no LIKE for text terms in FTS mode');
+    // Text terms must not filter via LIKE in FTS mode (the rank expression in
+    // the SELECT list legitimately keeps title/description LIKE scoring, and
+    // operator clauses like site: keep their own LIKE — check the WHERE tail).
+    assert(!sql.slice(sql.indexOf('WHERE')).includes('lower('), 'no LIKE for text terms in the FTS-mode WHERE clause');
     // params: rank parts first, then MATCH, then operator params, then limit
     eq(params[params.length - 1], 10, 'limit last');
     assert(params.includes('bitcoin*'), 'match param present');
@@ -372,6 +375,57 @@ export async function runAllTests(log = () => {}) {
     eq(params[params.length - 1], 25, 'limit param last');
     assert(params.includes('github.com'), 'site param bound');
     assert(params.includes('en'), 'lang param bound');
+  });
+
+  await test('nip50: source: matches full tag OR software prefix (SQL/live parity)', async () => {
+    // Live matcher semantics (extractSip01Fields parses software from source).
+    const fields = extractSip01Fields(EXAMPLE_EVENT_SELF_CONSISTENT); // source: crawlstr/1
+    eq(fields.software, 'crawlstr', 'software parsed from source');
+    const bySoftware = parseSearchQuery('source:crawlstr');
+    const byFull = parseSearchQuery('source:crawlstr/1');
+    assert(matchSip01Search(bySoftware, fields), 'matcher: software name matches');
+    assert(matchSip01Search(byFull, fields), 'matcher: full source matches');
+    assert(!matchSip01Search(parseSearchQuery('-source:crawlstr'), fields), 'matcher: negated excludes');
+    // The SQL path must express the same semantics (live delivery parity):
+    // exact match OR the value as the prefix before the first "/".
+    const { sql, params } = buildSip01SearchSql(bySoftware, 10);
+    assert(sql.includes('o.source = ?'), 'SQL matches the full source tag');
+    assert(sql.includes('substr(o.source, 1, ?) = ?'), 'SQL matches the software prefix');
+    assert(params.includes('crawlstr') && params.includes('crawlstr/'), 'params carry both forms');
+    const neg = buildSip01SearchSql(parseSearchQuery('-source:crawlstr'), 10);
+    assert(neg.sql.includes('NOT ('), 'negated source group wraps in NOT');
+  });
+
+  await test('nip45: distinct:author parses (COUNT + REQ collapse)', async () => {
+    const p = parseSearchQuery('bitcoin distinct:author');
+    assert(p.distinctAuthor === true, 'distinctAuthor flag set');
+    assert(p.distinctDomain === false, 'distinctDomain untouched');
+    eq(p.keywords.join(','), 'bitcoin', 'keyword preserved');
+    const neg = parseSearchQuery('-distinct:author');
+    assert(neg.distinctAuthor !== true, 'negated form ignored');
+    const unknown = parseSearchQuery('distinct:page');
+    assert(unknown.ignored.includes('distinct:page'), 'unknown distinct values still ignored');
+  });
+
+  await test('nip45: buildSip01CountSql mirrors search matching', async () => {
+    const p = parseSearchQuery('bitcoin site:github.com');
+    const plain = buildSip01CountSql(p);
+    assert(plain.sql.includes('COUNT(*) AS count'), 'default counts observation events');
+    assert(plain.sql.includes('sip01_observations'), 'joins observations (event counting)');
+    assert(plain.sql.includes('sip01_documents'), 'matches the document index');
+    assert(plain.params.includes('github.com'), 'operator params bound');
+    assert(!plain.sql.includes('LIMIT'), 'no LIMIT in a count');
+
+    const byAuthor = buildSip01CountSql(parseSearchQuery('bitcoin distinct:author'));
+    assert(byAuthor.sql.includes('COUNT(DISTINCT o.pubkey)'), 'distinct:author → indexer count');
+
+    const byDomain = buildSip01CountSql(parseSearchQuery('bitcoin distinct:domain'));
+    assert(byDomain.sql.includes('COUNT(DISTINCT r.url_host)'), 'distinct:domain → host count');
+
+    const fts = buildSip01CountSql(p, { fts: true });
+    assert(fts.sql.includes('sip01_fts MATCH ?'), 'FTS count joins the index un-aliased');
+    assert(fts.params.includes('bitcoin*'), 'FTS match param bound');
+    assert(!fts.sql.slice(fts.sql.indexOf('WHERE')).includes('lower('), 'no LIKE for text terms in the FTS count WHERE clause');
   });
 
   // ------------------------------------------------------------- NIP-77 neg
